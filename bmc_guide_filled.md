@@ -46,6 +46,7 @@
 | 2026-07-06 |  0.2 | Copilot | 撰寫 Yocto 章節 |
 | 2026-07-06 |  0.3 | Copilot | 撰寫常用變數、目錄結構與 BitBake 建構流程 |
 | 2026-07-06 |  0.4 | Copilot | 撰寫在 Docker 中建立 Yocto 專案並建置完整映像 |
+| 2026-07-06 |  0.5 | Copilot | 撰寫單獨建置與除錯特定套件章節 |
 
 ### 0.7 資料來源可信度分級
 
@@ -1272,6 +1273,338 @@ OpenBMC 專案建議額外確認：
 - Docker Docs - Bind mounts: [https://docs.docker.com/engine/storage/bind-mounts/](https://docs.docker.com/engine/storage/bind-mounts/)
 - Docker Docs - Resource constraints: [https://docs.docker.com/engine/containers/resource_constraints/](https://docs.docker.com/engine/containers/resource_constraints/)
 - AMD / Xilinx Wiki - Building Yocto Images using a Docker Container: [https://xilinx-wiki.atlassian.net/wiki/spaces/A/pages/2823422188/Building+Yocto+Images+using+a+Docker+Container](https://xilinx-wiki.atlassian.net/wiki/spaces/A/pages/2823422188/Building+Yocto+Images+using+a+Docker+Container)
+
+### 7.4 單獨建置與除錯特定套件
+
+在日常開發中，很少需要每次都從頭建置整個 image。更常見的是只修改某個 application、library、kernel、kernel module、OpenBMC service 或 recipe，然後希望快速驗證修改是否正確。Yocto / BitBake 的建構單位是 **recipe**，因此可以只針對單一 recipe 執行 `fetch`、`patch`、`compile`、`install`、`package`、`deploy` 等 tasks；BitBake 會根據相依關係、stamp 與 sstate 判斷哪些任務需要重跑。
+
+#### 7.4.1 為什麼要單獨建置一個套件？
+
+| 場景                 | 說明                                                        | 常用指令                                                      |
+| -------------------- | ----------------------------------------------------------- | ------------------------------------------------------------- |
+| 開發新功能           | 修改某個 application、daemon、kernel module，先確認能否編譯 | `bitbake -c compile -f <recipe>`                            |
+| 修 bug               | recipe 或 source 編譯失敗，修改後重新驗證                   | `bitbake <recipe>`                                          |
+| 驗證 patch           | 測試 patch 是否可套用、是否造成編譯錯誤                     | `bitbake -c patch -f <recipe>`                              |
+| 調整 feature         | 修改`PACKAGECONFIG`、編譯選項或 recipe 變數               | `bitbake -e <recipe>`、`bitbake -c configure -f <recipe>` |
+| 取出產物             | 只需要某個 library、binary、kernel image 或 module          | `bitbake -c deploy <recipe>`                                |
+| OpenBMC service 開發 | 修改 phosphor service 或平台 service 後快速重建             | `bitbake <service-recipe>`                                  |
+
+關鍵觀念：
+
+- `bitbake <recipe>` 會執行該 recipe 的預設 build task，並自動處理 build-time dependencies。
+- `bitbake -c <task> <recipe>` 可指定只跑某個 task，例如 `compile`、`install`、`package`、`deploy`。
+- `-f` 會讓指定 task 忽略既有 stamp，強制重跑。
+- 若只是臨時改 `tmp/work` 內 source，速度很快，但 `clean` 後修改會消失；正式修改應回到 layer，用 `.bbappend`、patch 或 `devtool` 管理。
+
+#### 7.4.2 單獨建置一個套件
+
+假設要建置 `zstd-native`：
+
+```bash
+bitbake zstd-native
+```
+
+BitBake 會檢查 `zstd-native` 的相依項目，並依任務關係執行必要流程，例如：
+
+```text
+do_fetch → do_unpack → do_patch → do_configure → do_compile → do_install
+         → do_populate_sysroot → do_package → do_package_qa → do_package_write_*
+```
+
+若之前已經建置過，相同 task 可能透過 stamp 或 sstate 判斷不需要重跑，因此第二次建置通常會快很多。
+
+只執行特定 task：
+
+```bash
+# 只下載原始碼
+bitbake -c fetch zstd-native
+
+# 展開 source 並套用 patch，用於檢查 patch 是否衝突
+bitbake -c patch zstd-native
+
+# 只編譯
+bitbake -c compile zstd-native
+
+# 只執行安裝到 ${D}
+bitbake -c install zstd-native
+
+# 列出此 recipe 可用 tasks
+bitbake -c listtasks zstd-native
+```
+
+強制重新執行某個 task：
+
+```bash
+# 強制重新編譯，忽略 compile task 的 stamp
+bitbake -c compile -f zstd-native
+
+# 如果 patch 或 configure 有改，從較早階段重跑
+bitbake -c patch -f zstd-native
+bitbake -c configure -f zstd-native
+bitbake -c compile -f zstd-native
+```
+
+補充：`-C <task>` 也是常用方式，它會讓指定 task 的 stamp 失效，然後執行預設 build 流程。例如：
+
+```bash
+# 清掉 compile stamp 後，接著跑預設 build
+bitbake -C compile zstd-native
+```
+
+#### 7.4.3 建置產物在哪裡？
+
+單獨建置一個 recipe 後，常見產物位置如下：
+
+| 路徑                                                          | 內容                                  | 用途                                             |
+| ------------------------------------------------------------- | ------------------------------------- | ------------------------------------------------ |
+| `tmp/work/<arch或machine>/<pn>/<pv>/`                       | 該 recipe 的工作目錄                  | 找 source、build output、task log                |
+| `tmp/work/.../<pn>/<pv>/temp/`                              | task log 與 run script                | 排查`log.do_compile`、`run.do_compile`       |
+| `tmp/work/.../<pn>/<pv>/image/`                             | `do_install` 安裝到 `${D}` 的結果 | 確認檔案是否安裝到正確路徑                       |
+| `tmp/work/.../<pn>/<pv>/package/`                           | package 前的中間資料                  | 排查 package 切分問題                            |
+| `tmp/work/.../<pn>/<pv>/packages-split/`                    | 拆分後的 package 內容                 | 確認`${PN}`、`${PN}-dev`、`${PN}-dbg` 內容 |
+| `tmp/deploy/rpm/`、`tmp/deploy/ipk/`、`tmp/deploy/deb/` | 最終套件檔                            | 找`.rpm`、`.ipk`、`.deb`                   |
+| `tmp/deploy/images/<machine>/`                              | kernel、DTB、U-Boot、image 等         | `virtual/kernel`、U-Boot、image recipe 常用    |
+| `tmp/sysroots-components/`                                  | sysroot 元件                          | 確認 headers / libraries 是否進 sysroot          |
+
+快速找 recipe 工作目錄：
+
+```bash
+bitbake -e zstd-native | grep '^WORKDIR='
+bitbake -e zstd-native | grep '^S='
+bitbake -e zstd-native | grep '^B='
+```
+
+開發時最常看的位置：
+
+```bash
+# 安裝結果
+ls ${WORKDIR}/image/
+
+# package 拆分結果
+ls ${WORKDIR}/packages-split/
+
+# task log
+ls ${WORKDIR}/temp/log.do_*
+```
+
+#### 7.4.4 完整開發循環：Modify → Build → Test
+
+以下以 `zstd-native` 為例，說明臨時修改 source 並驗證的流程。
+
+Step 1：找到 source 目錄：
+
+```bash
+bitbake -e zstd-native | grep '^S='
+```
+
+可能輸出：
+
+```text
+S="/home/yocto/poky/build/tmp/work/x86_64-linux/zstd-native/1.5.7/git"
+```
+
+Step 2：進入 source 目錄並修改：
+
+```bash
+cd /home/yocto/poky/build/tmp/work/x86_64-linux/zstd-native/1.5.7/git
+vim lib/zstd.h
+```
+
+注意：直接修改 `tmp/work/` 是臨時測試方式，適合快速確認方向。若後續執行 `clean`、重新 unpack，或 sstate 還原，修改可能消失。確認可行後，應把修改轉成 patch、`.bbappend`，或使用 `devtool modify / devtool finish` 納入正式 layer。
+
+Step 3：重新編譯：
+
+```bash
+bitbake -c compile -f zstd-native
+```
+
+Step 4：重新安裝與打包：
+
+```bash
+bitbake -c install -f zstd-native
+bitbake -c package -f zstd-native
+```
+
+Step 5：若要讓最終 image 納入變更，再重建 image：
+
+```bash
+bitbake core-image-minimal
+```
+
+OpenBMC service 常見流程：
+
+```bash
+# 找 recipe
+bitbake-layers show-recipes | grep phosphor
+
+# 單獨建置 service
+bitbake <service-recipe>
+
+# 若 image 要包含更新後 package
+bitbake obmc-phosphor-image
+```
+
+#### 7.4.5 建置失敗時如何排查
+
+BitBake 失敗時通常會印出失敗 task 與 log 位置，例如：
+
+```text
+ERROR: Logfile of failure stored in:
+/tmp/work/x86_64-linux/zstd-native/1.5.7/temp/log.do_compile.12345
+```
+
+查看 log：
+
+```bash
+less /home/yocto/poky/build/tmp/work/x86_64-linux/zstd-native/1.5.7/temp/log.do_compile.12345
+
+# 通常也會有無序號 symlink 或最新 log
+less tmp/work/x86_64-linux/zstd-native/1.5.7/temp/log.do_compile
+```
+
+常見失敗情境：
+
+| 失敗 task         | 可能原因                                                                                    | 排查入口                                                  |
+| ----------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| `do_fetch`      | 網路、proxy、DNS、Git branch / commit 不存在、憑證問題                                      | `log.do_fetch`、`SRC_URI`、`SRCREV`、mirror 設定    |
+| `do_unpack`     | 壓縮檔格式錯、檔案損壞、fetch 結果不完整                                                    | `log.do_unpack`、`DL_DIR`                             |
+| `do_patch`      | patch context 不符、source revision 不對、patch 順序錯                                      | `log.do_patch`、`patches/`、`quilt`                 |
+| `do_configure`  | 缺少 build dependency、`PACKAGECONFIG` 不合理、toolchain file 問題                        | `log.do_configure`、`DEPENDS`、`EXTRA_OECONF`       |
+| `do_compile`    | 語法錯誤、compiler flag 不相容、missing header / library                                    | `log.do_compile`、`S`、`B`、`CFLAGS`、`LDFLAGS` |
+| `do_install`    | 未加`${D}`、安裝目錄不存在、權限或路徑錯 | `log.do_install`、`${D}`、`do_install()` |                                                           |
+| `do_package`    | `FILES:${PN}` 未涵蓋、package split 錯誤                                                  | `packages-split/`、`FILES:*`                          |
+| `do_package_qa` | rpath、installed-vs-shipped、already-stripped、ldflags 等 QA issue                          | `log.do_package_qa`、`INSANE_SKIP`                    |
+
+從失敗點繼續：
+
+```bash
+# do_compile 失敗，修正 source 後重跑 compile
+bitbake -c compile -f zstd-native
+
+# do_configure 相關問題，通常從 configure 重跑
+bitbake -c configure -f zstd-native
+bitbake -c compile -f zstd-native
+
+# do_patch 相關問題，從 patch 重跑
+bitbake -c patch -f zstd-native
+bitbake -c compile -f zstd-native
+```
+
+進入開發 shell：
+
+```bash
+# 進入 recipe 的建構環境，便於手動執行 make / ninja / cmake
+bitbake -c devshell zstd-native
+
+# 部分 recipe 可用 menuconfig，例如 kernel / busybox
+bitbake -c menuconfig virtual/kernel
+```
+
+#### 7.4.6 clean / cleansstate / cleanall 何時使用？
+
+| 指令                                | 清除範圍                                        | 適用情境                         | 注意事項                             |
+| ----------------------------------- | ----------------------------------------------- | -------------------------------- | ------------------------------------ |
+| `bitbake -c clean <recipe>`       | 清除多數 build output，保留`DL_DIR` 與 sstate | 一般重新建置                     | 相對安全，常用                       |
+| `bitbake -c cleansstate <recipe>` | `clean` 加上移除該 recipe sstate              | 懷疑 sstate 還原舊結果           | 下次會慢，因為要重建                 |
+| `bitbake -c cleanall <recipe>`    | `cleansstate` 加上刪除下載資料                | source / mirror 異常或要重新下載 | 謹慎使用，可能造成重新下載大量資料   |
+| `bitbake -C <task> <recipe>`      | 指定 task stamp 失效後跑預設 build              | 想從某 task 後重跑完整流程       | 適合比`-f` 更貼近完整 build 的驗證 |
+
+實務建議：
+
+- 一般 code / recipe 修改：先用 `bitbake -c compile -f <recipe>` 或 `bitbake -C compile <recipe>`。
+- 懷疑 workdir 舊檔干擾：用 `clean`。
+- 懷疑 sstate 還原異常：用 `cleansstate`。
+- 除非確認 source cache 有問題，否則少用 `cleanall`。
+
+#### 7.4.7 實戰案例：修改 Linux Kernel
+
+Kernel 是 BMC porting 最常單獨建置的目標之一。常見目標是修改 driver、DTS、defconfig 或 config fragment。
+
+1. 建置 kernel：
+
+```bash
+bitbake virtual/kernel
+```
+
+2. 找 kernel source：
+
+```bash
+bitbake -e virtual/kernel | grep '^S='
+bitbake -e virtual/kernel | grep '^B='
+```
+
+3. 修改 driver 或 DTS：
+
+```bash
+cd <kernel-source>
+vim drivers/char/xxx.c
+# 或修改 arch/arm/boot/dts/... / arch/arm64/boot/dts/...
+```
+
+4. 重新編譯 kernel：
+
+```bash
+bitbake -c compile -f virtual/kernel
+```
+
+5. 部署 kernel image / DTB / modules：
+
+```bash
+bitbake -c deploy virtual/kernel
+```
+
+6. 查看部署結果：
+
+```bash
+ls tmp/deploy/images/${MACHINE}/
+```
+
+7. 若是 QEMU target，可用：
+
+```bash
+runqemu qemux86-64
+```
+
+BMC kernel / DTS 額外提醒：
+
+- 若變更 DTS，需確認實際 deploy 的 `.dtb` 是目標平台使用的那一份。
+- 若變更 config fragment，需確認最終 `.config` 是否真的包含該選項。
+- 若使用 OpenBMC，kernel image、DTB 與 rootfs 打包方式會受 machine 與 image type 影響，需同步檢查 `tmp/deploy/images/<machine>/` 的 `.mtd`、`.ubi`、fitImage 或其他平台產物。
+
+#### 7.4.8 何時該改用 devtool？
+
+直接修改 `tmp/work` 適合短時間測試，但不適合作為正式修改流程。以下情境建議使用 `devtool`：
+
+| 情境                                      | 建議工具                            |
+| ----------------------------------------- | ----------------------------------- |
+| 要長時間修改某 recipe source              | `devtool modify <recipe>`         |
+| 要新增一個 application / package          | `devtool add` 或手寫 recipe       |
+| 要把本地修改整理成 patch 並放回 layer     | `devtool finish <recipe> <layer>` |
+| 要部署單一 recipe 產物到 live target 測試 | `devtool deploy-target`           |
+| 要移除 workspace 內的臨時 recipe 修改     | `devtool reset <recipe>`          |
+
+典型 devtool 流程：
+
+```bash
+# 取出 recipe source 到 workspace
+ devtool modify zstd-native
+
+# 修改 source 後建置
+ devtool build zstd-native
+
+# 完成後把修改整理回指定 layer
+ devtool finish zstd-native ../meta-my-layer
+
+# 若只是取消 workspace 狀態
+ devtool reset zstd-native
+```
+
+#### 7.4.9 本章參考資料
+
+- BitBake User Manual - Execution: [https://docs.yoctoproject.org/bitbake/bitbake-user-manual/bitbake-user-manual-execution.html](https://docs.yoctoproject.org/bitbake/bitbake-user-manual/bitbake-user-manual-execution.html)
+- BitBake User Manual: [https://docs.yoctoproject.org/bitbake/](https://docs.yoctoproject.org/bitbake/)
+- Yocto Project Reference Manual - Tasks: [https://docs.yoctoproject.org/ref-manual/tasks.html](https://docs.yoctoproject.org/ref-manual/tasks.html)
+- Yocto Project Development Tasks Manual - devtool: [https://docs.yoctoproject.org/dev/dev-manual/devtool.html](https://docs.yoctoproject.org/dev/dev-manual/devtool.html)
 
 ### 8. Device Tree 通用寫法與排查
 
