@@ -51,6 +51,7 @@
 | 2026-07-06 |  0.7 | Copilot | 撰寫使用 devtool 修改原始碼並產出補丁章節 |
 | 2026-07-06 |  0.8 | Copilot | 撰寫自訂 .bb Recipe 章節 |
 | 2026-07-06 |  0.9 | Copilot | 撰寫進階混合開發 devtool modify / update-recipe / finish 章節 |
+| 2026-07-06 |  0.10 | Copilot | OpenBMC 新 Machine Layer 與 DTS Bring-up 系統化流程 |
 
 ### 0.7 資料來源可信度分級
 
@@ -3271,6 +3272,458 @@ find build/workspace/attic -maxdepth 3 -type f 2>/dev/null | head
 - Yocto Project Reference Manual - devtool Quick Reference: [https://docs.yoctoproject.org/ref-manual/devtool-reference.html](https://docs.yoctoproject.org/ref-manual/devtool-reference.html)
 - Yocto Project Reference Manual - Classes / externalsrc: [https://docs.yoctoproject.org/ref-manual/classes.html](https://docs.yoctoproject.org/ref-manual/classes.html)
 
+#### 7.9 OpenBMC 新 Machine Layer 與 DTS Bring-up 系統化流程
+
+本節把 `davidboard` 的 debug 紀錄整理成可重用的 OpenBMC / Yocto 新平台移植流程。
+
+1. 先讓 layer 成為合法 Yocto layer。
+2. 再讓 OpenBMC setup 能用 template 建立 build directory。
+3. 接著讓 BitBake 載入該 layer 並辨識 `MACHINE`。
+4. 先沿用既有 EVB DTS，確認 image build flow 可通過。
+5. 再導入 Linux kernel DTS。
+6. 最後導入 U-Boot DTS 與 bootloader 相關設定。
+
+此流程刻意將「能 build」與「硬體客製」分開，避免同時排查 layer、template、machine、kernel DTS、U-Boot DTS、flash layout 與 sensor/fan 設定。
+
+##### 7.9.1 整體目錄規劃
+
+案例假設：
+
+```text
+OpenBMC source tree : /yocto_qemu/aspeed_bmc/openbmc
+Platform layer      : /yocto_qemu/aspeed_bmc/openbmc/meta-davidcorp/meta-davidboard
+Machine             : davidboard
+Kernel recipe       : linux-aspeed
+U-Boot recipe       : u-boot-aspeed-sdk
+Image target        : obmc-phosphor-image
+```
+
+建議目錄：
+
+```text
+meta-davidcorp/
+└── meta-davidboard/
+    ├── conf/
+    │   ├── layer.conf
+    │   ├── machine/
+    │   │   └── davidboard.conf
+    │   └── templates/
+    │       └── default/
+    │           ├── bblayers.conf.sample
+    │           ├── local.conf.sample
+    │           ├── conf-notes.txt
+    │           └── conf-summary.txt        # 若目前 branch 使用此檔，需保留
+    ├── recipes-kernel/
+    │   └── linux/
+    │       ├── linux-aspeed_%.bbappend
+    │       └── linux-aspeed/
+    │           └── aspeed-bmc-david-davidboard.dts
+    └── recipes-bsp/
+        └── u-boot/
+            ├── u-boot-aspeed-sdk_%.bbappend
+            └── u-boot-aspeed-sdk/
+                └── ast2600-davidboard.dts
+```
+
+各區域的責任：
+
+| 區域                             | 放置內容                                                   | 主要影響                                                                        |
+| -------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `conf/layer.conf`              | layer collection、recipe 搜尋路徑、Yocto series 相容宣告   | BitBake 是否承認此目錄是 layer                                                  |
+| `conf/machine/davidboard.conf` | MACHINE、SoC include、kernel、DTB、U-Boot、image type      | BitBake 是否承認`davidboard`，以及 image 產物長相                             |
+| `conf/templates/default/`      | `setup` 建 build directory 時使用的 sample conf          | `. setup davidboard` 是否能建立 `conf/local.conf` 與 `conf/bblayers.conf` |
+| `recipes-kernel/linux/`        | kernel`.bbappend`、DTS、kernel patch、config fragment    | kernel source、DTB、driver config、deploy output                                |
+| `recipes-bsp/u-boot/`          | U-Boot`.bbappend`、U-Boot DTS、defconfig、Makefile patch | SPL / U-Boot 建置、bootloader DTB、boot flow                                    |
+
+##### 7.9.2 階段 1：建立合法 Yocto layer
+
+目的：讓 BitBake 承認 `meta-davidboard` 是一個可載入的 layer。
+
+需要放的檔案：
+
+```text
+meta-davidcorp/meta-davidboard/conf/layer.conf
+```
+
+建議內容：
+
+```bitbake
+BBPATH .= ":${LAYERDIR}"
+
+BBFILES += "${LAYERDIR}/recipes-*/*/*.bb \
+            ${LAYERDIR}/recipes-*/*/*.bbappend"
+
+BBFILE_COLLECTIONS += "meta-davidboard"
+BBFILE_PATTERN_meta-davidboard = "^${LAYERDIR}/"
+BBFILE_PRIORITY_meta-davidboard = "10"
+
+LAYERSERIES_COMPAT_meta-davidboard = "scarthgap styhead walnascar wrynose whinlatter"
+```
+
+會影響到什麼：
+
+- `bitbake-layers show-layers` 是否列出此 layer。
+- 此 layer 內的 `.bb` 與 `.bbappend` 是否會被掃描。
+- `.bbappend` 是否有機會套到 `linux-aspeed`、`u-boot-aspeed-sdk` 等 recipe。
+- `LAYERSERIES_COMPAT_*` 若不含目前 Yocto release，可能在 parsing 階段報 layer compatibility 相關錯誤。
+
+檢查方式：
+
+```bash
+cd /yocto_qemu/aspeed_bmc/openbmc
+find meta-davidcorp/meta-davidboard -name layer.conf -print
+bitbake-layers show-layers | grep david
+bitbake -p
+```
+
+常見錯誤與方向：
+
+- `No recipes available for ...bbappend`：`.bbappend` 檔名沒有對應到任何 recipe，或 layer branch / recipe name 不一致。
+- `.bbappend` 沒出現在 `show-appends`：`BBFILES` 沒涵蓋該路徑、layer 沒加入 `BBLAYERS`，或檔名不匹配。
+- layer compatibility warning / error：確認目前 OpenBMC branch 使用的 Yocto series，並同步 `LAYERSERIES_COMPAT_meta-davidboard`。
+
+##### 7.9.3 階段 2：建立 machine conf
+
+目的：定義 `davidboard` 這台機器，讓 BitBake 知道要用哪個 SoC BSP、kernel、DTB、U-Boot 與 image policy。
+
+需要放的檔案：
+
+```text
+meta-davidcorp/meta-davidboard/conf/machine/davidboard.conf
+```
+
+初期建議內容：
+
+```bitbake
+# override 標籤 (條件名稱), 這台機器有哪些 override 標籤要啟用
+MACHINEOVERRIDES =. "davidboard:"
+
+# 依目前 ASPEED BSP 實際 include 調整
+require conf/machine/include/ast2600.inc
+
+PREFERRED_PROVIDER_virtual/kernel = "linux-aspeed"
+PREFERRED_VERSION_linux-aspeed = "6.18%"
+
+# 第一階段先沿用 EVB DTB，降低 bring-up 變數
+KERNEL_DEVICETREE = "aspeed-bmc-ast2600-evb.dtb"
+
+# 切換到自訂 DTS 後再改成：
+# KERNEL_DEVICETREE = "aspeed-bmc-david-davidboard.dtb"
+
+# U-Boot 變數名稱需以實際 recipe 支援為準
+UBOOT_DEVICETREE = "ast2600-davidboard"
+```
+
+會影響到什麼：
+
+- `MACHINE = "davidboard"` 是否有效。
+- `tmp/work/` 目錄中的 machine-specific workdir。
+- kernel DTB 產出清單。
+- image deploy 目錄，例如 `tmp/deploy/images/davidboard/`。
+- U-Boot、kernel、rootfs、flash image 的 machine-specific override。
+
+檢查方式：
+
+```bash
+find meta-davidcorp/meta-davidboard/conf/machine -name 'davidboard.conf' -print
+bitbake -e obmc-phosphor-image | grep '^MACHINE='
+bitbake -e virtual/kernel | grep '^KERNEL_DEVICETREE='
+```
+
+##### 7.9.4 階段 3：建立 setup template
+
+目的：讓 `. setup davidboard` 能產生正確的 build directory 初始設定。
+
+需要放的檔案：
+
+```text
+meta-davidcorp/meta-davidboard/conf/templates/default/local.conf.sample
+meta-davidcorp/meta-davidboard/conf/templates/default/bblayers.conf.sample
+meta-davidcorp/meta-davidboard/conf/templates/default/conf-notes.txt
+meta-davidcorp/meta-davidboard/conf/templates/default/conf-summary.txt   # 若目前 branch 使用
+```
+
+`local.conf.sample` 至少要確認：
+
+```bitbake
+MACHINE ??= "davidboard"
+```
+
+`bblayers.conf.sample` 至少要確認含有 platform layer：
+
+```bitbake
+BBLAYERS ?= " \
+  /yocto_qemu/aspeed_bmc/openbmc/meta \
+  /yocto_qemu/aspeed_bmc/openbmc/meta-openembedded/meta-oe \
+  /yocto_qemu/aspeed_bmc/openbmc/meta-openembedded/meta-networking \
+  /yocto_qemu/aspeed_bmc/openbmc/meta-openembedded/meta-python \
+  /yocto_qemu/aspeed_bmc/openbmc/meta-phosphor \
+  /yocto_qemu/aspeed_bmc/openbmc/meta-aspeed-sdk \
+  /yocto_qemu/aspeed_bmc/openbmc/meta-aspeed-sdk/meta-ast2600-sdk \
+  /yocto_qemu/aspeed_bmc/openbmc/meta-davidcorp/meta-davidboard \
+  "
+```
+
+會影響到什麼：
+
+- `. setup davidboard` 是否能建立 `build/conf/local.conf`。
+- `. setup davidboard` 是否能建立 `build/conf/bblayers.conf`。
+- 新建 build directory 時是否自動加入 `meta-davidboard`。
+- 後續 BitBake 是否看得到 `davidboard.conf` 與 `.bbappend`。
+
+檢查方式：
+
+```bash
+unset TEMPLATECONF
+rm -rf build conf/templateconf.cfg
+. setup davidboard
+
+grep '^MACHINE' build/conf/local.conf
+grep david build/conf/bblayers.conf
+```
+
+##### 7.9.5 階段 4：確認 BBLAYERS 載入真正 layer root
+
+目的：確認 build directory 內的 `conf/bblayers.conf` 已包含真正 layer root。
+
+正確路徑應為：
+
+```text
+/yocto_qemu/aspeed_bmc/openbmc/meta-davidcorp/meta-davidboard
+```
+
+除非 `meta-davidcorp/conf/layer.conf` 才是真的 layer root，否則不要只加入：
+
+```text
+/yocto_qemu/aspeed_bmc/openbmc/meta-davidcorp
+```
+
+會影響到什麼：
+
+- BitBake 是否能找到 `conf/machine/davidboard.conf`。
+- `recipes-kernel/linux/linux-aspeed_%.bbappend` 是否套用。
+- `recipes-bsp/u-boot/u-boot-aspeed-sdk_%.bbappend` 是否套用。
+
+檢查方式：
+
+```bash
+find /yocto_qemu/aspeed_bmc/openbmc/meta-davidcorp -name layer.conf -print
+grep -n david build/conf/bblayers.conf
+bitbake-layers show-layers | grep david
+bitbake-layers show-appends | grep -E 'linux-aspeed|u-boot-aspeed-sdk'
+```
+
+##### 7.9.6 階段 5：先沿用 EVB DTB，確認 image build flow
+
+目的：先驗證 Yocto / OpenBMC build flow，不在同一時間導入自訂 DTS。
+
+`davidboard.conf`：
+
+```bitbake
+KERNEL_DEVICETREE = "aspeed-bmc-ast2600-evb.dtb"
+```
+
+`linux-aspeed_%.bbappend` 初期不要引用不存在的 DTS：
+
+```bitbake
+# SRC_URI += "file://aspeed-bmc-david-davidboard.dts"
+```
+
+會影響到什麼：
+
+- 可先確認 `obmc-phosphor-image` 能否完成。
+- 可排除 layer / machine / image recipe 這一層問題。
+- 後續切換自訂 DTS 時，若失敗就能集中看 DTS 與 kernel recipe。
+
+檢查方式：
+
+```bash
+bitbake -c cleansstate linux-aspeed
+bitbake obmc-phosphor-image
+find build/tmp/deploy/images/davidboard -maxdepth 1 -type f | sort
+```
+
+##### 7.9.7 階段 6：導入 Linux kernel DTS
+
+目的：把自訂硬體描述加入 kernel recipe，產出 `aspeed-bmc-david-davidboard.dtb`。
+
+需要放的檔案：
+
+```text
+meta-davidcorp/meta-davidboard/recipes-kernel/linux/linux-aspeed_%.bbappend
+meta-davidcorp/meta-davidboard/recipes-kernel/linux/linux-aspeed/aspeed-bmc-david-davidboard.dts
+```
+
+`linux-aspeed_%.bbappend`：
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+
+SRC_URI:append:davidboard = " file://aspeed-bmc-david-davidboard.dts"
+
+# 若 vendor recipe 的 do_configure 從 ${B} 找 DTS，才補這段。
+do_configure:prepend:davidboard() {
+    if [ -f "${WORKDIR}/aspeed-bmc-david-davidboard.dts" ]; then
+        cp "${WORKDIR}/aspeed-bmc-david-davidboard.dts" "${B}/"
+    fi
+}
+```
+
+`davidboard.conf` 切換 DTB：
+
+```bitbake
+KERNEL_DEVICETREE = "aspeed-bmc-david-davidboard.dtb"
+```
+
+會影響到什麼：
+
+- `SRC_URI` 會要求 BitBake 在 `FILESPATH` 裡找到該 DTS。
+- `linux-aspeed` 的 unpack / configure 階段會取得此 DTS。
+- kernel build 會嘗試產出指定 DTB。
+- 最終 image 會使用 `KERNEL_DEVICETREE` 指定的 DTB。
+
+檢查方式：
+
+```bash
+bitbake-layers show-appends | grep -A5 -B2 linux-aspeed
+bitbake -e linux-aspeed | grep '^FILESPATH='
+bitbake -e linux-aspeed | grep '^SRC_URI='
+bitbake -e linux-aspeed | grep '^KERNEL_DEVICETREE='
+
+bitbake -c cleansstate linux-aspeed
+bitbake -c configure linux-aspeed
+find build/tmp/work -path '*linux-aspeed*' -name 'aspeed-bmc-david-davidboard.dts' -print
+```
+
+若 failed task 是 `do_configure` 且訊息類似：
+
+```text
+cp: cannot stat '.../linux-aspeed/6.18+git/aspeed-bmc-david-davidboard.dts': No such file or directory
+```
+
+排查順序：
+
+1. 確認 DTS 檔案真實存在。
+2. 確認 `FILESEXTRAPATHS` 對應到 `recipes-kernel/linux/linux-aspeed/`。
+3. 確認 `.bbappend` 有被 `bitbake-layers show-appends` 列出。
+4. 確認 `SRC_URI` 中有該 DTS。
+5. 確認 vendor recipe 的 `do_configure` 從 `${WORKDIR}`、`${B}` 還是 `${S}` 找 DTS。
+6. 若 recipe 期望 DTS 在 `${B}`，用 `do_configure:prepend:davidboard()` 從 `${WORKDIR}` 複製到 `${B}`。
+
+##### 7.9.8 階段 7：導入 U-Boot DTS
+
+目的：讓 U-Boot 使用符合平台早期初始化需求的 DTS。U-Boot DTS 與 Linux DTS 是不同來源，不要混用。
+
+需要放的檔案：
+
+```text
+meta-davidcorp/meta-davidboard/recipes-bsp/u-boot/u-boot-aspeed-sdk_%.bbappend
+meta-davidcorp/meta-davidboard/recipes-bsp/u-boot/u-boot-aspeed-sdk/ast2600-davidboard.dts
+```
+
+`u-boot-aspeed-sdk_%.bbappend`：
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+
+SRC_URI:append:davidboard = " file://ast2600-davidboard.dts"
+UBOOT_DEVICETREE:davidboard = "ast2600-davidboard"
+
+# 只有在 recipe / log 顯示需要時才補複製。
+do_configure:prepend:davidboard() {
+    if [ -f "${WORKDIR}/ast2600-davidboard.dts" ]; then
+        cp "${WORKDIR}/ast2600-davidboard.dts" "${B}/" || true
+    fi
+}
+```
+
+若 U-Boot `arch/arm/dts/Makefile` 沒列入新 DTB，請提供 patch，例如：
+
+```bitbake
+SRC_URI:append:davidboard = " \
+    file://ast2600-davidboard.dts \
+    file://0001-arm-dts-aspeed-add-davidboard-dtb.patch \
+"
+```
+
+會影響到什麼：
+
+- SPL / U-Boot 的 device tree 選擇。
+- 早期 pinmux、clock、DRAM、boot media、console、flash 等 bootloader 階段行為。
+- U-Boot deploy 產物與後續 image 打包。
+
+檢查方式：
+
+```bash
+bitbake-layers show-appends | grep -A5 -B2 u-boot-aspeed-sdk
+bitbake -e u-boot-aspeed-sdk | grep -E '^(SRC_URI|FILESPATH|UBOOT_DEVICETREE|UBOOT_MACHINE)='
+bitbake -c cleansstate u-boot-aspeed-sdk
+bitbake u-boot-aspeed-sdk
+find build/tmp/deploy/images/davidboard -iname '*u-boot*' -o -iname '*dtb*'
+```
+
+##### 7.9.9 變數與路徑判讀
+
+| 變數           | 意義                       | 在本流程的用途                                     |
+| -------------- | -------------------------- | -------------------------------------------------- |
+| `${THISDIR}` | 目前`.bbappend` 所在目錄 | 組出 platform 檔案搜尋路徑                         |
+| `${PN}`      | recipe name                | 對應`linux-aspeed`、`u-boot-aspeed-sdk` 子目錄 |
+| `${BPN}`     | base recipe name           | 面對 native / nativesdk 變體時較穩定               |
+| `${WORKDIR}` | recipe 工作目錄            | `SRC_URI` 的本地檔案通常先出現在這裡             |
+| `${S}`       | source tree                | kernel / U-Boot source tree                        |
+| `${B}`       | build directory            | vendor recipe 可能從這裡找 DTS                     |
+
+排查指令：
+
+```bash
+bitbake -e linux-aspeed | grep -E '^(PN|BPN|WORKDIR|S|B|FILESPATH|SRC_URI)='
+bitbake -e u-boot-aspeed-sdk | grep -E '^(PN|BPN|WORKDIR|S|B|FILESPATH|SRC_URI)='
+```
+
+##### 7.9.10 決策樹
+
+```text
+setup 找不到 machine
+└─ 檢查 conf/machine/<machine>.conf 是否存在，檔名是否完全一致
+
+setup 找到 machine，但 oe-setup-builddir 失敗
+├─ 檢查 TEMPLATECONF 是否指到存在的 template 目錄
+├─ 檢查 template sample 檔是否齊全
+└─ 檢查 template 所在 layer 是否有 conf/layer.conf
+
+BitBake 回報 MACHINE invalid
+├─ 檢查 build/conf/bblayers.conf 是否加入真正 layer root
+├─ 檢查 layer.conf 的 BBFILES / collection / LAYERSERIES_COMPAT
+└─ 檢查 local.conf 或環境變數是否覆蓋 MACHINE
+
+BitBake 回報 file://*.dts 找不到
+├─ 檢查檔案是否存在
+├─ 檢查 FILESEXTRAPATHS 是否對應實際目錄
+├─ 檢查 .bbappend 是否被 show-appends 列出
+└─ 檢查 machine override 是否拼對
+
+configure 階段 cp 找不到 DTS
+├─ 檢查 DTS 是否在 WORKDIR
+├─ 檢查 recipe 自訂 task 從 B / S / WORKDIR 哪裡找
+└─ 用 do_configure:prepend 或 patch 修正路徑假設
+
+DTB 沒產出
+├─ 檢查 KERNEL_DEVICETREE / UBOOT_DEVICETREE
+├─ 檢查 kernel 或 U-Boot Makefile 是否列入新 DTS
+└─ 檢查 deploy 目錄與 log.do_compile
+```
+
+##### 7.9.11 建議收斂順序
+
+1. 建立 `conf/layer.conf`。
+2. 建立 `conf/machine/davidboard.conf`。
+3. 建立 `conf/templates/default/`。
+4. 確認 `build/conf/bblayers.conf` 加入真正 layer root。
+5. 先用 EVB DTB 建出 `obmc-phosphor-image`。
+6. 加 Linux DTS，確認 `linux-aspeed` 產出 DTB。
+7. 加 U-Boot DTS，確認 `u-boot-aspeed-sdk` 產物。
+8. 再逐步導入 GPIO、I2C、CPLD、sensor、fan、power control、network。
+
 ### 8. Device Tree 通用寫法與排查
 
 DT 是描述硬體拓樸的資料結構，讓 kernel 不需把板級資訊硬寫在 driver 中。建議所有裝置先查 binding，再寫 DTS。
@@ -3590,4 +4043,5 @@ Boot time 拆解：BootROM、U-Boot、kernel、userspace、network ready、API r
 - Poky repository note: [https://git.yoctoproject.org/poky/about/](https://git.yoctoproject.org/poky/about/)
 - OpenEmbedded and The Yocto Project: [https://www.openembedded.org/wiki/OpenEmbedded_and_The_Yocto_Project](https://www.openembedded.org/wiki/OpenEmbedded_and_The_Yocto_Project)
 - OpenBMC Yocto development: [https://github.com/openbmc/docs/blob/master/yocto-development.md](https://github.com/openbmc/docs/blob/master/yocto-development.md)
+
 - Yocto Project Reference Manual - externalsrc class: [https://docs.yoctoproject.org/ref-manual/classes.html](https://docs.yoctoproject.org/ref-manual/classes.html)
