@@ -45,6 +45,7 @@
 | 2026-07-06 |  0.1 | Copilot | 依目錄建立第一輪填寫版 |
 | 2026-07-06 |  0.2 | Copilot | 撰寫 Yocto 章節 |
 | 2026-07-06 |  0.3 | Copilot | 撰寫常用變數、目錄結構與 BitBake 建構流程 |
+| 2026-07-06 |  0.4 | Copilot | 撰寫在 Docker 中建立 Yocto 專案並建置完整映像 |
 
 ### 0.7 資料來源可信度分級
 
@@ -909,6 +910,368 @@ bitbake-layers show-overlayed
 - BitBake User Manual: [https://docs.yoctoproject.org/bitbake/](https://docs.yoctoproject.org/bitbake/)
 - Yocto Project Development Tasks Manual - Understanding and Creating Layers: [https://docs.yoctoproject.org/dev/dev-manual/layers.html](https://docs.yoctoproject.org/dev/dev-manual/layers.html)
 - OpenEmbedded Layer Index: [https://layers.openembedded.org](https://layers.openembedded.org)
+
+
+### 7.3 在 Docker 中建立 Yocto 專案並建置完整映像
+
+本章說明如何用 Docker 建立可重現的 Yocto build host，下載 Poky、初始化 build directory，並建置 `core-image-minimal`。此流程可用來驗證 Yocto 環境，也可作為 BMC / OpenBMC CI container 的基礎。
+
+#### 7.3.1 為什麼要在 Docker 中建置 Yocto？
+
+Yocto 對 build host 有明確需求：支援的 Linux distribution、必要套件，以及 Git、tar、Python、gcc、GNU make 等工具版本，都會隨 Yocto release 改變。若直接在本機安裝，可能遇到 host OS 太新或太舊、相依套件版本不合、同時維護多個 Yocto branch 時環境互相衝突等問題。
+
+Docker 的價值是提供隔離且可重現的 build environment。可以在 container 內固定 Linux distribution 與套件清單，讓專案成員與 CI 使用相同建構基準。相較於 VM，Docker 通常更輕量，因為它使用 host Linux kernel，不需模擬完整硬體。
+
+重要提醒：Yocto / BitBake 不建議以 `root` 身分執行。建構過程會建立大量檔案、執行 install step、產生 rootfs；若以 root 執行，容易造成檔案權限錯亂或誤寫 host 檔案。因此 Docker image 內應建立非 root 使用者，例如 `yocto`，並以該使用者執行 `bitbake`。
+
+#### 7.3.2 建立 Docker Container
+
+以下 Dockerfile 以 Fedora 38 為基礎。實際專案需依目前 Yocto release 的官方 system requirements 調整 base image 與套件清單。
+
+```dockerfile
+FROM fedora:38
+
+# 建立非 root 使用者
+RUN groupadd -g 1000 yocto && \
+    useradd -m -u 1000 -g yocto yocto
+
+# 安裝 Yocto 常用建構套件；實際清單需依 Yocto release 調整
+RUN dnf update -y && dnf install -y \
+    sudo \
+    glibc-locale-source \
+    glibc-langpack-en \
+    librsvg2-tools \
+    bc \
+    @development-tools \
+    gdisk \
+    openssl-devel \
+    bzip2 \
+    ccache \
+    chrpath \
+    cpio \
+    cpp \
+    diffstat \
+    diffutils \
+    file \
+    findutils \
+    gawk \
+    gcc \
+    gcc-c++ \
+    git \
+    glibc-devel \
+    gzip \
+    hostname \
+    libacl \
+    make \
+    ncurses-devel \
+    patch \
+    perl \
+    perl-Data-Dumper \
+    perl-File-Compare \
+    perl-File-Copy \
+    perl-FindBin \
+    perl-Text-ParseWords \
+    perl-Thread-Queue \
+    perl-bignum \
+    perl-locale \
+    python3 \
+    python3-GitPython \
+    python3-jinja2 \
+    python3-pexpect \
+    python3-pip \
+    rpcgen \
+    socat \
+    tar \
+    texinfo \
+    unzip \
+    wget \
+    which \
+    xz \
+    zstd \
+    vim \
+    lz4 \
+    && dnf clean all
+
+# 給予 yocto 使用者 sudo 權限；CI image 可依安全政策移除
+RUN echo "yocto ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/yocto && \
+    chmod 0440 /etc/sudoers.d/yocto
+
+USER yocto
+WORKDIR /home/yocto
+CMD ["/bin/bash"]
+```
+
+常見套件用途：
+
+| 套件 | 用途 |
+|---|---|
+| `git` | 從 Git repository 擷取原始碼，常用於 `do_fetch` |
+| `wget` | 從 HTTP / HTTPS / FTP 下載 source archive |
+| `make` / `gcc` / `gcc-c++` | 建構 host tools、native tools、target packages |
+| `chrpath` | 調整 ELF RPATH，常見於 SDK / native tools |
+| `cpio` | 建立 initramfs 或處理 cpio archive |
+| `diffstat` | 顯示 patch 統計資訊 |
+| `file` | 判斷檔案型態，常用於 QA 檢查 |
+| `patch` | 套用 recipe patches，對應 `do_patch` |
+| `perl` / `python3` | Yocto、BitBake、recipes 與輔助工具常用 runtime |
+| `texinfo` | 建構 GNU info 文件 |
+| `unzip` / `xz` / `zstd` / `lz4` | 處理不同壓縮格式 |
+| `socat` | QEMU 網路轉發與測試情境常用工具 |
+| `ccache` | 編譯快取，可縮短部分重建時間 |
+| `ncurses-devel` | `menuconfig` / `nconfig` 類工具需要的 terminal UI library |
+
+建立 Docker image：
+
+```bash
+mkdir -p ~/docker-yocto
+cd ~/docker-yocto
+vim Dockerfile
+
+docker build -t yocto-fedora:38 .
+```
+
+啟動 container：
+
+```bash
+mkdir -p ~/yocto-work
+
+docker run -itd \
+    --name yocto_fedora38 \
+    --memory=32g \
+    --memory-swap=32g \
+    -v ~/yocto-work:/work \
+    yocto-fedora:38
+
+docker exec -it yocto_fedora38 bash
+```
+
+參數說明：
+
+- `-v ~/yocto-work:/work`：將 host 目錄掛載到 container 內，保存 source、downloads、sstate-cache 與最終 image。
+- `--memory=32g --memory-swap=32g`：限制 container 記憶體與 swap。近期 Yocto quick build 文件建議準備較高 RAM；若只給 4 GB，簡單 image 可能可行，但大型 image 容易 OOM。
+- `--name yocto_fedora38`：指定 container 名稱，方便後續 `docker exec`、`docker stop`、`docker start`。
+
+若主機資源有限，優先降低 BitBake / make 平行度：
+
+```bitbake
+BB_NUMBER_THREADS = "4"
+PARALLEL_MAKE = "-j 4"
+```
+
+Windows / WSL / Docker Desktop 注意事項：
+
+- Yocto build directory 不建議放在 Windows NTFS 掛載路徑上，因為大小寫、symlink、inode、檔案權限與 I/O 行為可能造成額外問題。
+- 若使用 WSL2，建議把 source、`build/`、`downloads/`、`sstate-cache/` 放在 WSL2 Linux filesystem 內，而不是 `/mnt/c/...`。
+- 若需要從 Windows 取出產物，可只將 `tmp/deploy/images/<machine>/` 複製到 Windows 端。
+
+#### 7.3.3 下載 Poky 並初始化
+
+進入 container 後，下載 Poky 並切到目標分支。以下以 `walnascar` 為例；實際專案需依客戶、SoC vendor、OpenBMC branch 或 Yocto release policy 選擇 branch。
+
+```bash
+cd /work
+
+git clone git://git.yoctoproject.org/poky.git
+cd poky
+
+git branch -a | grep walnascar
+git checkout -t origin/walnascar -b my-walnascar
+
+source oe-init-build-env
+```
+
+執行 `source oe-init-build-env` 後，通常會進入 `build/` 目錄，並產生：
+
+```text
+build/conf/local.conf
+build/conf/bblayers.conf
+```
+
+第一次建置前建議調整 `conf/local.conf`：
+
+```bitbake
+# QEMU 目標；若是實體板，改為對應 MACHINE
+MACHINE ?= "qemux86-64"
+
+# 平行度需依 CPU / RAM / I/O 調整
+BB_NUMBER_THREADS = "8"
+PARALLEL_MAKE = "-j 8"
+
+# 將 downloads 與 sstate-cache 放到 build 外層，方便多個 build 共用
+DL_DIR = "/work/yocto-cache/downloads"
+SSTATE_DIR = "/work/yocto-cache/sstate-cache"
+```
+
+建議目錄規劃：
+
+```text
+/work/
+├── poky/
+│   └── build/
+└── yocto-cache/
+    ├── downloads/
+    └── sstate-cache/
+```
+
+#### 7.3.4 執行第一次 BitBake
+
+建立最小 Linux image：
+
+```bash
+bitbake core-image-minimal
+```
+
+`core-image-minimal` 是驗證 build host、toolchain、metadata 與 QEMU target 的常見起點。第一次建構會花較久，因為需要下載 source、建構 native tools、cross toolchain、target packages 與 rootfs。第二次以後若 `downloads/` 與 `sstate-cache/` 命中，時間會縮短。
+
+建構完成後，輸出通常位於：
+
+```bash
+ls tmp/deploy/images/qemux86-64/
+```
+
+常見產物：
+
+```text
+core-image-minimal-qemux86-64.ext4
+core-image-minimal-qemux86-64.manifest
+core-image-minimal-qemux86-64.testdata.json
+bzImage
+modules-qemux86-64.tgz
+```
+
+可用 QEMU 測試 image：
+
+```bash
+runqemu qemux86-64
+```
+
+若 container 內缺少 `/dev/kvm` 權限，QEMU 仍可能以軟體模擬方式啟動，但速度會慢很多。若要使用 KVM，可在 `docker run` 時加入：
+
+```bash
+docker run -itd \
+    --name yocto_fedora38 \
+    --device /dev/kvm \
+    --group-add $(getent group kvm | cut -d: -f3) \
+    -v ~/yocto-work:/work \
+    yocto-fedora:38
+```
+
+#### 7.3.5 效能最佳化與最佳實務
+
+保存建構產物：不要只把重要資料放在 container writable layer。container 移除後，內部資料也會消失。建議至少保存：
+
+```text
+/work/yocto-cache/downloads/
+/work/yocto-cache/sstate-cache/
+/work/poky/build/tmp/deploy/images/<machine>/
+```
+
+善用 sstate 快取：
+
+```bitbake
+SSTATE_DIR = "/work/yocto-cache/sstate-cache"
+```
+
+團隊共用 sstate 時，需注意：
+
+- 共用目錄權限需允許 container 內的 UID/GID 讀寫。
+- 不同 Yocto release、不同 host distro、不同 layer revision 混用時，sstate 命中率與可追蹤性會下降。
+- CI 可使用唯讀 upstream sstate mirror 加上 job local writable sstate，降低互相污染。
+
+記憶體與磁碟空間建議：
+
+- `core-image-minimal`：建議準備 100 GB 等級磁碟空間較穩妥。
+- OpenBMC image：依平台與 Web UI / debug package 狀態不同，建議保留更多空間給 `tmp/`、`downloads/`、`sstate-cache/`。
+- 若記憶體有限，先降低 `BB_NUMBER_THREADS` 與 `PARALLEL_MAKE`。
+- 可用 `docker stats` 觀察 container 記憶體與 CPU 使用。
+
+```bash
+docker stats yocto_fedora38
+```
+
+UID/GID 權限建議：若 host 掛載目錄屬於 UID 1000 / GID 1000，container 內也使用 UID 1000 / GID 1000 的 `yocto` 使用者，可避免許多 `Permission denied` 或 root-owned output。
+
+若開發機 UID/GID 不一定是 1000，可把 Dockerfile 改成 build args：
+
+```dockerfile
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+RUN groupadd -g ${GROUP_ID} yocto && \
+    useradd -m -u ${USER_ID} -g yocto yocto
+```
+
+建置時指定：
+
+```bash
+docker build \
+    --build-arg USER_ID=$(id -u) \
+    --build-arg GROUP_ID=$(id -g) \
+    -t yocto-fedora:38 .
+```
+
+#### 7.3.6 常見問題與排查
+
+| 問題 | 可能原因 | 排查 / 處理方式 |
+|---|---|---|
+| `OE-core's config sanity checker detected a potential misconfiguration` | Host distro、必要工具或 shell 環境不符合 Yocto sanity check | 查看 `tmp/log/cooker/*`，確認 Yocto release 支援的 host distro 與套件版本 |
+| `Permission denied` | bind mount 權限或 UID/GID 不一致 | 對齊 host 與 container 的 UID/GID，檢查 `/work` 權限 |
+| `do_patch` 失敗 | patch 不適用、換行格式、檔案權限或 source revision 不對 | 看 `temp/log.do_patch`，進 `WORKDIR` 檢查 patch context |
+| 建構中途被 kill | 記憶體不足或 Docker memory limit 太低 | 提高 `--memory`，或降低 `BB_NUMBER_THREADS` / `PARALLEL_MAKE` |
+| `do_fetch` 失敗 | 網路、DNS、proxy、憑證、Git protocol 被擋 | 設定 `http_proxy` / `https_proxy`，或改用 mirror / premirror |
+| 建構速度很慢 | 未命中 sstate、I/O 慢、平行度不合理 | 檢查 `SSTATE_DIR`、磁碟 I/O、`BB_NUMBER_THREADS`、`PARALLEL_MAKE` |
+| Windows 掛載點建構失敗 | 檔案系統大小寫、symlink、權限或 I/O 行為不符合 Linux 預期 | 將 `TMPDIR`、source tree、sstate 放在 Linux filesystem |
+| `make menuconfig` 失敗 | 缺少 ncurses 或 terminal 設定不足 | 安裝 `ncurses-devel`，確認 `TERM` 設定；必要時使用 `screen` / `tmux` |
+| `runqemu` 很慢 | container 沒有 KVM 權限 | 加入 `--device /dev/kvm` 與 kvm group，或接受軟體模擬速度 |
+| Docker 內 DNS 失敗 | Docker daemon DNS 設定或公司網路限制 | 檢查 `/etc/resolv.conf`，必要時於 Docker daemon 設定 DNS |
+
+常用 log 位置：
+
+```bash
+# BitBake cooker log
+ls -l bitbake-cookerdaemon.log
+
+# 單一 recipe task log
+find tmp/work -path '*temp/log.do_compile*' | head
+find tmp/work -path '*temp/log.do_fetch*' | head
+find tmp/work -path '*temp/log.do_patch*' | head
+
+# 最近失敗訊息
+find tmp/work -path '*temp/log.do_*' -mtime -1 | sort | tail
+```
+
+#### 7.3.7 BMC / OpenBMC 專案延伸
+
+若目標不是 Poky 的 `core-image-minimal`，而是 OpenBMC image，流程通常會變成：
+
+```bash
+cd /work
+
+git clone https://github.com/openbmc/openbmc.git
+cd openbmc
+
+# 依平台選擇 machine
+. setup <machine>
+
+bitbake obmc-phosphor-image
+```
+
+OpenBMC 專案建議額外確認：
+
+| 項目 | 檢查方式 | 說明 |
+|---|---|---|
+| MACHINE | `. setup <machine>` 後檢查 `conf/local.conf` | 確認平台是否正確 |
+| SoC layer | `bitbake-layers show-layers` | 需看到 `meta-aspeed`、`meta-nuvoton` 或對應 SoC layer |
+| image output | `tmp/deploy/images/<machine>/` | 找 `.static.mtd.tar`、`.ubi.mtd.tar` 或平台定義 image |
+| sensor config | platform layer / Entity Manager config | 對齊 I2C bus map 與 schematic |
+| update format | image manifest / phosphor software manager | 對齊 update service 與 flash layout |
+
+#### 7.3.8 本章參考資料
+
+- Yocto Project Quick Build: [https://docs.yoctoproject.org/brief-yoctoprojectqs/index.html](https://docs.yoctoproject.org/brief-yoctoprojectqs/index.html)
+- Yocto Project Reference Manual - System Requirements: [https://docs.yoctoproject.org/ref-manual/system-requirements.html](https://docs.yoctoproject.org/ref-manual/system-requirements.html)
+- Docker Docs - Bind mounts: [https://docs.docker.com/engine/storage/bind-mounts/](https://docs.docker.com/engine/storage/bind-mounts/)
+- Docker Docs - Resource constraints: [https://docs.docker.com/engine/containers/resource_constraints/](https://docs.docker.com/engine/containers/resource_constraints/)
+- AMD / Xilinx Wiki - Building Yocto Images using a Docker Container: [https://xilinx-wiki.atlassian.net/wiki/spaces/A/pages/2823422188/Building+Yocto+Images+using+a+Docker+Container](https://xilinx-wiki.atlassian.net/wiki/spaces/A/pages/2823422188/Building+Yocto+Images+using+a+Docker+Container)
 
 ### 8. Device Tree 通用寫法與排查
 
