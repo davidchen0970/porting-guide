@@ -48,6 +48,7 @@
 | 2026-07-06 |  0.4 | Copilot | 撰寫在 Docker 中建立 Yocto 專案並建置完整映像 |
 | 2026-07-06 |  0.5 | Copilot | 撰寫單獨建置與除錯特定套件章節 |
 | 2026-07-06 |  0.6 | Copilot | 撰寫使用 .bbappend 修改套件行為章節 |
+| 2026-07-06 |  0.7 | Copilot | 撰寫使用 devtool 修改原始碼並產出補丁章節 |
 
 ### 0.7 資料來源可信度分級
 
@@ -1957,6 +1958,318 @@ SRC_URI:append:my-bmc-machine = " file://0001-arm-dts-add-my-platform-sensors.pa
 - BitBake User Manual - Syntax and Operators: https://docs.yoctoproject.org/bitbake/bitbake-user-manual/bitbake-user-manual-metadata.html
 - Yocto Project Reference Manual - Variables: https://docs.yoctoproject.org/ref-manual/variables.html
 
+### 7.6 使用 devtool 修改原始碼並產出補丁（Patch）
+
+在上一章整理了 `.bbappend`。`.bbappend` 適合追加 patch、設定檔、systemd override、編譯參數或安裝步驟；但若你要反覆修改套件原始碼，例如修 bug、加功能、調整 C/C++/Python 程式邏輯，直接改 `tmp/work/` 會有維護風險。
+
+`devtool` 是 Yocto / OpenEmbedded 提供的開發輔助工具，用來把「取出原始碼 → 修改 → 建置 → 測試 → 產出 patch → 收回 layer」整理成可追蹤流程。官方文件也將 `devtool` 定位為與 `bitbake` 搭配使用、協助 build、test、package software 的命令列工具。
+
+#### 7.6.1 為什麼不要直接改 tmp/work/
+
+| 問題 | 說明 | 建議處理 |
+|------|------|----------|
+| 修改會消失 | `bitbake -c clean <recipe>`、重新 unpack 或 sstate 還原時，`tmp/work/` 修改可能被清掉 | 用 `devtool modify` 把 source 移到 workspace |
+| patch 整理麻煩 | 手動 `git diff`、複製 patch、修改 `SRC_URI` 容易漏步驟 | 用 `devtool finish` 或 `devtool update-recipe` |
+| 修改紀錄不清楚 | 修改多個檔案後不易回溯 | 在 workspace source tree 用 Git commit 管理 |
+| 不易分享 | 修改只在本機 workdir，很難給其他人重建 | 把 commit 轉成 patch，放回指定 layer |
+| 可能改錯 variant | 例如想改 target，卻改到 `-native` | 用 `devtool status`、`bitbake -e` 檢查 |
+
+#### 7.6.2 devtool 是什麼？
+
+`devtool` 常用於 recipe 開發、source 修改、target 部署測試與 patch 收尾。它的指令風格類似 Git：主命令加 subcommand，例如 `modify`、`build`、`deploy-target`、`update-recipe`、`finish`、`reset`、`status`。
+
+對既有 recipe 來說，`devtool` 主要做幾件事：
+
+1. 建立或使用 `build/workspace/` 這個 workspace layer。
+2. 把 recipe 的 source tree 放到 `workspace/sources/<recipe>/`，通常會是 Git repository。
+3. 在 `workspace/appends/` 產生暫時用的 `.bbappend`。
+4. 透過 `externalsrc` 與 `EXTERNALSRC` 讓 BitBake 改用 workspace 裡的 source tree。
+5. 開發完成後，把 Git commit 轉成 patch，收回原 recipe 或指定 layer。
+
+典型 workspace 結構：
+
+```text
+build/workspace/
+├── appends/
+│   └── <recipe>_*.bbappend
+├── conf/
+│   └── layer.conf
+├── recipes/
+├── sources/
+│   └── <recipe>/
+└── attic/
+```
+
+#### 7.6.3 devtool modify 的運作機制
+
+執行：
+
+```bash
+devtool modify zstd-native
+```
+
+概念流程：
+
+```text
+devtool modify zstd-native
+        │
+        ├─ 讀取目前 build environment 與 recipe metadata
+        ├─ 依 SRC_URI 取得並展開 source
+        ├─ 將 source tree 放到 build/workspace/sources/zstd-native/
+        ├─ 建立或使用 Git repository，讓修改可用 commit 管理
+        ├─ 在 build/workspace/appends/ 建立暫時 .bbappend
+        └─ 透過 externalsrc / EXTERNALSRC 讓 BitBake 改用 workspace source
+```
+
+暫時 `.bbappend` 的常見概念如下；實際內容會依 Yocto 版本、recipe、source layout 而有所不同：
+
+```bitbake
+inherit externalsrc
+
+EXTERNALSRC:pn-zstd-native = "/home/yocto/poky/build/workspace/sources/zstd-native"
+EXTERNALSRC_BUILD:pn-zstd-native = "/home/yocto/poky/build/workspace/sources/zstd-native"
+```
+
+`externalsrc` class 的用途，是讓 recipe 從外部 source tree 建置，而不是照一般流程從 `DL_DIR` 擷取、展開到 `WORKDIR` 後再建置。使用 devtool 時，外部 source tree 通常就是 `build/workspace/sources/<recipe>/`。
+
+#### 7.6.4 實際流程：以 zstd-native 為例
+
+`zstd-native` 是 build host 端工具；若目標是修改會進 BMC rootfs 的 target 套件，請確認 recipe 名稱不是 `-native` 版本。
+
+Step 1：確認 recipe 與 layer 狀態：
+
+```bash
+bitbake-layers show-layers
+bitbake-layers show-recipes zstd
+bitbake -e zstd-native | grep -E '^(PN|BPN|PV|S|B|WORKDIR)='
+```
+
+第一次處理時，可先建置一次：
+
+```bash
+bitbake zstd-native
+```
+
+Step 2：取出 source：
+
+```bash
+devtool modify zstd-native
+```
+
+檢查 workspace：
+
+```bash
+ls build/workspace
+find build/workspace -maxdepth 3 -type f | sort | head -50
+devtool status
+bitbake -e zstd-native | grep '^EXTERNALSRC'
+bitbake -e zstd-native | grep '^EXTERNALSRC_BUILD'
+```
+
+Step 3：修改 source：
+
+```bash
+cd build/workspace/sources/zstd-native
+
+git status
+vim lib/zstd.h
+
+git diff
+```
+
+Step 4：提交修改：
+
+```bash
+git add lib/zstd.h
+git commit -s -m "zstd: fix platform build issue"
+```
+
+建議加 `-s` 產生 Signed-off-by。若要送 upstream，commit message 建議包含問題、原因、修改內容與測試方式。
+
+Step 5：建置與測試：
+
+```bash
+devtool build zstd-native
+# 或
+bitbake zstd-native
+```
+
+檢查安裝結果：
+
+```bash
+bitbake -e zstd-native | grep '^WORKDIR='
+find tmp/work -path '*zstd-native*image*' -type f | head
+find tmp/work -path '*zstd-native*image*include*zstd.h' -print
+```
+
+如果測試失敗，回到 workspace source 修改，再 commit 或 amend，然後重新 build。這段循環不需要重新 fetch / unpack source。
+
+#### 7.6.5 產出 patch：update-recipe 與 finish
+
+完成修改後，常見有兩種收尾方式。
+
+##### 方式 A：devtool update-recipe
+
+```bash
+devtool update-recipe zstd-native
+```
+
+`update-recipe` 會把 workspace source tree 的提交轉成 patch，並更新 recipe metadata。預設行為可能會修改原 recipe 所在 layer；若該 layer 是 upstream / vendor layer，需先確認是否符合團隊流程。
+
+適用情境：
+
+- recipe 是你自己維護的 layer 中的 recipe。
+- 你正在準備把修正送回該 layer。
+- 專案流程允許直接更新原 recipe 所在 layer。
+
+收尾後檢查：
+
+```bash
+git status
+find .. -name '000*.patch' | grep zstd
+bitbake-layers show-appends | grep -A5 -B2 zstd || true
+```
+
+##### 方式 B：devtool finish
+
+若不想修改原 recipe 所在 layer，希望把 patch 與 `.bbappend` 放到自己的 layer，建議用：
+
+```bash
+devtool finish zstd-native ../meta-my-layer
+```
+
+`finish` 會把 workspace 中對 recipe 的修改整理回指定 layer，通常會產生 patch 與對應 `.bbappend`，接著移除 workspace 中該 recipe 的 active 狀態。實際輸出路徑會依 recipe 原本分類、layer 結構、Yocto 版本與 devtool 判斷而有所不同；完成後請直接檢查結果。
+
+```bash
+find ../meta-my-layer -path '*zstd*' -type f | sort
+git -C ../meta-my-layer status
+```
+
+收尾後驗證：
+
+```bash
+devtool status
+bitbake-layers show-appends | grep -A10 -B2 zstd
+bitbake -c cleansstate zstd-native
+bitbake zstd-native
+```
+
+BMC platform patch 建議優先使用 `devtool finish <recipe> <platform-layer>`，讓差異留在自己的 layer，不直接寫回 OE-Core、meta-phosphor、SoC vendor layer。
+
+#### 7.6.6 update-recipe、finish、手寫 .bbappend 的選擇
+
+| 方式 | 產出位置 | 適合情境 | 注意事項 |
+|------|----------|----------|----------|
+| `devtool update-recipe <recipe>` | 通常更新 recipe 所在 layer | recipe 是自己維護，或要回寫原 layer | 可能修改 upstream / vendor layer，需先確認流程 |
+| `devtool finish <recipe> <layer>` | 指定 layer | 平台客製化、BMC porting、產品差異 | 完成後要確認 `.bbappend` 與 patch 路徑 |
+| 手寫 `.bbappend` + patch | 自己指定 | 已有現成 patch，或修改很小且不需 workspace 流程 | patch 內容與 `SRC_URI` 要自行維護 |
+| 改 `SRC_URI` 指向 fork | 自己維護 recipe / bbappend | 長期維護大型 fork | 要管理 branch、SRCREV、授權與同步策略 |
+
+#### 7.6.7 devtool 常用指令
+
+| 指令 | 說明 |
+|------|------|
+| `devtool modify <recipe>` | 取出既有 recipe 的 source 到 workspace，準備修改 |
+| `devtool build <recipe>` | 建置 workspace 中的 recipe |
+| `devtool deploy-target <recipe> <target>` | 將 recipe 安裝結果部署到 live target，通常透過 SSH |
+| `devtool undeploy-target <recipe> <target>` | 從 live target 移除先前部署的檔案 |
+| `devtool update-recipe <recipe>` | 將 workspace 修改整理成 patch 並更新 recipe metadata |
+| `devtool finish <recipe> <layer>` | 將 workspace 修改整理回指定 layer，並結束該 recipe 的 workspace 狀態 |
+| `devtool reset <recipe>` | 從 workspace 移除該 recipe 的 active 狀態 |
+| `devtool status` | 顯示目前 workspace 管理中的 recipes |
+| `devtool edit-recipe <recipe>` | 開啟 workspace 中的 recipe / append 供檢查或修改 |
+| `devtool build-image <image>` | 建置包含 workspace recipe package 的 image |
+
+#### 7.6.8 deploy-target：部署到 live BMC 測試
+
+若 target BMC 已開啟 SSH，且 image 內有必要 runtime dependency，可以用 `deploy-target` 快速把 recipe 的安裝結果推到目標機器：
+
+```bash
+devtool deploy-target <recipe> root@<bmc-ip>
+```
+
+常見測試流程：
+
+```bash
+devtool build <recipe>
+devtool deploy-target <recipe> root@<bmc-ip>
+
+ssh root@<bmc-ip> 'systemctl restart <service>.service'
+ssh root@<bmc-ip> 'journalctl -u <service>.service -b --no-pager | tail -100'
+
+devtool undeploy-target <recipe> root@<bmc-ip>
+```
+
+注意事項：
+
+- `deploy-target` 適合開發測試，不等於正式 OTA / image update。
+- 若 recipe 有 postinst、systemd preset、user/group、D-Bus policy 或多 package split，部署結果需額外確認。
+- 若測的是 BMC service，建議保留 journal、service status、D-Bus object 狀態與 Redfish/IPMI 行為。
+
+#### 7.6.9 常見問題與排查
+
+| 問題 | 可能原因 | 檢查 / 處理方式 |
+|------|----------|------------------|
+| `devtool modify` 失敗 | `SRC_URI` 無法 fetch、相依 layer 未載入、recipe 解析失敗 | 先跑 `bitbake -c fetch <recipe>`、`bitbake-layers show-recipes <recipe>` |
+| build 仍吃舊 source | workspace append 未生效，或 recipe variant 不對 | `devtool status`、`bitbake -e <recipe> | grep '^EXTERNALSRC'` |
+| `update-recipe` 沒產出 patch | Git working tree 沒有 commit，或變更不是 source patch 類型 | `git status`、`git log --oneline`，先 commit 再收尾 |
+| `finish` 找不到 layer | layer path 錯、未建立 layer、或不符合 layer 結構 | `bitbake-layers show-layers`、確認 `conf/layer.conf` |
+| 收尾後 build 失敗 | patch context 不符、`.bbappend` 路徑不對、`FILESEXTRAPATHS` 不符合 | `bitbake-layers show-appends`、`log.do_patch`、`bitbake -e <recipe>` |
+| `deploy-target` 後 service 起不來 | runtime dependency 未在 target image、中間狀態與完整 image 不一致 | 看 `journalctl`、`ldd`、D-Bus policy、systemd unit |
+| `devtool reset` 後找不到修改 | 修改可能移到 `workspace/attic/` 或尚未 commit | 檢查 `build/workspace/attic/` 與 Git 狀態 |
+
+常用排查指令：
+
+```bash
+devtool status
+find build/workspace/appends -type f -maxdepth 2 -print
+
+git -C build/workspace/sources/<recipe> status
+git -C build/workspace/sources/<recipe> log --oneline --decorate -5
+
+bitbake -e <recipe> | grep '^EXTERNALSRC'
+bitbake -e <recipe> | grep '^S='
+bitbake -e <recipe> | grep '^B='
+
+bitbake-layers show-appends | grep -A10 -B2 '<recipe>'
+```
+
+#### 7.6.10 BMC / OpenBMC 實務建議
+
+- 修改 OpenBMC service source 時，先確認 recipe 名稱與 service 名稱不一定相同。可用 `bitbake-layers show-recipes | grep <keyword>` 搜尋。
+- 若只是改 JSON config、systemd override、D-Bus policy 或安裝路徑，優先評估 `.bbappend`，不一定需要 `devtool`。
+- 若是改 C++ daemon、host interface、sensor service、fan control service、Redfish backend，建議用 `devtool modify` 管理 source 變更。
+- 若修改會長期保留在專案，收尾時優先用 `devtool finish <recipe> <platform-layer>`，把 patch 留在平台 layer。
+- 若準備送 upstream，commit message 建議包含 issue、root cause、修改內容、測試方式，並保留 Signed-off-by。
+- 對 BMC target 做 `deploy-target` 測試後，仍需回到 image build 驗證，避免 live target 測試與正式 rootfs 組成不同。
+
+#### 7.6.11 最佳實踐
+
+1. 不要把 `tmp/work/` 內的手動修改當作正式成果。
+2. 用 `devtool modify` 進入 source 開發流程，用 Git commit 管理每一組可解釋的修改。
+3. 每次收尾前先確認 `git status` 是乾淨狀態，並檢查 commit message。
+4. 平台差異優先用 `devtool finish <recipe> <platform-layer>` 收回自己的 layer。
+5. 收尾後執行 `devtool status`，確認 workspace 不再覆蓋該 recipe。
+6. 用 `bitbake-layers show-appends` 與 `bitbake -e` 確認正式 layer 中的 append / patch 已生效。
+7. 至少從 `do_patch`、`do_compile`、完整 `bitbake <recipe>` 驗證一次；若會進 image，再重建 image。
+8. 若是 live target 測試，`deploy-target` 只能視為開發驗證，不能取代正式 update / image boot test。
+
+#### 7.6.12 回查結果
+
+本章回查後已補強：
+
+- 補上 `devtool modify`、workspace layer、`externalsrc`、`EXTERNALSRC` 的關係。
+- 補上 `zstd-native` 與 target recipe 的差異提醒，避免把 host tool 變更誤認為會進 BMC rootfs。
+- 補上 `update-recipe` 與 `finish` 的使用差異，並建議 BMC platform patch 優先收回自己的 layer。
+- 補上 `deploy-target` 的用途與限制。
+- 補上收尾後的驗證流程：`devtool status`、`show-appends`、`bitbake -e`、`cleansstate` 後重建。
+
+#### 7.6.13 本章參考資料
+
+- Yocto Project Development Tasks Manual - Using the devtool command-line tool: [https://docs.yoctoproject.org/dev/dev-manual/devtool.html](https://docs.yoctoproject.org/dev/dev-manual/devtool.html)
+- Yocto Project Reference Manual - devtool Quick Reference: [https://docs.yoctoproject.org/ref-manual/devtool-reference.html](https://docs.yoctoproject.org/ref-manual/devtool-reference.html)
+- Yocto Project Reference Manual - Classes / externalsrc: [https://docs.yoctoproject.org/ref-manual/classes.html](https://docs.yoctoproject.org/ref-manual/classes.html)
+
 ### 8. Device Tree 通用寫法與排查
 
 DT 是描述硬體拓樸的資料結構，讓 kernel 不需把板級資訊硬寫在 driver 中。建議所有裝置先查 binding，再寫 DTS。
@@ -2276,3 +2589,4 @@ Boot time 拆解：BootROM、U-Boot、kernel、userspace、network ready、API r
 - Poky repository note: [https://git.yoctoproject.org/poky/about/](https://git.yoctoproject.org/poky/about/)
 - OpenEmbedded and The Yocto Project: [https://www.openembedded.org/wiki/OpenEmbedded_and_The_Yocto_Project](https://www.openembedded.org/wiki/OpenEmbedded_and_The_Yocto_Project)
 - OpenBMC Yocto development: [https://github.com/openbmc/docs/blob/master/yocto-development.md](https://github.com/openbmc/docs/blob/master/yocto-development.md)
+- Yocto Project Reference Manual - externalsrc class: [https://docs.yoctoproject.org/ref-manual/classes.html](https://docs.yoctoproject.org/ref-manual/classes.html)
