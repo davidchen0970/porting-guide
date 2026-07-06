@@ -54,6 +54,7 @@
 | 2026-07-06 |  0.10 | Copilot | OpenBMC 新 Machine Layer 與 DTS Bring-up 系統化流程 |
 | 2026-07-06 |  0.11 | Copilot | 撰寫 Porting ADC Sensor |
 | 2026-07-06 |  0.12 | Copilot | 撰寫 Temperature Sensor |
+| 2026-07-06 |  0.13 | Copilot | 撰寫 Voltage Sensor |
 
 ### 0.7 資料來源可信度分級
 
@@ -3778,6 +3779,8 @@ Sensor 欄位範本：
 | [待填] | temp/voltage/fan | hwmon/i2c | [待填] | C/V/RPM |  [待填] |   [待填] | [待填]     | [待填]  | [待填]   |
 
 
+#### 11.1 Sensor 目的與共通架構
+#### 11.2 Sensor 種類總覽
 #### 11.3 ADC Sensor
 
 本節整理 OpenBMC 中 ADC voltage sensor 的 porting 流程。ADC 適合用來量測板上類比電壓，常見包含 P12V、P5V、P3V3、P1V8、CPU Vcore、standby rail、thermistor voltage、hardware strap voltage、battery sense 等。
@@ -4969,6 +4972,427 @@ D-Bus / 系統整合：
 - Linux hwmon sysfs interface: https://docs.kernel.org/hwmon/sysfs-interface.html
 - Linux LM75 Device Tree binding: https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/hwmon/lm75.yaml
 - Linux LM75 hwmon driver documentation: https://www.kernel.org/doc/html/latest/hwmon/lm75.html
+
+#### 11.5 Voltage Sensor
+
+本節整理 OpenBMC 中 Voltage Sensor 的適用情境、資料路徑與 PMBus / hwmon 類電壓感測器 porting 流程。ADC 類比電壓的細節已在 `11.1 ADC Sensor` 說明；本節重點放在 VR controller、PSU、PMBus device 與獨立 hwmon 晶片等數位讀取來源。
+
+##### 11.5.1 適用情境
+
+Voltage Sensor 用於監控系統中各級電源軌的電壓準位，目的在於確認供電穩定度、比對硬體規格，以及讓電源異常能被 D-Bus、Redfish、IPMI SDR、SEL / Journal 或平台 policy 消費。常見監控對象包含：
+
+```text
+P12V：主電源輸入
+P5V：週邊介面
+P3V3：I/O 與晶片組
+P1V8：低壓介面
+CPU_VCCIN：CPU 核心輸入電壓
+CPU_VDDCR：CPU 計算核心電壓
+DIMM rail：記憶體供電
+VR output voltage：電壓調節模組輸出
+PSU input voltage：電源供應器輸入端
+PSU output voltage：電源供應器輸出端
+```
+
+在 OpenBMC 中，Voltage Sensor 通常以 D-Bus sensor object 呈現，典型路徑如下：
+
+```text
+/xyz/openbmc_project/sensors/voltage/<sensor_name>
+```
+
+`dbus-sensors` 的設計是由不同 sensor daemon 從 `hwmon`、D-Bus 或直接 driver 讀值，並建立 `xyz.openbmc_project.Sensor.*` 介面；上層常見消費者包含 Redfish、IPMI SDR、logging 與控制策略。
+
+##### 11.5.2 資料路徑
+
+Voltage Sensor 依硬體來源可分為兩條主要資料路徑。
+
+路徑 A：ADC 類比電壓，細節請回查 `11.1 ADC Sensor`。
+
+```text
+類比電壓
+    ↓
+分壓電阻 / 濾波電路
+    ↓
+AST2600 ADC
+    ↓
+iio-hwmon
+    ↓
+sysfs：/sys/class/hwmon/hwmonX/inY_input
+    ↓
+adcsensor daemon
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/voltage/<Name>
+```
+
+路徑 B：PMBus / VR 控制器 / PSU / 獨立 hwmon 晶片。
+
+```text
+VR Controller / PSU / PMBus device
+    ↓
+I2C / SMBus 匯流排
+    ↓
+Linux kernel I2C driver
+    ↓
+PMBus kernel driver 或晶片專用 hwmon driver
+    ↓
+hwmon sysfs：/sys/class/hwmon/hwmonX/in*_input
+    ↓
+OpenBMC sensor daemon
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/voltage/<Name>
+    ↓
+Redfish / WebUI / IPMI / logging / policy
+```
+
+實務上，服務名稱會依平台採用的 sensor stack 而不同。常見可能是 `psusensor`、`phosphor-hwmon`、平台自有 hwmon voltage daemon，或專案命名的 `HwmonVoltageSensor` 類服務。Porting 時應以 image 內實際 systemd units、Entity Manager schema 與 `sensor-info.json` 為準。
+
+##### 11.5.3 常見來源分類與特性
+
+| 來源類型 | 讀取介面 | OpenBMC 對應服務 | 關鍵注意事項 |
+| :--- | :--- | :--- | :--- |
+| ADC 分壓電阻 | IIO / hwmon | `adcsensor` | 需計算 `ScaleFactor`；細節回查 ADC Sensor 章節 |
+| PMBus VR，例如 CPU / DIMM VR | PMBus driver | `psusensor` / hwmon voltage daemon / 平台服務 | 需確認 I2C bus、address、PMBus Page 與 rail 對應 |
+| PMBus PSU | PMBus driver | `psusensor` 或 PSU sensor service | 通常同時有 input voltage、output voltage、power、current、fan 等資料 |
+| 獨立 hwmon 晶片，例如 LTC2990 / INA 類 device | I2C hwmon driver | hwmon 類 sensor service | 需在 Device Tree 或 board info 中啟用，並確認 label 對應 |
+| 主機板內建 VR / CPU telemetry | 專用 driver 或 PECI / SMBus 類路徑 | 專用 daemon | 依 CPU / vendor driver 與平台策略確認 |
+
+Linux hwmon sysfs 對 voltage 使用 `in<number>_input` 命名；多數文件慣例中 voltage 編號常從 `in0` 開始，而 `*_input` 為單一固定小數格式數值。實際 rail 標籤仍需靠 `in*_label`、schematic、driver 文件或實機量測比對確認。
+
+##### 11.5.4 Porting 步驟：PMBus / hwmon Voltage Sensor
+
+###### Step 1：確認硬體資訊與 PMBus Page
+
+從 schematic、BOM、VR datasheet、PSU MFR 文件與 I2C bus map 取得下列資料：
+
+```text
+- VR / PSU / hwmon 晶片型號，例如 MP2971、ISL68137、TPS53679、LTC2990
+- 所在 I2C bus number
+- 7-bit I2C device address，例如 0x40、0x4C、0x4E
+- VR 支援的輸出電壓軌數量，也就是 Page 數量
+- 每個 Page 對應的 rail 名稱，例如 Page 0 = Vcore，Page 1 = VCCGT
+- 電壓讀取命令，PMBus 常見 READ_VOUT = 0x8B
+- 是否存在外部回授分壓或 sense network
+- nominal voltage、warning threshold、critical threshold
+```
+
+範例參數：
+
+```text
+Sensor Name: CPU0_VCCIN
+Chip: MP2971
+I2C Bus: 8
+Address: 0x40
+Page: 0
+Expected Voltage: 1.80 V
+Warning High: 1.89 V
+Critical High: 1.98 V
+Warning Low: 1.71 V
+Critical Low: 1.62 V
+PowerState: On
+```
+
+###### Step 2：I2C 位址與基本通訊驗證
+
+先確認 I2C bus 上能看到目標位址：
+
+```bash
+i2cdetect -y 8
+```
+
+預期在 `0x40` 位置看到裝置回應。若該 device 對 SMBus quick command 敏感，請優先查 datasheet、平台 bring-up guideline 或改用較保守的讀取方式。
+
+若需手動讀取 PMBus `READ_VOUT`，可先設定 Page，再讀取 command `0x8B`。不同 IC 對 byte / word order 與 VOUT_MODE 解碼可能不同，下列指令主要用於確認通訊與大致資料變化：
+
+```bash
+# 設定 PMBus Page 0
+i2cset -y 8 0x40 0x00 0x00
+
+# 讀取 READ_VOUT，command 0x8B
+i2cget -y 8 0x40 0x8B w
+```
+
+若能取得 `0xXXXX` 類結果，代表 I2C transaction 有回應。是否為正確電壓值，仍需結合 `VOUT_MODE`、driver 解碼、sysfs 讀值與電表量測比對。
+
+###### Step 3：Device Tree 加入 PMBus / VR 節點
+
+以下以 MP2971 在 `i2c8`、address `0x40` 為例。實際 compatible string 需以目前 kernel binding、driver 支援清單與 vendor BSP 為準。
+
+```dts
+&i2c8 {
+    status = "okay";
+    clock-frequency = <100000>;
+
+    vr-controller@40 {
+        compatible = "mps,mp2971";
+        reg = <0x40>;
+        label = "cpu_vr";
+    };
+};
+```
+
+常見 compatible / driver 方向：
+
+```text
+"mps,mp2971"
+"mps,mp2973"
+"isl,isl68137"
+"ti,tps53679"
+"pmbus"：通用 fallback，需確認 generic PMBus driver 能安全辨識該 device 的能力
+```
+
+Kernel 設定需包含 PMBus core、對應 PMBus device driver 或通用 PMBus driver。例如：
+
+```text
+CONFIG_PMBUS
+CONFIG_SENSORS_PMBUS
+CONFIG_SENSORS_MP2975 / CONFIG_SENSORS_ISL68137 / CONFIG_SENSORS_TPS53679 類似選項
+```
+
+實際 config 名稱會隨 kernel 版本與 vendor BSP 有差異，請用 `grep -R "config SENSORS_" drivers/hwmon/pmbus/` 或 kernel `.config` 驗證。
+
+###### Step 4：確認 driver probe 與 hwmon sysfs 節點
+
+開機後先看 driver 是否 probe 成功：
+
+```bash
+dmesg | grep -Ei 'pmbus|mp297|isl681|tps536|hwmon'
+```
+
+列出目前 hwmon 裝置：
+
+```bash
+for i in /sys/class/hwmon/hwmon*; do
+    echo "$i: $(cat "$i/name" 2>/dev/null)"
+done
+```
+
+假設 MP2971 對應到 `hwmon3`，可檢查 voltage input：
+
+```bash
+ls /sys/class/hwmon/hwmon3/in*_input
+cat /sys/class/hwmon/hwmon3/in0_input
+cat /sys/class/hwmon/hwmon3/in0_label 2>/dev/null || true
+```
+
+hwmon voltage input 通常以 millivolt 為單位，例如：
+
+```text
+1800 = 1.800 V
+900  = 0.900 V
+12000 = 12.000 V
+```
+
+多 Page VR 的 `in*_input` 對應需以 driver 與實機結果確認。常見但不可直接假設的映射如下：
+
+```text
+in0_input → Page 0，例如 VCCIN
+in1_input → Page 1，例如 VCCGT
+in2_input → Page 2，例如 VCCSA
+```
+
+若 driver 提供 `in*_label`，請優先用 label 與 schematic rail name 建立對照。若沒有 label，建議透過 Page 切換、負載變化、VR telemetry tool、oscilloscope / DMM 量測共同確認。
+
+###### Step 5：Entity Manager / Sensor JSON 配置
+
+設定檔常見位置包含：
+
+```text
+/usr/share/entity-manager/configurations/
+meta-<platform>/recipes-phosphor/configuration/entity-manager/*.json
+平台自有 sensor configuration recipe
+```
+
+以下為概念範例。實際 schema 需依專案採用的 `entity-manager` 與 sensor daemon 支援欄位調整。關鍵是 `Name`、`Type`、`Bus`、`Address`、`Page`、`ScaleFactor`、`PowerState` 與 thresholds 要對齊。
+
+```json
+{
+    "Name": "CPU0_VCCIN",
+    "Type": "MP2971",
+    "Bus": 8,
+    "Address": "0x40",
+    "Page": 0,
+    "PollInterval": 500,
+    "ScaleFactor": 1.0,
+    "Offset": 0.0,
+    "MaxValue": 2.5,
+    "MinValue": 0.0,
+    "PowerState": "On",
+    "Thresholds": [
+        {
+            "Name": "upper critical",
+            "Direction": "greater than",
+            "Severity": 1,
+            "Value": 1.98
+        },
+        {
+            "Name": "lower critical",
+            "Direction": "less than",
+            "Severity": 1,
+            "Value": 1.62
+        },
+        {
+            "Name": "upper non critical",
+            "Direction": "greater than",
+            "Severity": 0,
+            "Value": 1.89
+        },
+        {
+            "Name": "lower non critical",
+            "Direction": "less than",
+            "Severity": 0,
+            "Value": 1.71
+        }
+    ]
+}
+```
+
+注意事項：
+
+- `Type` 必須與 sensor daemon / Entity Manager 目前支援的類型一致。若 JSON 被解析但 D-Bus sensor 未產生，優先查 Entity Manager log 與 sensor daemon log。
+- `Page` 對多輸出 VR 十分關鍵。若 Page 錯誤，sensor 可能讀到另一條 rail，數值仍看似合理但對應錯誤。
+- 若 hwmon driver 已輸出正確 mV，`ScaleFactor` 常設為 `1.0`。若 sense point 有外部比例網路，才依硬體比例補償。
+- `PowerState` 建議與 rail 供電條件一致。CPU / DIMM VR 通常只在 host power on 後有效；PSU input、standby rail 則可能屬於 AlwaysOn。
+- threshold 建議由 rail nominal 與 tolerance 推導，並與硬體保護門檻、VR fault limit、系統降載策略同步。
+
+###### Step 6：啟動服務與 D-Bus 驗證
+
+依平台實際服務名稱重啟對應 sensor service。若專案使用 `HwmonVoltageSensor` 類服務，可採用：
+
+```bash
+systemctl restart xyz.openbmc_project.HwmonVoltageSensor.service
+journalctl -u xyz.openbmc_project.HwmonVoltageSensor.service -b --no-pager | tail -100
+```
+
+若平台使用 `psusensor` 或其他服務，請先列出相關 units：
+
+```bash
+systemctl list-units '*sensor*' --no-pager
+systemctl list-units '*psu*' --no-pager
+```
+
+確認 D-Bus 物件：
+
+```bash
+busctl tree xyz.openbmc_project.HwmonVoltageSensor
+
+busctl get-property \
+  xyz.openbmc_project.HwmonVoltageSensor \
+  /xyz/openbmc_project/sensors/voltage/CPU0_VCCIN \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+
+busctl introspect \
+  xyz.openbmc_project.HwmonVoltageSensor \
+  /xyz/openbmc_project/sensors/voltage/CPU0_VCCIN
+```
+
+若服務名稱不同，可先用以下方式找 sensor owner：
+
+```bash
+busctl tree | grep -i sensors
+busctl get-property \
+  $(busctl tree | grep -i HwmonVoltageSensor | head -1) \
+  /xyz/openbmc_project/sensors/voltage/CPU0_VCCIN \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+```
+
+實務上更穩定的方式是用 mapper 查 object owner：
+
+```bash
+busctl call xyz.openbmc_project.ObjectMapper \
+  /xyz/openbmc_project/object_mapper \
+  xyz.openbmc_project.ObjectMapper GetObject \
+  sas \
+  /xyz/openbmc_project/sensors/voltage/CPU0_VCCIN \
+  0
+```
+
+##### 11.5.5 進階除錯與常見陷阱
+
+| 問題現象 | 可能方向 | 排查 / 處理方式 |
+| :--- | :--- | :--- |
+| `i2cdetect` 可看到 address，但無 `in*_input` | kernel driver 未 bind；compatible 不匹配；PMBus driver 未啟用 | 查 `dmesg`、DTS compatible、kernel `.config`；必要時用 `new_device` 暫時驗證 driver |
+| 讀值為 0、固定最大值或 `65535` | VR 未上電、PMBus timeout、device standby、讀到不支援 command | 確認 host power state、VR enable、PMBus status；降低 I2C clock 後比對 |
+| VCCIN 應為 1.8 V 但顯示 0.9 V | Page / channel 對應錯誤；讀到其他 rail；driver 解碼或 scaling 不符 | 查 `in*_label`、切 Page 讀 `READ_VOUT`、用 DMM 量測 rail，建立對照表 |
+| 多顆 VR address 相同 | I2C address strap 或 mux channel 判讀錯誤 | 查 schematic ADDR pin 與 mux topology；確認 bus number 是 mux 後 channel |
+| D-Bus sensor 未出現 | JSON `Type`、`Bus`、`Address`、`Page` 或 schema 欄位不符合 daemon 預期 | 查 Entity Manager log、sensor daemon log、`busctl tree xyz.openbmc_project.EntityManager` |
+| Redfish 看得到 sensor 但數值不變 | daemon poll 未更新、sysfs 本身不變、PowerState gating、讀值 cache | 直接 `cat in*_input`，再看 D-Bus `Value` 與 service journal |
+| 電壓與電表有固定比例誤差 | 外部分壓、sense point 不同、driver scaling 與平台設計不一致 | 計算硬體比例並調整 `ScaleFactor` / platform config；保留量測紀錄 |
+| log 出現 hwmon / pmbus symbol 或 module 相關錯誤 | PMBus core 或晶片 driver 未進 image / module 未載入 | 確認 kernel config、module autoload、`modprobe pmbus` 與 image package |
+| threshold 觸發但沒有事件紀錄 | Threshold interface 存在但 logging policy 未接，或 alarm flag 未被消費 | 查 D-Bus threshold properties、phosphor-logging、event service 與 Redfish event 設定 |
+
+##### 11.5.6 Voltage Sensor Porting 驗收 Checklist
+
+硬體設計階段：
+
+```text
+[ ] Voltage source 確認：ADC / PMBus VR / PSU / 獨立 hwmon 晶片
+[ ] Rail 名稱與 nominal voltage 確認
+[ ] I2C bus / address / mux channel 確認
+[ ] VR Page 數量與各 Page 對應 rail 確認
+[ ] 外部 sense / feedback 分壓是否存在，若有則計算 ScaleFactor
+[ ] Warning / Critical threshold 依 rail tolerance 與保護策略設定
+[ ] 量測點、sense point、sysfs rail name 已建立對照
+```
+
+Device Tree / Kernel：
+
+```text
+[ ] 對應 I2C bus node `status = "okay"`
+[ ] PMBus / VR / PSU / hwmon node 的 compatible 與 reg 正確
+[ ] kernel config 已開啟 PMBus core 與對應 chip driver
+[ ] 開機後 dmesg 無 probe 失敗或 timeout
+[ ] /sys/class/hwmon/hwmonX/in*_input 存在且讀值合理
+[ ] `in*_label` 或實測對照可正確映射到 rail
+[ ] 使用 DMM / oscilloscope 比對 sysfs 數值，誤差符合平台規格
+[ ] Power state 切換時，讀值、availability、daemon log 行為符合預期
+```
+
+Entity Manager / Userspace：
+
+```text
+[ ] JSON 設定檔已放入平台 layer 或 image 內正確路徑
+[ ] Type 名稱與 sensor daemon 支援清單一致
+[ ] Bus / Address / Page / Index 數值正確
+[ ] ScaleFactor 與 Offset 已按硬體設計調整
+[ ] PollInterval 符合監控需求，建議先以 500~2000 ms 驗證
+[ ] PowerState 設定符合 rail 供電時序
+[ ] Thresholds 上下限與 Severity 已設定並經 review
+```
+
+D-Bus / 系統整合：
+
+```text
+[ ] 對應 sensor service 啟動無錯誤
+[ ] D-Bus tree 出現 /xyz/openbmc_project/sensors/voltage/<Name>
+[ ] `xyz.openbmc_project.Sensor.Value` 可讀到 double 值，單位為 V
+[ ] Warning / Critical threshold properties 寫入 D-Bus
+[ ] Redfish /redfish/v1/Chassis/.../Sensors 可查到 sensor
+[ ] 負載或電源變化時，sysfs 與 D-Bus 數值同步變化
+[ ] 過壓 / 欠壓條件下，對應 alarm flag 變為 true
+[ ] threshold 觸發時有 journal / event log / SEL 或平台定義事件
+[ ] 若有電源管理或降載 policy，電壓異常時行為符合規格
+```
+
+##### 11.5.7 本章參考資料
+
+- OpenBMC dbus-sensors README：https://github.com/openbmc/dbus-sensors/blob/master/README.md
+- Linux kernel hwmon sysfs interface：https://www.kernel.org/doc/html/latest/hwmon/sysfs-interface.html
+- Linux kernel PMBus driver documentation：https://docs.kernel.org/hwmon/pmbus.html
+- Linux kernel PMBus register definitions：https://github.com/torvalds/linux/blob/master/drivers/hwmon/pmbus/pmbus.h
+
+#### 11.6 Current Sensor
+#### 11.7 Power Sensor
+#### 11.8 Fan Tach Sensor
+#### 11.9 PSU Sensor
+#### 11.10 CPU / PECI Sensor
+#### 11.11 NVMe Sensor
+#### 11.12 GPU Sensor
+#### 11.13 External / Virtual Sensor
+#### 11.14 Presence / Intrusion / GPIO State Sensor
+#### 11.15 Redfish Association
+#### 11.16 Sensor 共用除錯指令與附錄
 
 ### 12. Fan Control
 
