@@ -49,6 +49,7 @@
 | 2026-07-06 |  0.5 | Copilot | 撰寫單獨建置與除錯特定套件章節 |
 | 2026-07-06 |  0.6 | Copilot | 撰寫使用 .bbappend 修改套件行為章節 |
 | 2026-07-06 |  0.7 | Copilot | 撰寫使用 devtool 修改原始碼並產出補丁章節 |
+| 2026-07-06 |  0.8 | Copilot | 撰寫自訂 .bb Recipe 章節 |
 
 ### 0.7 資料來源可信度分級
 
@@ -2269,6 +2270,612 @@ bitbake-layers show-appends | grep -A10 -B2 '<recipe>'
 - Yocto Project Development Tasks Manual - Using the devtool command-line tool: [https://docs.yoctoproject.org/dev/dev-manual/devtool.html](https://docs.yoctoproject.org/dev/dev-manual/devtool.html)
 - Yocto Project Reference Manual - devtool Quick Reference: [https://docs.yoctoproject.org/ref-manual/devtool-reference.html](https://docs.yoctoproject.org/ref-manual/devtool-reference.html)
 - Yocto Project Reference Manual - Classes / externalsrc: [https://docs.yoctoproject.org/ref-manual/classes.html](https://docs.yoctoproject.org/ref-manual/classes.html)
+
+### 7.7 撰寫一個自訂的 .bb Recipe
+
+前面章節已經說明兩種常見情境：用 `.bbappend` 修改既有 recipe 的 metadata，或用 `devtool` 對既有 recipe 的原始碼產出 patch。這一章處理另一種情境：**套件還不存在，需要自己新增一個 `.bb` recipe**。
+
+在 BMC / OpenBMC porting 中，新增 recipe 常見於：
+
+- 新增平台自有 daemon、CLI 工具或 factory tool。
+- 加入公司內部 library、測試程式或 provisioning utility。
+- 包裝客戶提供的 binary、script、configuration bundle。
+- 加入 Yocto / OpenEmbedded 尚未收錄的開源專案。
+- 建立 OpenBMC 平台 service、systemd unit、D-Bus config、Redfish backend 相關工具。
+
+Recipe 的目標不是只讓程式「能編譯」，而是讓 BitBake 能以可重現方式完成：取得 source、套用 patch、設定、編譯、安裝、切 package、通過 QA、加入 image，並留下授權資訊。
+
+#### 7.7.1 Recipe 是什麼？
+
+Recipe 是 `.bb` 檔案，屬於 Yocto / OpenEmbedded metadata 的核心。每一個要被 OpenEmbedded build system 建置的軟體元件，都需要 recipe 描述如何取得、建置、安裝與打包。
+
+最小概念包含三件事：
+
+1. **去哪裡拿原始碼**：`SRC_URI`、`SRCREV`、checksum。
+2. **怎麼建置它**：`inherit` 哪個 class、`do_configure`、`do_compile`。
+3. **安裝到哪裡並怎麼打包**：`do_install`、`${D}`、`FILES:${PN}`、`PACKAGES`。
+
+常見 recipe 欄位：
+
+| 區塊 | 常見變數 / task | 說明 |
+|------|-----------------|------|
+| 基本資訊 | `SUMMARY`、`DESCRIPTION`、`HOMEPAGE`、`SECTION` | 給人與 package manager 看的套件資訊 |
+| 授權 | `LICENSE`、`LIC_FILES_CHKSUM` | Yocto 會檢查授權檔案 checksum，避免授權內容變更未被注意 |
+| 原始碼 | `SRC_URI`、`SRCREV`、`S`、`UNPACKDIR` | source、patch、本地檔案、Git revision、source directory |
+| 相依 | `DEPENDS`、`RDEPENDS:${PN}`、`RRECOMMENDS:${PN}` | build-time 與 runtime dependency |
+| 建置 | `inherit`、`EXTRA_OECMAKE`、`EXTRA_OEMESON`、`do_compile` | 決定使用 Makefile、Autotools、CMake、Meson、Python 等流程 |
+| 安裝 | `do_install`、`${D}`、`${bindir}`、`${sysconfdir}` | 把檔案安裝到暫存 root，供後續 package 使用 |
+| 打包 | `PACKAGES`、`FILES:${PN}`、`CONFFILES:${PN}` | 決定哪些檔案被放進哪些 package |
+| 服務 | `inherit systemd`、`SYSTEMD_SERVICE:${PN}` | 安裝與啟用 systemd service |
+
+#### 7.7.2 建立 recipe 的三種方式
+
+| 方式 | 說明 | 適用情境 |
+|------|------|----------|
+| 手寫 `.bb` | 從空白 recipe 開始撰寫 | 熟悉 BitBake 語法，或內容很簡單 |
+| `recipetool create` | 根據本地 source、tarball、Git URL 產生 recipe 骨架 | 快速起步，尤其適合不確定 build system 時 |
+| `devtool add` | 產生 recipe，同時建立 workspace 方便後續修改 source | 新增套件後還要繼續改 source、補 patch、測試 |
+
+實務建議：就算已經熟悉 Yocto，也可以先用 `recipetool create` 或 `devtool add` 產生骨架，再手動修整 recipe。官方文件也將 `devtool add`、`recipetool create`、參考相似 recipe 列為建立 base recipe 的常見入口。
+
+#### 7.7.3 Recipe 放在哪裡？
+
+Recipe 應放在自己維護的 layer，不要直接修改 OE-Core、meta-phosphor、SoC vendor layer 或客戶提供的 BSP layer。
+
+建議目錄命名：
+
+```text
+meta-my-layer/
+└── recipes-<category>/
+    └── <recipe-name>/
+        ├── files/
+        │   ├── <local-source-or-config>
+        │   └── <service-or-patch>
+        └── <recipe-name>_<version>.bb
+```
+
+常見分類：
+
+| 分類目錄 | 適合內容 |
+|----------|----------|
+| `recipes-apps/`、`recipes-extended/` | 一般應用程式、CLI 工具 |
+| `recipes-devtools/` | 開發工具、build helper、factory tool |
+| `recipes-kernel/` | kernel module、kernel fragment 相關 recipe |
+| `recipes-bsp/` | bootloader、board-level BSP component |
+| `recipes-phosphor/` | OpenBMC phosphor 相關 service / config |
+| `recipes-support/` | library、helper、support package |
+| `recipes-core/` | system core 元件；需謹慎使用 |
+
+重點不是目錄名稱本身，而是 layer 的 `conf/layer.conf` 中 `BBFILES` pattern 要包含這些 `.bb` 檔案。新增 recipe 後可用：
+
+```bash
+bitbake-layers show-recipes hello
+bitbake-layers show-layers
+```
+
+確認 BitBake 能看到你的 layer 與 recipe。
+
+#### 7.7.4 手寫 Hello World recipe
+
+##### Step 1：建立 layer
+
+若還沒有自己的 layer：
+
+```bash
+bitbake-layers create-layer ../meta-my-layer
+bitbake-layers add-layer ../meta-my-layer
+bitbake-layers show-layers
+```
+
+##### Step 2：建立目錄與原始碼
+
+```bash
+mkdir -p ../meta-my-layer/recipes-helloworld/hello/files
+```
+
+建立 `helloworld.c`：
+
+```c
+#include <stdio.h>
+
+int main(void)
+{
+    printf("Hello world!\n");
+    return 0;
+}
+```
+
+放到：
+
+```text
+../meta-my-layer/recipes-helloworld/hello/files/helloworld.c
+```
+
+##### Step 3：建立 recipe
+
+建立：
+
+```text
+../meta-my-layer/recipes-helloworld/hello/hello_1.0.bb
+```
+
+內容：
+
+```bitbake
+SUMMARY = "Simple hello world application"
+DESCRIPTION = "A minimal single-file C application used to demonstrate a custom Yocto recipe."
+HOMEPAGE = "https://example.com/hello"
+SECTION = "examples"
+LICENSE = "MIT"
+LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
+
+SRC_URI = "file://helloworld.c"
+
+# 新版 Yocto 常見寫法：明確指定 local file unpack 目的地與 source directory
+S = "${WORKDIR}/sources"
+UNPACKDIR = "${S}"
+
+do_compile() {
+    ${CC} ${CFLAGS} ${LDFLAGS} helloworld.c -o helloworld
+}
+
+do_install() {
+    install -d ${D}${bindir}
+    install -m 0755 helloworld ${D}${bindir}/helloworld
+}
+```
+
+補充：部分舊版 Yocto 範例會寫 `S = "${WORKDIR}"`，因為 `file://helloworld.c` 會被放在 `WORKDIR` 下。近年 Yocto 文件逐步將 unpack 目的地顯式化，看到 `S = "${WORKDIR}/sources"` 與 `UNPACKDIR = "${S}"` 屬於合理寫法。若專案 branch 較舊、不支援 `UNPACKDIR`，可改回 `S = "${WORKDIR}"`，並以實際 `bitbake -e hello | grep '^S='` 與 `WORKDIR` 結果為準。
+
+##### Step 4：建置 recipe
+
+```bash
+bitbake hello
+```
+
+注意 target 名稱通常是 `PN`，也就是 recipe 檔名中第一個 `_` 前面的部分。`hello_1.0.bb` 對應：
+
+```text
+PN = "hello"
+PV = "1.0"
+PR = "r0"   # 未指定時常見預設
+```
+
+建置後檢查安裝暫存 root：
+
+```bash
+bitbake -e hello | grep '^WORKDIR='
+find tmp/work -path '*hello*image*helloworld' -print
+```
+
+也可檢查 packages split：
+
+```bash
+bitbake -c package -f hello
+find tmp/work -path '*hello*packages-split*helloworld' -print
+```
+
+#### 7.7.5 把 recipe 加入 image
+
+單獨 `bitbake hello` 只代表 recipe 可以建置，並不代表它會進入 image。要放進 rootfs，常見做法有三種。
+
+##### 方法 A：local.conf 開發測試
+
+```bitbake
+IMAGE_INSTALL:append = " hello"
+```
+
+這適合本機快速測試，不建議作為正式專案設定。
+
+##### 方法 B：image recipe 或 image `.bbappend`
+
+例如針對 `core-image-minimal`：
+
+```text
+meta-my-layer/
+└── recipes-core/
+    └── images/
+        └── core-image-minimal.bbappend
+```
+
+內容：
+
+```bitbake
+IMAGE_INSTALL:append = " hello"
+```
+
+##### 方法 C：packagegroup 管理產品內容
+
+BMC / OpenBMC 專案通常會把產品 feature 收斂到 packagegroup，方便不同 SKU / image 共用：
+
+```text
+meta-my-layer/
+└── recipes-core/
+    └── packagegroups/
+        └── packagegroup-my-platform.bb
+```
+
+```bitbake
+SUMMARY = "My platform package group"
+LICENSE = "MIT"
+
+inherit packagegroup
+
+RDEPENDS:${PN} = "    hello "
+```
+
+再把 packagegroup 加入 image：
+
+```bitbake
+IMAGE_INSTALL:append = " packagegroup-my-platform"
+```
+
+#### 7.7.6 重要變數說明
+
+| 變數 | 說明 | 常見注意事項 |
+|------|------|--------------|
+| `SUMMARY` | 簡短摘要 | 建議一行說清楚用途 |
+| `DESCRIPTION` | 較完整描述 | 未設定時常由 `SUMMARY` 補上，但建議明確填寫 |
+| `SECTION` | 套件分類 | 可協助套件管理與閱讀 metadata |
+| `LICENSE` | 授權名稱 | 不清楚授權時先釐清，避免量產法務風險 |
+| `LIC_FILES_CHKSUM` | 授權檔案 checksum | source 授權文字變更時會提醒維護者重新確認 |
+| `SRC_URI` | source、patch、本地檔案來源 | `file://`、`git://`、`https://` 都常見 |
+| `SRCREV` | Git commit revision | 不建議量產 recipe 使用 `${AUTOREV}` |
+| `S` | source directory | `do_configure` / `do_compile` 通常在這裡跑 |
+| `B` | build directory | out-of-tree build 時與 `S` 分開 |
+| `D` | install destination root | `do_install` 必須安裝到 `${D}` 底下 |
+| `DEPENDS` | build-time dependency | 例如需要 header / library 供編譯使用 |
+| `RDEPENDS:${PN}` | runtime dependency | 目標機執行時需要的 package |
+| `FILES:${PN}` | 指定 package 收哪些檔案 | 避免 installed-vs-shipped QA issue |
+| `CONFFILES:${PN}` | 標示設定檔 | package upgrade 時會保護使用者修改 |
+
+#### 7.7.7 `SRC_URI` 常見來源
+
+##### 本地檔案
+
+```bitbake
+SRC_URI = "file://helloworld.c"
+```
+
+檔案通常放在 `files/` 或 `${PN}/` 子目錄。若放在自訂路徑，需搭配 `FILESEXTRAPATHS`。
+
+##### Tarball
+
+```bitbake
+SRC_URI = "https://example.com/releases/myapp-${PV}.tar.gz"
+SRC_URI[sha256sum] = "<sha256>"
+
+S = "${WORKDIR}/myapp-${PV}"
+```
+
+遠端 tarball 建議固定 checksum，避免 upstream 檔案變更但 recipe 不易察覺。
+
+##### Git repository
+
+```bitbake
+SRC_URI = "git://github.com/example/myapp.git;protocol=https;branch=main"
+SRCREV = "0123456789abcdef0123456789abcdef01234567"
+
+S = "${WORKDIR}/git"
+```
+
+量產或 CI 建議固定 `SRCREV`。`${AUTOREV}` 適合短期開發，不適合需要可重現的 release build。
+
+##### 加 patch
+
+```bitbake
+SRC_URI = "    git://github.com/example/myapp.git;protocol=https;branch=main     file://0001-fix-build-on-arm.patch "
+```
+
+patch 會在 `do_patch` 階段套用。若 patch 順序有要求，依 `SRC_URI` 順序列出。
+
+#### 7.7.8 不同建構系統的 recipe 寫法
+
+##### 單一 C 檔案
+
+```bitbake
+do_compile() {
+    ${CC} ${CFLAGS} ${LDFLAGS} main.c -o myapp
+}
+
+do_install() {
+    install -d ${D}${bindir}
+    install -m 0755 myapp ${D}${bindir}/
+}
+```
+
+##### Makefile 專案
+
+一般不需要 `inherit make`；常見做法是直接使用 `oe_runmake`。`oe_runmake` 會帶入 Yocto 設定好的 make flags 與環境，較適合交叉編譯。
+
+```bitbake
+do_compile() {
+    oe_runmake
+}
+
+do_install() {
+    oe_runmake install DESTDIR=${D}
+}
+```
+
+若 upstream Makefile 不支援 `DESTDIR`，可改為手動安裝：
+
+```bitbake
+do_install() {
+    install -d ${D}${bindir}
+    install -m 0755 myapp ${D}${bindir}/
+}
+```
+
+##### Autotools
+
+```bitbake
+inherit autotools
+
+EXTRA_OECONF = "--disable-tests"
+```
+
+通常不需要自行寫 `do_configure`、`do_compile`、`do_install`，除非 upstream build system 有特殊需求。
+
+##### CMake
+
+```bitbake
+inherit cmake
+
+EXTRA_OECMAKE = "-DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF"
+```
+
+##### Meson
+
+```bitbake
+inherit meson
+
+EXTRA_OEMESON = "-Dtests=false"
+```
+
+##### Python setuptools
+
+```bitbake
+inherit setuptools3
+
+RDEPENDS:${PN} += "python3-core"
+```
+
+不同 Yocto branch 對 Python build backend 支援可能不同。若是 pyproject / PEP517 專案，需依 branch 中可用的 Python class 選擇，例如 `python_setuptools_build_meta`、`python_poetry_core` 等。
+
+##### 只包 script
+
+```bitbake
+SUMMARY = "Simple BMC helper script"
+LICENSE = "CLOSED"
+SRC_URI = "file://bmc-helper.sh"
+
+S = "${WORKDIR}/sources"
+UNPACKDIR = "${S}"
+
+do_install() {
+    install -d ${D}${bindir}
+    install -m 0755 bmc-helper.sh ${D}${bindir}/bmc-helper
+}
+```
+
+若公司內部封閉工具無法公開授權，可使用 `LICENSE = "CLOSED"`；但仍需符合公司與客戶的 legal / security policy。
+
+#### 7.7.9 加入 systemd service
+
+BMC service 常需要 recipe 同時安裝 binary、設定檔與 systemd unit。
+
+目錄：
+
+```text
+meta-my-layer/
+└── recipes-apps/
+    └── mydaemon/
+        ├── files/
+        │   ├── mydaemon.c
+        │   └── mydaemon.service
+        └── mydaemon_1.0.bb
+```
+
+`mydaemon.service`：
+
+```ini
+[Unit]
+Description=My BMC daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mydaemon
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`mydaemon_1.0.bb`：
+
+```bitbake
+SUMMARY = "My BMC daemon"
+LICENSE = "MIT"
+LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
+
+SRC_URI = "    file://mydaemon.c     file://mydaemon.service "
+
+S = "${WORKDIR}/sources"
+UNPACKDIR = "${S}"
+
+inherit systemd
+
+SYSTEMD_SERVICE:${PN} = "mydaemon.service"
+SYSTEMD_AUTO_ENABLE:${PN} = "enable"
+
+do_compile() {
+    ${CC} ${CFLAGS} ${LDFLAGS} mydaemon.c -o mydaemon
+}
+
+do_install() {
+    install -d ${D}${bindir}
+    install -m 0755 mydaemon ${D}${bindir}/
+
+    install -d ${D}${systemd_system_unitdir}
+    install -m 0644 mydaemon.service ${D}${systemd_system_unitdir}/
+}
+
+FILES:${PN} += "${systemd_system_unitdir}/mydaemon.service"
+```
+
+如果 service 還需要 D-Bus policy、tmpfiles、sysusers 或設定檔，請一併安裝，並確認 `FILES:${PN}` 涵蓋所有路徑。
+
+#### 7.7.10 Package split：把檔案分成多個 package
+
+單一 recipe 可以產生多個 package。常見情境：主程式、設定檔、開發檔、測試工具分開。
+
+```bitbake
+PACKAGES += "${PN}-tools"
+
+FILES:${PN} = "    ${bindir}/mydaemon     ${systemd_system_unitdir}/mydaemon.service "
+
+FILES:${PN}-tools = "    ${bindir}/mydaemon-cli "
+
+RDEPENDS:${PN}-tools = "${PN}"
+```
+
+檢查 package split：
+
+```bash
+bitbake -c package -f mydaemon
+find tmp/work -path '*mydaemon*packages-split*' -maxdepth 5 -type f | sort
+```
+
+若出現 `installed-vs-shipped` QA issue，通常代表檔案已安裝到 `${D}`，但沒有被任何 `FILES:*` 收進 package。
+
+#### 7.7.11 recipetool create
+
+`recipetool create` 可以根據 source 自動產生 base recipe。官方文件說明它會根據 source files 建立 recipe，並自動設定 pre-build information，例如 dependencies、license 與 checksums；使用時需要在 Build Directory 中並已 source build environment。
+
+##### 本地 source
+
+```bash
+cd /path/to/myapp
+recipetool create -o ../meta-my-layer/recipes-myapp/myapp/myapp_1.0.bb .
+```
+
+##### 遠端 tarball
+
+```bash
+recipetool create -o ../meta-my-layer/recipes-myapp/myapp/myapp_1.0.bb     https://github.com/example/myapp/archive/refs/tags/v1.0.tar.gz
+```
+
+##### 產生後建議檢查
+
+```bash
+sed -n '1,200p' ../meta-my-layer/recipes-myapp/myapp/myapp_1.0.bb
+bitbake-layers show-recipes myapp
+bitbake myapp
+```
+
+`recipetool` 的產出是骨架，不代表可以完全不看。仍需確認：
+
+- `LICENSE` 與 `LIC_FILES_CHKSUM` 是否合理。
+- `SRC_URI` 與 checksum 是否固定。
+- `S` 是否指向正確 source directory。
+- `DEPENDS` 是否足夠但不過度。
+- 是否使用正確 class，例如 `cmake`、`meson`、`autotools`、`setuptools3`。
+- `do_install` 是否真的把檔案裝到 `${D}`。
+- 是否需要補 `FILES:${PN}`、`RDEPENDS:${PN}`、systemd 設定。
+
+#### 7.7.12 devtool add：新增套件並進入開發模式
+
+若新增 recipe 後還要繼續修改 source，`devtool add` 比 `recipetool create` 更適合。它會使用類似 `recipetool create` 的邏輯建立 recipe，同時建立 workspace，方便後續 patch 與測試。
+
+常見形式：
+
+```bash
+# 從遠端 source 建立 recipe，source 放到 workspace
+devtool add myapp https://github.com/example/myapp/archive/refs/tags/v1.0.tar.gz
+
+# 指定本地 source tree
+devtool add myapp /path/to/myapp
+```
+
+後續流程：
+
+```bash
+devtool build myapp
+devtool finish myapp ../meta-my-layer
+```
+
+完成後仍需回到正式 layer 檢查 recipe 與 patch，並跑一次非 workspace 狀態的 `bitbake myapp`。
+
+#### 7.7.13 常見問題與除錯
+
+| 現象 | 可能方向 | 檢查方式 |
+|------|----------|----------|
+| BitBake 找不到 recipe | layer 未加入、`BBFILES` pattern 不含路徑、檔名不符合 `<name>_<version>.bb` | `bitbake-layers show-layers`、`bitbake-layers show-recipes <name>` |
+| `file://` 檔案找不到 | 檔案不在 `files/`、`${PN}/`，或檔名大小寫不對 | `bitbake -e <recipe> | grep '^FILESPATH='` |
+| 編譯時找不到 header / library | 缺少 build-time dependency | 補 `DEPENDS`，檢查 `log.do_compile` |
+| 本機可編譯，Yocto 失敗 | Makefile 硬寫 `gcc`、忽略 `CC` / `CFLAGS` / `LDFLAGS` | patch Makefile 或傳入 `oe_runmake CC="${CC}"` |
+| 安裝到 host `/usr/bin` | `do_install` 沒加 `${D}` | 所有安裝路徑都改成 `${D}${bindir}` 等 |
+| `installed-vs-shipped` | 檔案在 `${D}` 但未被 package 收走 | 補 `FILES:${PN}` 或調整安裝路徑 |
+| image 裡沒有程式 | 只建了 recipe，未加入 image | 檢查 `IMAGE_INSTALL`、packagegroup、`oe-pkgdata-util` |
+| runtime 找不到 shared library | 缺少 runtime dependency 或 package split 不正確 | 補 `RDEPENDS:${PN}`，檢查 rootfs 與 `ldd` |
+| systemd service 沒啟動 | 未 inherit systemd、`SYSTEMD_SERVICE` 不對、unit 未安裝 | 檢查 `${systemd_system_unitdir}`、`systemctl status` |
+
+常用指令：
+
+```bash
+bitbake-layers show-recipes <recipe>
+bitbake -e <recipe> | less
+bitbake -e <recipe> | grep -E '^(PN|PV|S|B|D|WORKDIR|SRC_URI|DEPENDS)='
+bitbake -c fetch <recipe>
+bitbake -c unpack -f <recipe>
+bitbake -c compile -f <recipe>
+bitbake -c install -f <recipe>
+bitbake -c package -f <recipe>
+find tmp/work -path '*<recipe>*temp/log.do_*' | sort
+find tmp/work -path '*<recipe>*image*' -type f | sort
+find tmp/work -path '*<recipe>*packages-split*' -type f | sort
+```
+
+#### 7.7.14 BMC / OpenBMC recipe 檢查重點
+
+| 類型 | 檢查重點 |
+|------|----------|
+| BMC daemon | systemd unit、restart policy、D-Bus name、journal log、runtime dependency |
+| Sensor / fan service | Entity Manager config、D-Bus object path、threshold、failsafe 行為 |
+| Factory tool | 是否只進 factory image、是否避免進正式 image、權限與安全風險 |
+| Provisioning script | secret handling、重試機制、半寫入回復方式、log 是否洩漏敏感資訊 |
+| Host interface tool | KCS/eSPI/LPC/PLDM/MCTP dependency、host state timing |
+| Debug tool | 是否只在 debug image 或 development feature 啟用 |
+| Binary-only package | 架構相容性、授權、strip 狀態、RPATH、shared library dependency |
+
+#### 7.7.15 Recipe 提交前檢查清單
+
+- [ ] recipe 放在自己的 layer，且 `bitbake-layers show-recipes <recipe>` 看得到。
+- [ ] 檔名符合 `<PN>_<PV>.bb`，版本策略清楚。
+- [ ] `SUMMARY`、`DESCRIPTION`、`HOMEPAGE`、`SECTION` 合理。
+- [ ] `LICENSE` 正確，`LIC_FILES_CHKSUM` 已確認。
+- [ ] `SRC_URI` 固定 source，遠端檔案有 checksum，Git source 固定 `SRCREV`。
+- [ ] `S` / `UNPACKDIR` 符合目前 Yocto branch。
+- [ ] 已選對 build class：`autotools`、`cmake`、`meson`、`setuptools3` 等。
+- [ ] `DEPENDS` 與 `RDEPENDS:${PN}` 分別描述 build-time / runtime dependency。
+- [ ] `do_install` 全部安裝到 `${D}` 底下。
+- [ ] `FILES:${PN}` 涵蓋所有安裝檔案，沒有 `installed-vs-shipped` QA issue。
+- [ ] 若有設定檔，評估是否加入 `CONFFILES:${PN}`。
+- [ ] 若有 systemd service，確認 `inherit systemd`、`SYSTEMD_SERVICE:${PN}`、unit install path。
+- [ ] `bitbake <recipe>` 可成功。
+- [ ] `tmp/work/.../image/` 與 `packages-split/` 結果符合預期。
+- [ ] 若要進 image，已透過 image append 或 packagegroup 加入，且完整 image build 通過。
+- [ ] 若是 BMC service，已在 target 上驗證 service status、journal、D-Bus / Redfish / IPMI 行為。
+
+#### 7.7.17 本章參考資料
+
+- Yocto Project Development Tasks Manual - Writing a New Recipe: [https://docs.yoctoproject.org/dev/dev-manual/new-recipe.html](https://docs.yoctoproject.org/dev/dev-manual/new-recipe.html)
+- Yocto Project Reference Manual - Variables Glossary: [https://docs.yoctoproject.org/ref-manual/variables.html](https://docs.yoctoproject.org/ref-manual/variables.html)
+- Yocto Project Reference Manual - Tasks: [https://docs.yoctoproject.org/ref-manual/tasks.html](https://docs.yoctoproject.org/ref-manual/tasks.html)
+- Yocto Project Reference Manual - devtool / recipetool Quick Reference: [https://docs.yoctoproject.org/ref-manual/devtool-reference.html](https://docs.yoctoproject.org/ref-manual/devtool-reference.html)
 
 ### 8. Device Tree 通用寫法與排查
 
