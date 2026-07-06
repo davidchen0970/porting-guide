@@ -47,6 +47,7 @@
 | 2026-07-06 |  0.3 | Copilot | 撰寫常用變數、目錄結構與 BitBake 建構流程 |
 | 2026-07-06 |  0.4 | Copilot | 撰寫在 Docker 中建立 Yocto 專案並建置完整映像 |
 | 2026-07-06 |  0.5 | Copilot | 撰寫單獨建置與除錯特定套件章節 |
+| 2026-07-06 |  0.6 | Copilot | 撰寫使用 .bbappend 修改套件行為章節 |
 
 ### 0.7 資料來源可信度分級
 
@@ -1605,6 +1606,356 @@ BMC kernel / DTS 額外提醒：
 - BitBake User Manual: [https://docs.yoctoproject.org/bitbake/](https://docs.yoctoproject.org/bitbake/)
 - Yocto Project Reference Manual - Tasks: [https://docs.yoctoproject.org/ref-manual/tasks.html](https://docs.yoctoproject.org/ref-manual/tasks.html)
 - Yocto Project Development Tasks Manual - devtool: [https://docs.yoctoproject.org/dev/dev-manual/devtool.html](https://docs.yoctoproject.org/dev/dev-manual/devtool.html)
+
+### 7.5 使用 .bbappend 修改套件行為
+
+在 Yocto / OpenBMC 開發中，常見需求是調整既有套件的行為，但不直接修改原本的 `.bb`。原始 recipe 可能來自 OE-Core、meta-openembedded、meta-phosphor、SoC vendor layer 或 BSP layer；若直接改，後續更新時容易被覆蓋，也會讓平台差異不易追蹤。因此平台差異建議放在自己的 layer，透過 `.bbappend` 追加。
+
+#### 7.5.1 什麼是 .bbappend？
+
+`.bbappend` 是 BitBake append file。它必須對應到一個存在的 `.bb` recipe，且 root filename 要相同，差異只在副檔名。例如 `zstd_1.5.7.bb` 可對應 `zstd_1.5.7.bbappend`、`zstd_1.5.%.bbappend` 或 `zstd_%.bbappend`。
+
+可以這樣理解：
+
+- `.bb`：原始食譜。
+- `.bbappend`：補充便條，只寫需要追加或調整的部分。
+- BitBake：解析 recipe 時，把符合條件的 `.bbappend` 合併進 metadata。
+
+常見用途：加 patch、加設定檔、加 systemd override、調整 `PACKAGECONFIG` / `EXTRA_OECMAKE` / `EXTRA_OEMESON`、追加 `DEPENDS` / `RDEPENDS:${PN}`、在 `do_install` 後追加安裝內容、針對 machine 或 class 做差異化設定。
+
+#### 7.5.2 命名規範
+
+| 檔名 | 套用範圍 | 適用情境 |
+|------|----------|----------|
+| `zstd_1.5.7.bbappend` | 只套用到 `zstd_1.5.7.bb` | patch 高度綁定特定版本 |
+| `zstd_1.5.%.bbappend` | 套用到 `zstd_1.5.x` | 同一 minor series 行為接近 |
+| `zstd_%.bbappend` | 套用到所有 `zstd` 版本 | 平台設定不依賴版本，最常見 |
+
+注意：`%` 通常只放在 `.bbappend` 前面。若 recipe 升級，精準版本 append 可能失效；使用 `recipe_%.bbappend` 較能承受版本更新。若 append 找不到對應 recipe，BitBake 通常會在 parsing 階段報錯。
+
+#### 7.5.3 目錄結構與 FILESEXTRAPATHS
+
+建議把 `.bbappend` 放在自己的 layer，目錄分類盡量跟原 recipe 接近：
+
+```text
+meta-my-layer/
+└── recipes-extended/
+    └── zstd/
+        ├── zstd_%.bbappend
+        └── zstd/
+            └── 0001-fix-compile-error.patch
+```
+
+`zstd_%.bbappend`：
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+
+SRC_URI:append = " file://0001-fix-compile-error.patch"
+```
+
+變數說明：
+
+- `${THISDIR}`：目前 `.bbappend` 所在目錄。
+- `${PN}`：目前 recipe / package name。
+- `${BPN}`：base package name；遇到 `-native`、`nativesdk-`、multilib 變體時常比 `${PN}` 穩定。
+- `FILESEXTRAPATHS`：擴充 `file://` 搜尋路徑。
+- `SRC_URI`：列出 source、patch 或本地檔案。
+
+常用寫法：
+
+```bitbake
+# 一般 recipe 常用
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+
+# native / nativesdk 也會套用時，常改用 BPN
+FILESEXTRAPATHS:prepend := "${THISDIR}/${BPN}:"
+
+# 檔案統一放 files/ 時
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+```
+
+BMC porting 建議：若 append 會作用到 `cmake-native`、`zstd-native` 或 `nativesdk-*`，優先評估 `${BPN}` 或 `files/`。因為 native variant 的 `${PN}` 可能是 `cmake-native`，但實際檔案目錄常是 `cmake/`。
+
+#### 7.5.4 常用語法
+
+```bitbake
+# 追加變數；字串前面的空格要保留
+SRC_URI:append = " file://0001-platform-fix.patch"
+DEPENDS:append = " openssl"
+RDEPENDS:${PN}:append = " bash"
+
+# 插入變數；字串後面的空格要保留
+CFLAGS:prepend = "-DDEBUG "
+
+# 移除 list-like 變數中的項目
+PACKAGECONFIG:remove = "x11"
+
+# 完全覆寫，需謹慎
+PACKAGECONFIG = "ssl zlib"
+```
+
+建議優先使用 `:append`、`:prepend`、`:remove`，非必要不要直接用 `=` 覆寫整個變數。override-style 的 `:append` / `:prepend` 不會自動補空格，所以 `SRC_URI:append = " file://my.patch"` 前面的空格是必要的。
+
+追加 task 內容：
+
+```bitbake
+do_install:append() {
+    install -d ${D}${sysconfdir}/myapp
+    install -m 0644 ${WORKDIR}/myapp.conf ${D}${sysconfdir}/myapp/myapp.conf
+}
+```
+
+`do_install` 內正式要進 package 的檔案應安裝到 `${D}` 底下，例如 `${D}${bindir}`、`${D}${sysconfdir}`、`${D}${datadir}`。`${B}` 是 build directory，不等於 package 安裝目的地。
+
+針對 machine / class 做差異：
+
+```bitbake
+SRC_URI:append:my-bmc-machine = " file://0001-my-bmc-only.patch"
+EXTRA_OECMAKE:append:class-native = " -DENABLE_TOOLS=ON"
+
+do_install:append:class-target() {
+    install -d ${D}${sysconfdir}/platform
+}
+```
+
+#### 7.5.5 動手做：用 .bbappend 修改 cmake-native 行為
+
+Step 1：建立或加入自己的 layer：
+
+```bash
+bitbake-layers create-layer ../meta-my-layer
+bitbake-layers add-layer ../meta-my-layer
+bitbake-layers show-layers
+```
+
+Step 2：確認 recipe：
+
+```bash
+bitbake-layers show-recipes cmake
+bitbake -e cmake-native | grep -E '^(PN|BPN|PV|FILE)='
+```
+
+注意：雖然建置目標是 `cmake-native`，append 檔名通常仍是 `cmake_%.bbappend`。原因是 `cmake-native` 多半是由 `cmake` recipe 透過 class extension 產生，不是檔名叫 `cmake-native_*.bb` 的獨立 recipe。
+
+Step 3：建立 append：
+
+```bash
+mkdir -p ../meta-my-layer/recipes-devtools/cmake
+vim ../meta-my-layer/recipes-devtools/cmake/cmake_%.bbappend
+```
+
+先放最小內容確認 append 被解析：
+
+```bitbake
+python () {
+    bb.note("meta-my-layer: cmake append parsed for PN=%s BPN=%s" % (d.getVar("PN"), d.getVar("BPN")))
+}
+```
+
+確認 append 有套上：
+
+```bash
+bitbake -p
+bitbake-layers show-appends | grep -A5 -B2 'cmake'
+```
+
+Step 4A：練習用，寫檔到 build directory：
+
+```bitbake
+do_install:append:class-native() {
+    install -d ${B}/cmake2
+    echo "Try to write line to the file." > ${B}/cmake2/appendFile.txt
+}
+```
+
+```bash
+bitbake -c install -f cmake-native
+cat tmp/work/x86_64-linux/cmake-native/*/build/cmake2/appendFile.txt
+```
+
+這個做法適合確認 `do_install:append` 有執行，但不代表檔案會被打包或進 rootfs。
+
+Step 4B：正式安裝用，寫到 `${D}`：
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${BPN}:"
+
+SRC_URI:append:class-native = " file://appendFile.txt"
+
+do_install:append:class-native() {
+    install -d ${D}${datadir}/cmake2
+    install -m 0644 ${WORKDIR}/appendFile.txt ${D}${datadir}/cmake2/appendFile.txt
+}
+
+FILES:${PN}:append:class-native = " ${datadir}/cmake2/appendFile.txt"
+```
+
+```text
+meta-my-layer/
+└── recipes-devtools/
+    └── cmake/
+        ├── cmake_%.bbappend
+        └── cmake/
+            └── appendFile.txt
+```
+
+```bash
+bitbake -c install -f cmake-native
+find tmp/work -path '*cmake-native*image*appendFile.txt' -print
+
+bitbake -c package -f cmake-native
+find tmp/work -path '*cmake-native*packages-split*appendFile.txt' -print
+```
+
+補充：`cmake-native` 的產物主要給 build host sysroot 使用，不一定會進 target image。若目標是讓檔案進 BMC rootfs，應修改 target recipe、image recipe 或 packagegroup。
+
+#### 7.5.6 完整範例：對 zstd 加 patch
+
+```text
+meta-my-layer/
+└── recipes-extended/
+    └── zstd/
+        ├── zstd_%.bbappend
+        └── zstd/
+            └── 0001-fix-platform-build.patch
+```
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+
+SRC_URI:append = " file://0001-fix-platform-build.patch"
+```
+
+驗證：
+
+```bash
+bitbake-layers show-appends | grep -A5 -B2 'zstd'
+bitbake -c patch -f zstd
+bitbake -c compile -f zstd
+bitbake zstd
+```
+
+若 patch 失敗，先看：
+
+```bash
+bitbake -e zstd | grep '^WORKDIR='
+find tmp/work -path '*zstd*temp/log.do_patch*' -print
+```
+
+常見方向包含 source revision 已變更、patch context 不符合、patch 順序不對、`FILESEXTRAPATHS` 路徑沒對上。
+
+#### 7.5.7 多個 .bbappend 的順序與 layer priority
+
+同一個 recipe 可以被多個 layer 的 `.bbappend` 修改。查看 layer priority：
+
+```bash
+bitbake-layers show-layers
+```
+
+查看 append：
+
+```bash
+bitbake-layers show-appends | grep -A20 -B2 '<recipe>'
+```
+
+查看變數最終值：
+
+```bash
+bitbake -e <recipe> | less
+bitbake -e <recipe> | grep -n '^SRC_URI='
+bitbake -e <recipe> | grep -n '^PACKAGECONFIG='
+```
+
+建議不要只靠 layer priority 猜結果；以 `bitbake-layers show-appends` 與 `bitbake -e` 展開值為準。若多個 layer 都在改同一變數，盡量用 `:append`、`:prepend`、`:remove` 表達意圖。
+
+#### 7.5.8 常見錯誤與排查
+
+| 現象 | 可能方向 | 檢查方式 |
+|------|----------|----------|
+| `.bbappend` 沒套上 | 檔名版本不合、layer 未加入、`BBFILES` pattern 不含路徑 | `bitbake-layers show-appends`、`show-layers`、`conf/layer.conf` |
+| `No recipes available for ...bbappend` | append 找不到對應 recipe | 確認 recipe 是否存在、版本是否匹配、branch 是否一致 |
+| `file://xxx.patch` 找不到 | `FILESEXTRAPATHS` 或目錄結構不對 | `bitbake -e <recipe> | grep '^FILESPATH='` |
+| patch 無法套用 | source revision 不符、patch context 改變、patch 順序不對 | `log.do_patch`、`WORKDIR`、`quilt` |
+| `do_install` 成功但 package 沒檔案 | 安裝到 `${B}` 而非 `${D}`，或 `FILES:${PN}` 未涵蓋 | `WORKDIR/image`、`packages-split`、`log.do_package_qa` |
+| `installed-vs-shipped` QA issue | 檔案進 `${D}` 但沒被任何 package 收走 | 補 `FILES:${PN}:append` 或調整安裝路徑 |
+| 修改後結果沒變 | task stamp / sstate 命中，或改到錯的 variant | `bitbake -c cleansstate <recipe>`、`bitbake -e` |
+| 只想改 target 卻影響 native | 缺少 class override | 使用 `:class-target` 或 `:class-native` |
+| 只想改某板子卻影響全部 machine | 缺少 machine override | 使用 `:append:<machine>` 或 machine-specific 檔案路徑 |
+
+排查順序：
+
+```bash
+bitbake-layers show-layers
+bitbake-layers show-recipes <recipe>
+bitbake-layers show-appends | grep -A10 -B2 '<recipe>'
+bitbake -e <recipe> | grep '^FILESPATH='
+bitbake -e <recipe> | grep '^SRC_URI='
+bitbake -e <recipe> | grep '^PACKAGECONFIG='
+bitbake -c patch -f <recipe>
+bitbake -c compile -f <recipe>
+bitbake -c install -f <recipe>
+```
+
+#### 7.5.9 BMC / OpenBMC 常見場景
+
+加入平台設定檔：
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+SRC_URI:append = " file://platform.conf"
+
+do_install:append() {
+    install -d ${D}${sysconfdir}/platform
+    install -m 0644 ${WORKDIR}/platform.conf ${D}${sysconfdir}/platform/platform.conf
+}
+
+FILES:${PN}:append = " ${sysconfdir}/platform/platform.conf"
+```
+
+加入 systemd override：
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+SRC_URI:append = " file://10-platform.conf"
+
+do_install:append() {
+    install -d ${D}${systemd_system_unitdir}/my-service.service.d
+    install -m 0644 ${WORKDIR}/10-platform.conf ${D}${systemd_system_unitdir}/my-service.service.d/10-platform.conf
+}
+
+FILES:${PN}:append = " ${systemd_system_unitdir}/my-service.service.d/10-platform.conf"
+```
+
+加入 kernel config fragment 或 DTS patch：
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${BPN}:"
+SRC_URI:append:my-bmc-machine = " file://my-bmc.cfg"
+SRC_URI:append:my-bmc-machine = " file://0001-arm-dts-add-my-platform-sensors.patch"
+```
+
+驗證重點：patch 是否套用到正確 kernel source、deploy 的 DTB 是否為目標 machine 使用的 DTB、實機 `/sys/firmware/fdt` 反編譯後是否包含預期 node。
+
+#### 7.5.10 本章重點
+
+1. `.bbappend` 一律放在自己的 layer，不直接修改 upstream / vendor layer。
+2. 檔名優先使用 `recipe_%.bbappend`，除非 patch 嚴格綁定特定版本。
+3. 有 `file://` patch 或本地檔案時，補上 `FILESEXTRAPATHS`。
+4. native / nativesdk 相關 append 優先評估 `${BPN}` 或 `files/` 目錄。
+5. 追加 list-like 變數時注意空格，例如 `SRC_URI:append = " file://x.patch"`。
+6. 優先使用 `:append`、`:prepend`、`:remove`，非必要不要直接 `=` 覆寫整個變數。
+7. 要進 package 的檔案應安裝到 `${D}`，並確認 `FILES:${PN}` 涵蓋該路徑。
+8. 用 `:class-target`、`:class-native`、machine override 控制影響範圍。
+9. 新增 append 後先跑 `bitbake-layers show-appends`，再用 `bitbake -e` 檢查變數展開值。
+10. 修改 recipe 行為後，至少驗證 patch、configure、compile、install、package；若會進 image，再重建 image 或 rootfs。
+
+#### 7.5.11 本章參考資料
+
+- Yocto Project Development Tasks Manual - Understanding and Creating Layers: https://docs.yoctoproject.org/dev-manual/layers.html
+- Yocto Project Reference Manual - Append Files: https://docs.yoctoproject.org/ref-manual/terms.html#term-Append-Files
+- BitBake User Manual - Syntax and Operators: https://docs.yoctoproject.org/bitbake/bitbake-user-manual/bitbake-user-manual-metadata.html
+- Yocto Project Reference Manual - Variables: https://docs.yoctoproject.org/ref-manual/variables.html
 
 ### 8. Device Tree 通用寫法與排查
 
