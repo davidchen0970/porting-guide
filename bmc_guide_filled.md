@@ -53,6 +53,7 @@
 | 2026-07-06 |  0.9 | Copilot | 撰寫進階混合開發 devtool modify / update-recipe / finish 章節 |
 | 2026-07-06 |  0.10 | Copilot | OpenBMC 新 Machine Layer 與 DTS Bring-up 系統化流程 |
 | 2026-07-06 |  0.11 | Copilot | 撰寫 Porting ADC Sensor |
+| 2026-07-06 |  0.12 | Copilot | 撰寫 Temperature Sensor |
 
 ### 0.7 資料來源可信度分級
 
@@ -4195,6 +4196,779 @@ D-Bus / Redfish / IPMI：
 - OpenBMC `ADCSensorMain.cpp`：`adcsensor` 尋找 `name` 為 `iio_hwmon` 的 hwmon 裝置，讀取 `in*_input`，預設 poll rate 約 `0.5` 秒。
 - Linux kernel `iio-hwmon.yaml`：`iio-hwmon` binding 的必要屬性為 `compatible = "iio-hwmon"` 與 `io-channels`。
 - Linux kernel `aspeed,ast2600-adc.yaml`：AST2600 ADC binding 描述兩個 ADC engine、各 8 個 voltage channels、`#io-channel-cells = <1>`、內部 reference `1200000` / `2500000` microvolt，以及可用 `vref-supply` 對應外部 reference。
+
+
+#### 11.4 Temperature Sensor
+
+##### 11.4.1 適用情境
+
+Temperature Sensor 常見於監控系統中各關鍵部位的熱分佈。BMC 端通常不只關心單點溫度，也會將多個溫度來源交給 Redfish、IPMI SDR、事件紀錄與 fan control policy 使用。
+
+常見監控點如下：
+
+```text
+Ambient temperature：進風口 / 出風口
+Board temperature：PCB 中央或局部 hotspot
+CPU temperature：核心 / 外殼 / PECI 回報值
+DIMM temperature：記憶體模組
+PSU temperature：電源供應器內部
+NVMe temperature：固態硬碟 controller / composite temperature
+GPU temperature：圖形處理器 / HBM / board sensor
+VR temperature：電壓調節模組
+BMC temperature：BMC SoC 自身或鄰近 board sensor
+```
+
+在 OpenBMC 中，溫度感測器通常會被發布成 D-Bus 物件，常見路徑如下：
+
+```text
+/xyz/openbmc_project/sensors/temperature/<sensor_name>
+```
+
+典型 D-Bus 介面包含：
+
+```text
+xyz.openbmc_project.Sensor.Value
+xyz.openbmc_project.Sensor.Threshold.Warning
+xyz.openbmc_project.Sensor.Threshold.Critical
+xyz.openbmc_project.State.Decorator.Availability
+xyz.openbmc_project.State.Decorator.OperationalStatus
+xyz.openbmc_project.Association.Definitions
+```
+
+這些物件後續可被 Redfish、IPMI、Phosphor PID Control、logging service 或其他平台 daemon 消費。
+
+##### 11.4.2 資料路徑（Data Flow）
+
+本節以最常見的 I2C 溫度感測晶片（例如 TMP75 / LM75 類）為例說明資料流：
+
+```text
+I2C Temperature Chip (TMP75 at Bus 3, Addr 0x48)
+    ↓
+Linux I2C Driver (i2c-core) + Chip-specific hwmon Driver (lm75.c / tmp75 compatible)
+    ↓
+hwmon sysfs 介面 (/sys/class/hwmon/hwmonX/temp1_input)
+    ↓
+HwmonTempSensor daemon 定期讀取 sysfs
+    ↓
+Entity Manager 提供 JSON 設定 (Name, Type, Bus, Address, Thresholds)
+    ↓
+D-Bus 發佈至 /xyz/openbmc_project/sensors/temperature/<Name>
+    ↓
+Redfish Thermal / Sensors、IPMI SDR、Fan PID policy 查詢或消費
+```
+
+其他溫度來源的前段資料路徑可能不同，例如 PECI CPU 溫度、PMBus PSU 溫度、NVMe over MCTP、GPU vendor tool 或 ADC Thermistor。但在 OpenBMC 上，常見整合方向仍是收束到標準 D-Bus sensor 介面，讓上層服務用一致模型讀取。
+
+##### 11.4.3 常見來源分類
+
+<table>
+<tr>
+<th>來源類型</th>
+<th>驅動 / 協定</th>
+<th>OpenBMC 對應 Daemon</th>
+<th>備註</th>
+</tr>
+<tr>
+<td>I2C 獨立晶片，例如 TMP75 / LM75 / MAX31725</td>
+<td>Linux hwmon driver</td>
+<td>HwmonTempSensor</td>
+<td>最常見；需 DTS 或 board info 建立 I2C device</td>
+</tr>
+<tr>
+<td>CPU 內部溫度</td>
+<td>PECI driver / peci-temp</td>
+<td>IntelCPUSensor 或平台特定 daemon</td>
+<td>主要見於 x86 平台；需 host CPU / PCH / PECI 通道可用</td>
+</tr>
+<tr>
+<td>PMBus 電源裝置</td>
+<td>pmbus driver</td>
+<td>PSUSensor 或 HwmonTempSensor</td>
+<td>讀取 PSU 回報的內部 temperature rail</td>
+</tr>
+<tr>
+<td>NVMe 固態硬碟</td>
+<td>NVMe-MI / MCTP / vendor command</td>
+<td>NVMeSensor 或平台自有服務</td>
+<td>視平台拓撲決定是否透過 MCTP over I2C / PCIe sideband</td>
+</tr>
+<tr>
+<td>GPU</td>
+<td>vendor-specific ioctl / SMBus / MCTP</td>
+<td>GPUUtilSensor / ExternalSensor / vendor daemon</td>
+<td>通常需額外 userspace 工具或 vendor library</td>
+</tr>
+<tr>
+<td>外部類比 Thermistor</td>
+<td>ADC 讀取後換算</td>
+<td>ADCSensor 搭配 ScaleFactor / Offset / polynomial</td>
+<td>請參閱 11.1 ADC Sensor</td>
+</tr>
+<tr>
+<td>BMC SoC 內部溫度</td>
+<td>SoC thermal / hwmon driver</td>
+<td>HwmonTempSensor 或 SoC-specific daemon</td>
+<td>需確認 kernel driver 是否輸出 temp*_input</td>
+</tr>
+</table>
+
+##### 11.4.4 Porting 前需確認的硬體資訊與校準參數
+
+從 schematic、board placement、datasheet 與 thermal policy 取得下列資訊：
+
+```text
+- Sensor chip 完整型號，例如 TMP75B、LM75A、MAX31725、PCT2075
+- 所在 I2C bus number，例如 I2C3
+- 若經過 I2C mux，需確認 mux device、channel 與 enable 條件
+- 7-bit I2C device address，例如 0x48、0x4A
+- 供電 rail 與 power state，例如 BMC standby rail 或 host main rail
+- ALERT / interrupt pin 是否接到 BMC GPIO
+- 解析度、轉換時間、sample time 或 conversion rate
+- 感測點物理位置，例如 front inlet、rear outlet、VR hotspot、PCIe zone
+- 有無硬體 offset 或需線性補償，例如貼合、風道位置、膠材造成固定偏差
+- Warning / Critical threshold，由 thermal policy 決定
+- Redfish / IPMI 顯示名稱與 inventory association
+```
+
+範例參數：
+
+```text
+Sensor Name: Ambient_Temp
+Chip: TMP75B
+I2C Bus: 3
+Address: 0x48
+Resolution: 12-bit (0.0625°C per LSB)
+Expected Offset: +0.5°C
+Critical High: 85°C
+Warning High: 75°C
+Warning Low: 0°C
+Power Rail: BMC_STBY_3V3
+Physical Location: Front inlet, near fan wall
+```
+
+建議在 bring-up 記錄中保留硬體量測條件，例如室溫、風扇狀態、系統功耗與開蓋 / 關蓋狀態，避免後續校準時無法對齊測試條件。
+
+##### 11.4.5 I2C Bus 偵測與地址確認
+
+開機後使用 `i2cdetect` 掃描指定 bus：
+
+```bash
+i2cdetect -y 3
+```
+
+預期輸出範例，0x48 出現 `48`：
+
+```text
+     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+00:          -- -- -- -- -- -- -- -- -- -- -- -- -- 
+10: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- 
+20: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- 
+30: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- 
+40: -- -- -- -- -- -- -- -- 48 -- -- -- -- -- -- -- 
+```
+
+若經過 I2C mux，先確認 mux channel 是否切到正確路徑：
+
+```bash
+# 範例：列出 I2C adapter 與 mux channel
+ls -l /sys/bus/i2c/devices/
+
+i2cdetect -l
+```
+
+若掃不到地址，可改用 read-only 方式讀取溫度暫存器或製造商 ID 暫存器。實際 register 需依 datasheet 確認：
+
+```bash
+# TMP75 / LM75 類常見 temperature register 在 0x00；實際格式需看 datasheet
+i2cget -y 3 0x48 0x00 w
+```
+
+注意事項：
+
+- `i2cdetect` 只是輔助確認工具，不建議在不熟悉裝置行為時對整條 bus 反覆掃描。
+- 部分裝置對 SMBus quick command 或特定讀寫型態敏感，可能造成狀態變化。
+- 若 bus 上有 mux、CPLD bridge、hot-swap buffer 或電源 domain gating，需先確認相關 enable 條件。
+
+##### 11.4.6 Device Tree 加入 sensor node
+
+LM75 / TMP75 類溫度晶片通常在 I2C bus node 下建立 child node。核心必要屬性是 `compatible` 與 `reg`；若平台有 regulator 或 interrupt，也應一併描述。
+
+```dts
+&i2c3 {
+    status = "okay";
+    clock-frequency = <100000>;
+
+    temperature-sensor@48 {
+        compatible = "ti,tmp75b";
+        reg = <0x48>;
+        label = "ambient_front";
+        vs-supply = <&p3v3_stby>;
+        #thermal-sensor-cells = <0>;   /* 若需與 Linux thermal zone 連結 */
+    };
+};
+```
+
+相容性注意事項：
+
+- Linux `lm75` family binding 支援多個 compatible，例如 `national,lm75`、`st,stlm75`、`maxim,max31725`、`ti,tmp75`、`ti,tmp75b`、`ti,tmp75c` 等。
+- 若特定 compatible 在目前 kernel branch 尚未支援，可先查看 `Documentation/devicetree/bindings/hwmon/lm75.yaml` 與 `drivers/hwmon/lm75.c`。
+- 不建議任意使用相近 compatible；必須確認解析度、暫存器格式、sample time、threshold register 與 interrupt 行為相容。
+
+若溫度晶片掛在 I2C mux 後方，DTS 結構會多一層 mux channel。實際 bus number 可能由 kernel 動態分配，因此 Entity Manager 中的 bus number 需以目標機實際 `i2cdetect -l` 與 `/sys/bus/i2c/devices/` 結果確認。
+
+##### 11.4.7 Kernel config 與 driver 確認
+
+Kernel 需啟用 I2C、hwmon 與對應感測器 driver。LM75 / TMP75 類通常對應 `CONFIG_SENSORS_LM75`。
+
+```bash
+# 在 build tree 檢查最終 kernel config
+bitbake -e virtual/kernel | grep '^B='
+
+grep -E 'CONFIG_HWMON|CONFIG_I2C|CONFIG_SENSORS_LM75' \
+  tmp/work/*/linux-*/ */build/.config 2>/dev/null
+```
+
+實機上可檢查 driver 是否 probe 成功：
+
+```bash
+dmesg | grep -Ei 'lm75|tmp75|hwmon|i2c'
+
+# 若 driver 是 module
+lsmod | grep -E 'lm75|hwmon'
+
+# 查看 I2C device 與 driver bind 狀態
+find /sys/bus/i2c/devices -maxdepth 2 -type l -name driver -print -exec readlink -f {} \;
+```
+
+若 driver 未 probe，可從下列方向同步資訊：
+
+- DTS 是否進到實際 boot 的 DTB。
+- `compatible` 是否被目前 kernel driver 支援。
+- bus / mux path 是否正確。
+- power rail 是否已開。
+- I2C address 是否與硬體 strap 一致。
+
+##### 11.4.8 確認 hwmon sysfs 節點與數值單位
+
+開機後尋找對應 hwmon：
+
+```bash
+# 找出所有 hwmon 並顯示 name
+for i in /sys/class/hwmon/hwmon*; do
+    echo "$i: $(cat $i/name 2>/dev/null)"
+done
+
+# 假設找到 hwmon4，檢查溫度節點
+ls /sys/class/hwmon/hwmon4/temp*_input
+
+# 讀取溫度，Linux hwmon temperature 通常以 millidegree Celsius 呈現
+cat /sys/class/hwmon/hwmon4/temp1_input
+```
+
+單位判讀：
+
+```text
+temp1_input: 30000 → 30.000°C
+temp1_crit: 85000 → 85.000°C
+temp1_max: 75000 → 75.000°C
+```
+
+常見 sysfs 欄位：
+
+<table>
+<tr>
+<th>欄位</th>
+<th>常見意義</th>
+<th>單位</th>
+</tr>
+<tr>
+<td>temp1_input</td>
+<td>目前溫度讀值</td>
+<td>millidegree Celsius</td>
+</tr>
+<tr>
+<td>temp1_max</td>
+<td>上限 threshold，若 driver 支援</td>
+<td>millidegree Celsius</td>
+</tr>
+<tr>
+<td>temp1_crit</td>
+<td>critical threshold，若 driver 支援</td>
+<td>millidegree Celsius</td>
+</tr>
+<tr>
+<td>temp1_alarm</td>
+<td>硬體 alarm 狀態，若 driver 支援</td>
+<td>0 / 1</td>
+</tr>
+<tr>
+<td>name</td>
+<td>hwmon 裝置名稱</td>
+<td>字串</td>
+</tr>
+</table>
+
+注意：Linux hwmon 文件中提到，driver 只是呈現硬體值與 alarm 狀態；不同 board 的標籤與補償通常仍需由 userspace 或設定檔處理。
+
+##### 11.4.9 Entity Manager 配置
+
+Entity Manager 的設定通常位於下列路徑之一，實際位置需依平台 layer 與 recipe 設計確認：
+
+```text
+/usr/share/entity-manager/configurations/
+meta-<platform>/recipes-phosphor/configuration/<project>/
+meta-<platform>/recipes-phosphor/configuration/entity-manager/
+```
+
+OpenBMC `dbus-sensors` 通常透過 Entity Manager 取得 sensor device 設定；sensor 物件以 configuration 中的 `Exposes` records 描述，且 `Name` 與 `Type` 是基本必要欄位。
+
+常見 JSON 結構如下。不同 OpenBMC branch 的 schema 可能略有差異，請以目前 image 內 `/usr/share/entity-manager/schemas/` 與 `sensor-info.json` 為準。
+
+```json
+{
+    "Name": "Baseboard Sensors",
+    "Probe": "xyz.openbmc_project.FruDevice({'BOARD_PRODUCT_NAME': 'MyPlatform'})",
+    "Type": "Board",
+    "Exposes": [
+        {
+            "Name": "Ambient_Temp",
+            "Type": "TMP75",
+            "Bus": 3,
+            "Address": "0x48",
+            "PollRate": 0.5,
+            "ScaleFactor": 1.0,
+            "Offset": 0.5,
+            "MaxValue": 100.0,
+            "MinValue": -10.0,
+            "PowerState": "AlwaysOn",
+            "Thresholds": [
+                {
+                    "Name": "upper critical",
+                    "Direction": "greater than",
+                    "Severity": 1,
+                    "Value": 85.0
+                },
+                {
+                    "Name": "upper non critical",
+                    "Direction": "greater than",
+                    "Severity": 0,
+                    "Value": 75.0
+                },
+                {
+                    "Name": "lower non critical",
+                    "Direction": "less than",
+                    "Severity": 0,
+                    "Value": 0.0
+                }
+            ]
+        }
+    ]
+}
+```
+
+重點欄位說明：
+
+<table>
+<tr>
+<th>欄位</th>
+<th>說明</th>
+<th>檢查方式</th>
+</tr>
+<tr>
+<td>Name</td>
+<td>D-Bus sensor 名稱的一部分；通常會出現在 /xyz/openbmc_project/sensors/temperature/&lt;Name&gt;</td>
+<td>busctl tree / Redfish sensor list</td>
+</tr>
+<tr>
+<td>Type</td>
+<td>需符合 dbus-sensors 與 Entity Manager schema 支援的 sensor type</td>
+<td>查 sensor-info.json、schema、daemon log</td>
+</tr>
+<tr>
+<td>Bus / Address</td>
+<td>對應 I2C bus 與 7-bit address</td>
+<td>i2cdetect -l、/sys/bus/i2c/devices</td>
+</tr>
+<tr>
+<td>PollRate / PollInterval</td>
+<td>輪詢頻率或間隔；名稱依 branch 而可能不同</td>
+<td>查 schema 與 daemon source</td>
+</tr>
+<tr>
+<td>ScaleFactor / Offset</td>
+<td>線性倍率與固定補償；適合處理安裝位置或類比路徑的固定偏差</td>
+<td>與標準溫度計比對</td>
+</tr>
+<tr>
+<td>PowerState</td>
+<td>AlwaysOn 或 On；用來控制 host power state 下是否讀取</td>
+<td>待機 / 上電狀態測試</td>
+</tr>
+<tr>
+<td>Thresholds</td>
+<td>Warning / Critical high / low threshold</td>
+<td>D-Bus introspect 與 threshold 觸發測試</td>
+</tr>
+</table>
+
+若平台使用舊版設定格式，可能不使用 `Exposes` wrapper，或欄位名稱不同。移植時請以 target image 內實際 schema 為準，不要只複製其他平台 JSON。
+
+##### 11.4.10 啟動服務與 D-Bus 驗證
+
+重啟 Entity Manager 與 HwmonTempSensor：
+
+```bash
+systemctl restart xyz.openbmc_project.EntityManager.service
+systemctl restart xyz.openbmc_project.HwmonTempSensor.service
+```
+
+監看日誌：
+
+```bash
+journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager | tail -100
+journalctl -u xyz.openbmc_project.HwmonTempSensor.service -b --no-pager | tail -100
+
+# 或持續追蹤
+journalctl -u xyz.openbmc_project.HwmonTempSensor.service -f
+```
+
+確認 D-Bus 物件樹：
+
+```bash
+busctl tree xyz.openbmc_project.HwmonTempSensor
+```
+
+讀取溫度輸出。D-Bus `Value` 的單位通常為 °C，型態為 double：
+
+```bash
+busctl get-property \
+  xyz.openbmc_project.HwmonTempSensor \
+  /xyz/openbmc_project/sensors/temperature/Ambient_Temp \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+```
+
+確認 threshold 介面是否存在：
+
+```bash
+busctl introspect xyz.openbmc_project.HwmonTempSensor \
+  /xyz/openbmc_project/sensors/temperature/Ambient_Temp
+```
+
+預期可看到下列介面與屬性：
+
+```text
+xyz.openbmc_project.Sensor.Value
+  Value
+  Unit
+
+xyz.openbmc_project.Sensor.Threshold.Warning
+  WarningHigh
+  WarningLow
+  WarningAlarmHigh
+  WarningAlarmLow
+
+xyz.openbmc_project.Sensor.Threshold.Critical
+  CriticalHigh
+  CriticalLow
+  CriticalAlarmHigh
+  CriticalAlarmLow
+```
+
+若 D-Bus sensor 未出現，先同步三個層級的資訊：
+
+```bash
+# 1. kernel / hwmon 是否有輸出
+find /sys/class/hwmon -name 'temp*_input' -print
+
+# 2. Entity Manager 是否載入設定
+busctl tree xyz.openbmc_project.EntityManager
+journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager | grep -i Ambient
+
+# 3. HwmonTempSensor 是否建立物件
+journalctl -u xyz.openbmc_project.HwmonTempSensor.service -b --no-pager | grep -Ei 'Ambient|TMP75|0x48|error|fail'
+```
+
+##### 11.4.11 Redfish / IPMI 整合驗證
+
+Redfish 常見查詢入口會依 OpenBMC 版本與平台設定而不同。常見路徑包含：
+
+```text
+/redfish/v1/Chassis/<ChassisId>/Thermal
+/redfish/v1/Chassis/<ChassisId>/Sensors
+/redfish/v1/TelemetryService/MetricReports
+```
+
+查詢範例：
+
+```bash
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/chassis/Sensors
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/chassis/Thermal
+```
+
+需確認項目：
+
+- Redfish sensor 名稱是否符合平台命名規格。
+- Reading / ReadingUnits 是否合理，溫度單位通常為 Celsius。
+- Thresholds 是否對應 Entity Manager 設定。
+- Status.State / Status.Health 是否會隨 availability / threshold 狀態變化。
+- 若需 IPMI SDR，確認 SDR 中 sensor type、entity id、sensor number 與 threshold mapping 是否符合需求。
+
+##### 11.4.12 校準與 Thermal Policy 對齊
+
+溫度 sensor bring-up 不應只停在 `cat temp1_input` 有值，還需與 thermal policy 對齊。建議建立下列測試資料：
+
+<table>
+<tr>
+<th>測試條件</th>
+<th>觀察項目</th>
+<th>驗收方向</th>
+</tr>
+<tr>
+<td>室溫 idle</td>
+<td>sensor 讀值、標準溫度計、風扇轉速</td>
+<td>ambient sensor 通常應與環境溫度接近</td>
+</tr>
+<tr>
+<td>host full load</td>
+<td>CPU / DIMM / VR / outlet 溫度曲線</td>
+<td>曲線需符合 airflow 與功耗預期</td>
+</tr>
+<tr>
+<td>fan speed step</td>
+<td>溫度下降時間常數</td>
+<td>fan policy 應可讓溫度回到目標區間</td>
+</tr>
+<tr>
+<td>局部加熱</td>
+<td>D-Bus Value、WarningAlarmHigh、CriticalAlarmHigh</td>
+<td>threshold 旗標與事件紀錄需同步更新</td>
+</tr>
+<tr>
+<td>S5 / standby</td>
+<td>PowerState 行為與 I2C error log</td>
+<td>不應在未供電裝置上持續讀取造成錯誤</td>
+</tr>
+</table>
+
+校準建議：
+
+- 先確認 raw sysfs 值是否合理，再調整 Entity Manager 的 `Offset` / `ScaleFactor`。
+- 若偏差與溫度相關，單純固定 offset 可能不足，需重新檢查硬體安裝、感測點位置或換算公式。
+- 若 thermal policy 使用 PID control，需要同步確認 sensor 名稱是否被 policy 指到正確物件。
+- threshold 建議由熱設計與可靠度規格定義，不要只依 bring-up 當下測得溫度推估。
+
+##### 11.4.13 進階除錯與常見陷阱
+
+<table>
+<tr>
+<th>問題現象</th>
+<th>可能方向</th>
+<th>排查 / 處理方式</th>
+</tr>
+<tr>
+<td>i2cdetect 掃不到地址</td>
+<td>I2C mux 未切到正確 channel；晶片未供電；地址 strap 與預期不同；bus number 認知不一致</td>
+<td>檢查 DTS mux node、/sys/bus/i2c/devices、VCC / GND、嘗試相鄰 address，例如 0x49 / 0x4A</td>
+</tr>
+<tr>
+<td>hwmon 有節點但讀值固定或異常</td>
+<td>driver 與硬體型號不完全相容；暫存器格式不同；讀取到 cached value</td>
+<td>確認 compatible、看 datasheet、觀察 dmesg；注意 LM75 driver 可能有 cache 週期</td>
+</tr>
+<tr>
+<td>讀值為極端負值，例如 -128°C 附近</td>
+<td>通訊失敗、NACK、暫存器讀取格式不正確、driver 回傳錯誤值</td>
+<td>確認 I2C waveform、pull-up、clock-frequency；必要時降速到 100 kHz 或 40 kHz 測試</td>
+</tr>
+<tr>
+<td>讀值與標準溫度計偏差大於 2°C</td>
+<td>硬體熱耦合不良；sensor 放置位置與量測點不同；解析度或 sample time 設定不同</td>
+<td>比對多個溫度點；先確認 raw 值，再評估 JSON Offset 或 ScaleFactor</td>
+</tr>
+<tr>
+<td>D-Bus sensor 未出現</td>
+<td>Entity Manager JSON 未載入；Probe 條件不成立；Type 不符合 schema；Bus / Address 對不上 hwmon device</td>
+<td>查 Entity Manager log、HwmonTempSensor log、sensor-info.json、schema 與 busctl tree</td>
+</tr>
+<tr>
+<td>Redfish 出現但數值不更新</td>
+<td>daemon 輪詢未更新；Redfish cache；sensor availability false</td>
+<td>調整 PollRate 測試；busctl monitor 觀察 PropertiesChanged；查 bmcweb log</td>
+</tr>
+<tr>
+<td>系統 log 出現頻繁 I2C 錯誤</td>
+<td>輪詢過快；bus 上裝置過多；clock 太高；host / BMC 共用 bus 存在 arbitration 問題</td>
+<td>調低 PollRate 或調高 PollInterval；降低 clock-frequency；檢查 bus loading</td>
+</tr>
+<tr>
+<td>PECI CPU 溫度無法讀取</td>
+<td>peci driver 未載入；PECI channel 初始化失敗；host CPU 不回應</td>
+<td>檢查 DTS peci node、dmesg、host power state 與平台 PECI routing</td>
+</tr>
+<tr>
+<td>threshold 不觸發事件</td>
+<td>Thresholds 未進 D-Bus；logging / event policy 未連接；測試溫度未跨越門檻與 hysteresis 條件</td>
+<td>busctl introspect 查看 Warning/Critical 介面；busctl monitor；查 phosphor-logging journal</td>
+</tr>
+</table>
+
+##### 11.4.14 Temperature Sensor 資料表範本
+
+<table>
+<tr>
+<th>欄位</th>
+<th>填寫值</th>
+<th>備註</th>
+</tr>
+<tr>
+<td>Sensor Name</td>
+<td>[待填]</td>
+<td>例如 Ambient_Temp、CPU0_Temp、DIMM_A0_Temp</td>
+</tr>
+<tr>
+<td>Physical Location</td>
+<td>[待填]</td>
+<td>進風口、出風口、VR、PCIe zone 等</td>
+</tr>
+<tr>
+<td>Source Type</td>
+<td>[待填]</td>
+<td>I2C hwmon、PECI、PMBus、NVMe、GPU、ADC Thermistor</td>
+</tr>
+<tr>
+<td>Chip / Device</td>
+<td>[待填]</td>
+<td>TMP75B、LM75A、MAX31725、CPU PECI 等</td>
+</tr>
+<tr>
+<td>I2C Bus / Mux Channel</td>
+<td>[待填]</td>
+<td>若非 I2C，填入協定或來源</td>
+</tr>
+<tr>
+<td>7-bit Address</td>
+<td>[待填]</td>
+<td>例如 0x48</td>
+</tr>
+<tr>
+<td>DTS Node</td>
+<td>[待填]</td>
+<td>檔名與 node path</td>
+</tr>
+<tr>
+<td>Kernel Driver</td>
+<td>[待填]</td>
+<td>例如 lm75、pmbus、peci-temp</td>
+</tr>
+<tr>
+<td>hwmon Path</td>
+<td>[待填]</td>
+<td>/sys/class/hwmon/hwmonX/temp1_input</td>
+</tr>
+<tr>
+<td>Entity Manager Type</td>
+<td>[待填]</td>
+<td>需符合 schema</td>
+</tr>
+<tr>
+<td>D-Bus Path</td>
+<td>[待填]</td>
+<td>/xyz/openbmc_project/sensors/temperature/...</td>
+</tr>
+<tr>
+<td>Redfish Path</td>
+<td>[待填]</td>
+<td>/redfish/v1/Chassis/.../Sensors/...</td>
+</tr>
+<tr>
+<td>ScaleFactor / Offset</td>
+<td>[待填]</td>
+<td>預設 1.0 / 0.0；需有測試依據</td>
+</tr>
+<tr>
+<td>Warning High / Low</td>
+<td>[待填]</td>
+<td>°C</td>
+</tr>
+<tr>
+<td>Critical High / Low</td>
+<td>[待填]</td>
+<td>°C</td>
+</tr>
+<tr>
+<td>PowerState</td>
+<td>[待填]</td>
+<td>AlwaysOn / On</td>
+</tr>
+<tr>
+<td>Fan Policy Consumer</td>
+<td>[待填]</td>
+<td>PID zone 或 thermal policy 名稱</td>
+</tr>
+<tr>
+<td>Validation Owner</td>
+<td>[待填]</td>
+<td>BMC / Thermal / HW / System</td>
+</tr>
+</table>
+
+##### 11.4.15 Temperature Sensor 完整 Checklist（Porting 驗收）
+
+```text
+硬體設計階段：
+[ ] Sensor chip 型號與 datasheet 確認
+[ ] I2C bus number、mux channel 與 device address 確認
+[ ] 地址 strap、ALERT pin、供電 rail 與 power state 確認
+[ ] 溫度感測點物理位置定義（進風 / 出風 / 元件表面 / hotspot）
+[ ] 預期溫度範圍與 thermal policy thresholds 定義
+[ ] 若需校準，已定義標準溫度計、測試治具與環境條件
+
+Device Tree / Kernel：
+[ ] 對應 I2C bus node status = "okay"
+[ ] 若經過 I2C mux，mux node 與 channel 設定正確
+[ ] Sensor child node 加入，compatible / reg 正確
+[ ] regulator / interrupt / label 視平台需求加入
+[ ] Kernel driver 已啟用，例如 CONFIG_SENSORS_LM75
+[ ] 開機後 dmesg 無 probe 失敗錯誤
+[ ] /sys/class/hwmon/hwmonX/temp1_input 存在且讀值合理
+[ ] 以標準溫度計比對讀值，誤差在規格書或 thermal 團隊定義範圍內
+
+Entity Manager / Userspace：
+[ ] JSON 設定檔加入正確路徑或已編進 image
+[ ] Probe 條件符合目前 board FRU / inventory 資料
+[ ] Type 名稱與 sensor-info.json / schema 定義一致
+[ ] Bus / Address 數值與實機一致
+[ ] ScaleFactor 與 Offset 已視需要調整，且有測試紀錄
+[ ] PollRate / PollInterval 符合散熱回應時間與 bus loading 需求
+[ ] PowerState 設定符合系統使用情境
+[ ] Thresholds（Critical / Warning High / Low）設定完成
+
+D-Bus / 系統整合：
+[ ] xyz.openbmc_project.HwmonTempSensor.service 啟動無錯誤
+[ ] busctl tree 出現 /xyz/openbmc_project/sensors/temperature/<Name>
+[ ] busctl get-property 可讀取 Value，單位為 °C
+[ ] WarningHigh / CriticalHigh 等屬性寫入 D-Bus 且數值正確
+[ ] busctl monitor 可看到 PropertiesChanged 訊號
+[ ] Redfish Thermal 或 Sensors 可查到該溫度 sensor
+[ ] IPMI SDR 若有需求，sensor type / entity / threshold mapping 正確
+[ ] 加熱 / 冷卻測試時，D-Bus 與 Redfish 數值同步變化
+[ ] 觸發過溫時，CriticalAlarmHigh 或 WarningAlarmHigh 旗標正確變化
+[ ] threshold 觸發時，phosphor-logging / SEL / Journal entry 符合需求
+[ ] 風扇轉速依據溫度變化有正確加速 / 減速
+[ ] S5 / standby / host power cycle 下，不產生不必要 I2C error log
+```
+
+##### 11.4.16 本節參考資料
+
+- OpenBMC dbus-sensors README: https://github.com/openbmc/dbus-sensors
+- OpenBMC dbus-sensors HwmonTempSensor source: https://github.com/openbmc/dbus-sensors/tree/master/src/hwmon-temp
+- Linux hwmon sysfs interface: https://docs.kernel.org/hwmon/sysfs-interface.html
+- Linux LM75 Device Tree binding: https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/hwmon/lm75.yaml
+- Linux LM75 hwmon driver documentation: https://www.kernel.org/doc/html/latest/hwmon/lm75.html
 
 ### 12. Fan Control
 
