@@ -52,6 +52,7 @@
 | 2026-07-06 |  0.8 | Copilot | 撰寫自訂 .bb Recipe 章節 |
 | 2026-07-06 |  0.9 | Copilot | 撰寫進階混合開發 devtool modify / update-recipe / finish 章節 |
 | 2026-07-06 |  0.10 | Copilot | OpenBMC 新 Machine Layer 與 DTS Bring-up 系統化流程 |
+| 2026-07-06 |  0.11 | Copilot | 撰寫 Porting ADC Sensor |
 
 ### 0.7 資料來源可信度分級
 
@@ -3774,6 +3775,426 @@ Sensor 欄位範本：
 | Name   | Type             | Source    | Scale  | Unit    | Warning | Critical | D-Bus path | Redfish | IPMI SDR |
 | ------ | ---------------- | --------- | ------ | ------- | ------: | -------: | ---------- | ------- | -------- |
 | [待填] | temp/voltage/fan | hwmon/i2c | [待填] | C/V/RPM |  [待填] |   [待填] | [待填]     | [待填]  | [待填]   |
+
+
+#### 11.3 ADC Sensor
+
+本節整理 OpenBMC 中 ADC voltage sensor 的 porting 流程。ADC 適合用來量測板上類比電壓，常見包含 P12V、P5V、P3V3、P1V8、CPU Vcore、standby rail、thermistor voltage、hardware strap voltage、battery sense 等。
+
+在 OpenBMC 的 `dbus-sensors` 架構中，ADC sensor 通常由 `adcsensor` daemon 讀取 Linux kernel 透過 IIO / hwmon 匯出的 sysfs 節點，再依 Entity Manager 提供的設定建立 D-Bus sensor 物件。AST2600 類平台需先在 device tree 啟用 ADC controller，再用 `iio-hwmon` 將 IIO channel 轉成 hwmon voltage input。
+
+##### 11.3.1 基本資料流
+
+```text
+硬體待測電壓 Rail
+    ↓
+分壓電阻或濾波電路
+    ↓
+BMC SoC ADC pin / ADC channel
+    ↓
+Linux IIO ADC driver
+    ↓
+iio-hwmon bridge
+    ↓
+/sys/class/hwmon/hwmonX/inY_input
+    ↓
+OpenBMC adcsensor daemon
+    ↓
+Entity Manager configuration：Name / Type / Index / ScaleFactor / Thresholds
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/voltage/<Name>
+    ↓
+Redfish / WebUI / IPMI SDR / logging / threshold event
+```
+
+關鍵觀念：
+- Kernel 端負責讓 ADC channel 出現在 IIO，並由 `iio-hwmon` 轉為 `/sys/class/hwmon/hwmonX/inY_input`。
+- Userspace 端的 `adcsensor` 會尋找 `name` 為 `iio_hwmon` 的 hwmon 裝置，並讀取 `in*_input`。
+- Entity Manager 只描述「哪個 index 對應哪個 sensor 名稱、倍率、閾值與電源狀態」，不負責設定 ADC pinmux 或啟用 kernel driver。
+- Redfish / IPMI 是否看得到 sensor，通常取決於 D-Bus path、sensor type、association 與上層 mapping 是否符合平台政策。
+
+##### 11.3.2 Bring-up 前必填資料
+
+| 欄位 | 說明 | 範例 / 注意事項 |
+| --- | --- | --- |
+| Rail name | 待測電壓名稱 | `P12V`、`P3V3_AUX`、`CPU_VCORE` |
+| ADC controller | 使用哪個 ADC engine | `adc0` / `adc1` |
+| ADC channel | SoC 端 channel number | `adc0 channel 0`、`adc1 channel 3` |
+| Schematic net | ADC pin 前後 net 名稱 | 需可回查硬體圖 |
+| Rtop / Rbottom | 分壓電阻 | 例如 `100 kΩ / 20 kΩ` |
+| ADC pin 最大電壓 | 分壓後進 ADC 的最高電壓 | 不可超過 Vref / SoC 規格限制 |
+| ADC reference | 內部或外部參考電壓 | AST2600 common binding 允許內部 `1.2 V` 或 `2.5 V`，也可用 `vref-supply` 描述外部參考 |
+| ADC 解析度 | SoC / driver 實際解析度 | Upstream AST2600 binding 描述為 10-bit；若 vendor BSP 有差異，以該 kernel driver 與 datasheet 為準 |
+| sysfs index | `/sys/class/hwmon/.../inY_input` 的 `Y` | 需實機確認，避免 DTS channel 順序與 sensor 設定不一致 |
+| ScaleFactor | 分壓還原倍率 | `(Rtop + Rbottom) / Rbottom` |
+| Thresholds | Warning / Critical 上下限 | 通常依 rail nominal ± tolerance 設定 |
+| PowerState | sensor 啟用條件 | `Always` / `On` 等，依專案 schema 支援值確認 |
+| Redfish / IPMI policy | 是否需要對外呈現 | 對應 Chassis / Inventory / SDR policy |
+
+##### 11.3.3 ScaleFactor 與單位換算
+
+若 `/sys/class/hwmon/hwmonX/inY_input` 回傳的是 ADC pin 上的電壓，hwmon voltage input 慣例單位為 millivolt。此時 Entity Manager 中的 `ScaleFactor` 應設定為外部分壓還原倍率：
+
+```text
+ScaleFactor = (Rtop + Rbottom) / Rbottom
+RailVoltage(V) = (inY_input(mV) / 1000) × ScaleFactor
+```
+
+範例：
+
+```text
+待測 rail: P12V
+Rtop = 100 kΩ
+Rbottom = 20 kΩ
+ScaleFactor = (100 + 20) / 20 = 6.0
+in0_input = 2000 mV
+P12V = 2000 / 1000 × 6.0 = 12.0 V
+```
+
+若看到 sysfs 讀值像 `0~1023` 或 `0~4095` 這類 raw code，而不是 mV，需要先確認目前節點是否真的是 hwmon voltage input，或是否讀錯到 IIO raw 節點。若專案 kernel / vendor BSP 的橋接行為與 upstream 不同，才需要把 Vref 與解析度納入換算：
+
+```text
+ADC_pin_mV = raw_code × Vref_mV / (2^N - 1)
+RailVoltage(V) = (ADC_pin_mV / 1000) × ((Rtop + Rbottom) / Rbottom)
+```
+
+排查時建議同步讀取：
+
+```bash
+# hwmon voltage input，通常為 millivolt
+cat /sys/class/hwmon/hwmonX/inY_input
+
+# IIO raw / scale，依 driver expose 狀態可能不同
+ls /sys/bus/iio/devices/iio:device*/in_voltage*_raw 2>/dev/null
+ls /sys/bus/iio/devices/iio:device*/in_voltage*_scale 2>/dev/null
+```
+
+##### 11.3.4 Device Tree 設定
+
+AST2600 upstream binding 中，ADC controller 常見必要屬性包含 `compatible`、`reg`、`clocks`、`resets` 與 `#io-channel-cells = <1>`。平台 dts 通常只需覆寫 `status`、參考電壓與必要 pinmux，再建立 `iio-hwmon` consumer。
+
+```dts
+/* SoC dtsi 通常已有 adc0 / adc1 節點，平台 dts 覆寫即可 */
+&adc0 {
+    status = "okay";
+    aspeed,int-vref-microvolt = <2500000>;
+};
+
+&adc1 {
+    status = "okay";
+    aspeed,int-vref-microvolt = <2500000>;
+};
+
+/* 將指定 IIO channels 匯出為 hwmon voltage input */
+iio-hwmon {
+    compatible = "iio-hwmon";
+    io-channels = <&adc0 0>, <&adc0 1>, <&adc0 2>, <&adc1 0>;
+};
+```
+
+若平台使用外部 reference regulator，可改用 `vref-supply`，並在 regulator 節點描述實際電壓。若 BSP 支援額外 vendor property，例如 averaging、clock frequency、battery sensing 或 trim data，需以該 kernel tree 的 binding 文件與 `dtbs_check` 結果為準；不要只靠舊專案 DTS 複製。
+
+建議驗證：
+
+```bash
+# build host：檢查 binding
+bitbake -c devshell virtual/kernel
+make dtbs_check DT_SCHEMA_FILES=Documentation/devicetree/bindings/iio/adc/aspeed,ast2600-adc.yaml
+make dtbs_check DT_SCHEMA_FILES=Documentation/devicetree/bindings/hwmon/iio-hwmon.yaml
+
+# target：確認 DTB 實際載入內容
+dtc -I fs -O dts /sys/firmware/devicetree/base 2>/dev/null | less
+```
+
+##### 11.3.5 Kernel Config 與 image 納入檢查
+
+ADC sensor 需要 ADC driver、IIO core 與 iio-hwmon。不同 kernel 版本名稱可能略有差異，常見方向如下：
+
+```text
+CONFIG_IIO=y
+CONFIG_ASPEED_ADC=y 或對應 platform ADC driver
+CONFIG_SENSORS_IIO_HWMON=y 或 m
+CONFIG_HWMON=y
+```
+
+檢查方式：
+
+```bash
+# build output 中確認最後 .config
+bitbake -e virtual/kernel | grep '^B='
+ grep -E 'CONFIG_(IIO|ASPEED_ADC|SENSORS_IIO_HWMON|HWMON)' \
+    tmp/work/*/linux-*/**/build/.config 2>/dev/null
+
+# target 上確認 driver / module / sysfs
+zcat /proc/config.gz | grep -E 'CONFIG_(IIO|ASPEED_ADC|SENSORS_IIO_HWMON|HWMON)' 2>/dev/null
+ls /sys/bus/iio/devices/
+ls /sys/class/hwmon/
+```
+
+##### 11.3.6 sysfs 節點確認
+
+開機後先找出 `iio_hwmon`：
+
+```bash
+for h in /sys/class/hwmon/hwmon*; do
+    [ -f "$h/name" ] || continue
+    if grep -qx "iio_hwmon" "$h/name"; then
+        echo "$h"
+        ls "$h"/in*_input
+    fi
+done
+```
+
+讀取所有 voltage input：
+
+```bash
+HWMON=/sys/class/hwmon/hwmon2
+for f in "$HWMON"/in*_input; do
+    printf '%s = ' "$(basename "$f")"
+    cat "$f"
+done
+```
+
+以三用電表比對：
+
+```text
+1. 量測 ADC pin 端電壓，而不是 rail 原始電壓。
+2. 比對 inY_input 是否接近 ADC pin mV。
+3. 再用 ScaleFactor 換算回 rail voltage。
+4. 若 pin 電壓吻合但 D-Bus rail voltage 不吻合，優先檢查 ScaleFactor / Index。
+5. 若 pin 電壓與 sysfs 不吻合，優先檢查 Vref、driver、DTS、IIO scale、SoC ADC calibration。
+```
+
+一般 bring-up 可接受誤差需依電阻精度、ADC 精度、Vref 精度與 board noise 決定；若未另訂規格，可先用 `±1%~±3%` 作為初步判斷，再由 HW / validation 定義量產門檻。
+
+##### 11.3.7 Entity Manager JSON 設定
+
+Entity Manager configuration 通常為 board / chassis / device 物件，sensor 放在 `Exposes` 陣列中。以下以 baseboard 上的 P12V 為例：
+
+```json
+{
+    "Name": "Baseboard",
+    "Type": "Board",
+    "Probe": "TRUE",
+    "Exposes": [
+        {
+            "Name": "P12V",
+            "Type": "ADC",
+            "Index": 0,
+            "ScaleFactor": 6.0,
+            "PollRate": 0.5,
+            "PowerState": "Always",
+            "MinValue": 0.0,
+            "MaxValue": 15.0,
+            "Thresholds": [
+                {
+                    "Name": "upper critical",
+                    "Direction": "greater than",
+                    "Severity": 1,
+                    "Value": 13.2
+                },
+                {
+                    "Name": "lower critical",
+                    "Direction": "less than",
+                    "Severity": 1,
+                    "Value": 10.8
+                },
+                {
+                    "Name": "upper non critical",
+                    "Direction": "greater than",
+                    "Severity": 0,
+                    "Value": 12.6
+                },
+                {
+                    "Name": "lower non critical",
+                    "Direction": "less than",
+                    "Severity": 0,
+                    "Value": 11.4
+                }
+            ]
+        }
+    ]
+}
+```
+
+設定重點：
+- `Type = "ADC"`：讓 `adcsensor` daemon 把此筆設定視為 ADC sensor。
+- `Index`：需對應實機可讀到的 `inY_input`，請以 target sysfs 與 daemon log 交叉確認。
+- `ScaleFactor`：通常只放分壓倍率；不要重複把 mV → V 或 Vref 轉換放進去，除非專案 driver 確認回傳 raw code。
+- `PollRate`：OpenBMC upstream `adcsensor` 使用秒為單位且預設約 `0.5` 秒；部分 vendor fork 可能改成 `PollInterval` 或毫秒，需查 schema / source。
+- `PowerState`：用於控制 sensor 在 standby / host on 時是否建立或更新。待機 rail 用 `Always` 類設定，host rail 可依平台政策設為只在 host on 時讀取。
+- `Probe`：若 sensor 只存在於特定 SKU，需加入 FRU、board ID、CPLD register 或其他 inventory 條件，避免不存在的 sensor 長期呈現 unavailable。
+
+建議在 source tree 內驗證 schema：
+
+```bash
+# 找 ADC schema 或 legacy schema 中的 ADC 定義
+find meta-* openbmc -path '*entity-manager*schema*' -type f 2>/dev/null | sort
+ grep -R '"ADC"' -n meta-* openbmc 2>/dev/null | head -50
+
+# 找平台設定是否進 image
+find tmp/work -path '*entity-manager*' -type f | grep -E '\.json$' | head
+find tmp/deploy/images/${MACHINE}/ -type f | grep -E 'manifest|rootfs|tar'
+```
+
+##### 11.3.8 啟動服務與 D-Bus 驗證
+
+```bash
+# 重新讀取 Entity Manager 設定
+systemctl restart xyz.openbmc_project.EntityManager.service
+
+# 重啟 ADC sensor daemon
+systemctl restart xyz.openbmc_project.ADCSensor.service
+
+# 查看 log
+journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager
+journalctl -u xyz.openbmc_project.ADCSensor.service -b --no-pager
+
+# 找 ADC sensor 物件
+busctl tree xyz.openbmc_project.ADCSensor
+
+# 讀值，Value 通常為 Volts / double
+busctl get-property \
+  xyz.openbmc_project.ADCSensor \
+  /xyz/openbmc_project/sensors/voltage/P12V \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+
+# 確認 threshold interface
+busctl introspect \
+  xyz.openbmc_project.ADCSensor \
+  /xyz/openbmc_project/sensors/voltage/P12V
+```
+
+預期在 D-Bus 上可看到：
+
+```text
+xyz.openbmc_project.Sensor.Value
+xyz.openbmc_project.Sensor.Threshold.Warning
+xyz.openbmc_project.Sensor.Threshold.Critical
+xyz.openbmc_project.State.Decorator.Availability
+xyz.openbmc_project.State.Decorator.OperationalStatus
+```
+
+##### 11.3.9 Redfish / IPMI 驗證
+
+Redfish：
+
+```bash
+# 依平台 Chassis 名稱調整
+$ curl -k -u root:0penBmc https://${BMC}/redfish/v1/Chassis/
+$ curl -k -u root:0penBmc https://${BMC}/redfish/v1/Chassis/<chassis>/Sensors
+$ curl -k -u root:0penBmc https://${BMC}/redfish/v1/Chassis/<chassis>/Sensors/P12V
+```
+
+IPMI：
+
+```bash
+$ ipmitool -I lanplus -H ${BMC} -U root -P 0penBmc sensor list | grep -i P12V
+$ ipmitool -I lanplus -H ${BMC} -U root -P 0penBmc sdr elist | grep -i P12V
+```
+
+若 D-Bus 有 sensor 但 Redfish / IPMI 看不到，排查方向通常不是 ADC driver，而是：
+- sensor path 或 type 不符合上層預期。
+- inventory association 未建立。
+- Redfish chassis mapping 未包含該 sensor。
+- IPMI SDR policy 未產生該 sensor。
+- service 啟動順序或 cache 未更新。
+
+##### 11.3.10 閾值與事件驗證
+
+Threshold 建議先用 nominal voltage 與 tolerance 計算。例如 12 V rail：
+
+```text
+Warning：±5%  → 11.4 V / 12.6 V
+Critical：±10% → 10.8 V / 13.2 V
+```
+
+驗證內容：
+
+```bash
+# 讀取 threshold property
+busctl introspect xyz.openbmc_project.ADCSensor \
+  /xyz/openbmc_project/sensors/voltage/P12V | grep -E 'Threshold|Alarm|Value'
+
+# 查看事件 log / journal
+journalctl -b | grep -Ei 'P12V|threshold|critical|warning'
+```
+
+測試方式可依硬體條件選擇：
+- 使用可程式電源供應器調整 rail，需先確認安全範圍。
+- 使用 ADC input fixture 模擬分壓後電壓。
+- 若 driver / validation framework 支援，可用測試 hook 注入讀值。
+
+驗收點：
+- 超過 warning threshold 時，Warning alarm property 變化。
+- 超過 critical threshold 時，Critical alarm property 變化。
+- 回到 hysteresis / deassert 條件後 alarm 清除。
+- EventLog / SEL / journal 有對應紀錄。
+- Redfish sensor 狀態與讀值同步更新。
+
+##### 11.3.11 常見問題與排查
+
+| 問題現象 | 可能方向 | 建議檢查 |
+| --- | --- | --- |
+| `/sys/class/hwmon` 找不到 `iio_hwmon` | `iio-hwmon` DTS node 未加入、kernel config 未啟用、driver probe fail | `dmesg | grep -Ei 'adc|iio|hwmon'`、確認 `CONFIG_SENSORS_IIO_HWMON` |
+| `iio_hwmon` 存在但沒有 `in*_input` | `io-channels` 指到錯誤 provider / channel、ADC controller 未啟用 | 檢查 DTS phandle、`#io-channel-cells`、`status = "okay"` |
+| `inY_input` 永遠為 0 | ADC pin 無電壓、pinmux / board route 錯、待測 rail 未上電 | 用電表量 ADC pin，確認 host power state |
+| D-Bus sensor 沒出現 | Entity Manager JSON 未載入、`Probe` 不符合、`Type` / `Index` 錯誤 | `journalctl -u EntityManager`、`journalctl -u ADCSensor`、`busctl tree` |
+| D-Bus value 差一個倍率 | `ScaleFactor` 未填或填錯、把 mV/V 轉換重複計入 | 用 `inY_input / 1000 × ScaleFactor` 手算比對 |
+| 某些 rail 在待機顯示 unavailable | `PowerState` 設成 host-on-only、rail 本身未上電 | 確認 power policy 與待機 rail 定義 |
+| 讀值跳動大 | ADC input noise、分壓阻值過高、濾波不足、取樣率太快 | 用示波器看 ADC pin；評估 RC filter、driver averaging、PollRate |
+| Redfish N/A | D-Bus 有 sensor 但 association / chassis mapping 不完整 | 查 bmcweb log、Redfish sensors endpoint、inventory association |
+| threshold 不觸發 | threshold 名稱 /方向 /Severity 錯、讀值未真正跨越門檻 | busctl introspect threshold properties，人工調整輸入驗證 |
+| 更新 DTB 後行為沒變 | 燒錄到錯誤 image slot、U-Boot 載入舊 DTB | 檢查 `/proc/device-tree`、U-Boot env、`tmp/deploy/images` |
+
+##### 11.3.12 Porting 驗收 Checklist
+
+硬體與 schematic：
+- [ ] ADC channel number 與 SoC pin 對照完成。
+- [ ] Rail name、net name、Rtop、Rbottom、ADC pin net 已記錄。
+- [ ] ADC pin 最大電壓低於 SoC / Vref 允許範圍。
+- [ ] ScaleFactor 已依 schematic 計算並由 HW review。
+- [ ] 使用三用電表量測 ADC pin 與 rail，確認分壓比例合理。
+
+Device Tree / Kernel：
+- [ ] `adc0` / `adc1` 或對應 ADC controller `status = "okay"`。
+- [ ] `aspeed,int-vref-microvolt` 或 `vref-supply` 與硬體一致。
+- [ ] `iio-hwmon` node 已列出需要的 `io-channels`。
+- [ ] kernel config 包含 IIO、ADC driver、hwmon、iio-hwmon。
+- [ ] target 上可看到 `/sys/class/hwmon/hwmonX/name = iio_hwmon`。
+- [ ] target 上可讀到 `/sys/class/hwmon/hwmonX/inY_input`。
+
+Entity Manager / Userspace：
+- [ ] JSON 放在正確 layer / recipe，且進入 rootfs。
+- [ ] `Exposes` 裡有 `Type = "ADC"`、`Name`、`Index`、`ScaleFactor`。
+- [ ] `PollRate` / `PowerState` 符合平台需求。
+- [ ] SKU 差異已用 `Probe` 或平台設定區分。
+- [ ] warning / critical thresholds 已依 rail tolerance 設定。
+
+D-Bus / Redfish / IPMI：
+- [ ] `xyz.openbmc_project.ADCSensor.service` 啟動無錯誤。
+- [ ] D-Bus path 出現 `/xyz/openbmc_project/sensors/voltage/<Name>`。
+- [ ] `Value` 單位為 Volts，且與電表換算結果一致。
+- [ ] Warning / Critical threshold interfaces 存在。
+- [ ] Redfish sensor endpoint 可看到該 sensor。
+- [ ] 若平台需要 IPMI，SDR 與 `ipmitool sensor list` 可看到該 sensor。
+- [ ] threshold assert / deassert、EventLog / SEL / journal 已驗證。
+
+##### 11.3.13 ADC Sensor 資料表範本
+
+| Rail | ADC controller / channel | sysfs | Rtop | Rbottom | ScaleFactor | Nominal | Warning low/high | Critical low/high | PowerState | D-Bus path |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| P12V | adc0 ch0 | in0_input | 100 kΩ | 20 kΩ | 6.0 | 12.0 V | 11.4 / 12.6 V | 10.8 / 13.2 V | Always | `/xyz/openbmc_project/sensors/voltage/P12V` |
+| P3V3_AUX | adc0 ch1 | in1_input | [待填] | [待填] | [待填] | 3.3 V | [待填] | [待填] | Always | [待填] |
+| CPU_VCORE | adc1 ch0 | in3_input | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | On | [待填] |
+
+##### 11.3.14 本節參考資料
+
+- OpenBMC `dbus-sensors` README：說明 sensor daemon 由 Entity Manager 動態設定，ADC sensor 使用 Linux IIO，AST2600 平台需在 device tree 啟用 `adc0` / `adc1` 並用 `iio-hwmon` 匯出。
+- OpenBMC `ADCSensorMain.cpp`：`adcsensor` 尋找 `name` 為 `iio_hwmon` 的 hwmon 裝置，讀取 `in*_input`，預設 poll rate 約 `0.5` 秒。
+- Linux kernel `iio-hwmon.yaml`：`iio-hwmon` binding 的必要屬性為 `compatible = "iio-hwmon"` 與 `io-channels`。
+- Linux kernel `aspeed,ast2600-adc.yaml`：AST2600 ADC binding 描述兩個 ADC engine、各 8 個 voltage channels、`#io-channel-cells = <1>`、內部 reference `1200000` / `2500000` microvolt，以及可用 `vref-supply` 對應外部 reference。
 
 ### 12. Fan Control
 
