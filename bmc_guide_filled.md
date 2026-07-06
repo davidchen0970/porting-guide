@@ -44,6 +44,7 @@
 | ---------- | ---: | ------- | ---------------------- |
 | 2026-07-06 |  0.1 | Copilot | 依目錄建立第一輪填寫版 |
 | 2026-07-06 |  0.2 | Copilot | 撰寫 Yocto 章節 |
+| 2026-07-06 |  0.3 | Copilot | 撰寫常用變數、目錄結構與 BitBake 建構流程 |
 
 ### 0.7 資料來源可信度分級
 
@@ -463,6 +464,451 @@ bitbake -e <recipe> | grep '^WORKDIR='
 #### 7.1.9 小結
 
 Yocto 可以理解成「可重現的嵌入式 Linux 建構框架」，BitBake 是任務引擎，OpenEmbedded 提供 metadata 骨架，Poky 是參考發行版，OpenBMC 則是在這套框架上建出的 BMC 韌體專案。對 BMC porting 來說，最重要的是把 machine、layer、kernel、U-Boot、image、sensor / inventory config、firmware update layout 這幾塊關係釐清，後續 debug 才能有效率地把問題定位到 BSP、kernel、Device Tree、user space service 或平台設定。
+
+
+### 7.2 常用變數、目錄結構與 BitBake 建構流程
+
+這章整理 Yocto 的「廚房」：目錄怎麼放、設定檔怎麼寫、常用變數代表什麼、BitBake 如何解析 metadata 並執行 tasks。熟悉這些內容後，排查 BMC image 建構失敗、recipe 沒有被套用、layer 優先權不如預期、sstate 沒有命中等問題會更有效率。
+
+#### 7.2.1 目錄結構
+
+執行 `source oe-init-build-env` 後，常見流程會建立或切換到 `build/` 目錄。`build/` 是整個建構過程的工作核心，包含設定檔、下載資料、快取、中間產物與最終輸出。
+
+```text
+build/
+├── bitbake-cookerdaemon.log   # BitBake cooker daemon 的執行日誌
+├── cache/                     # BitBake 解析快取，加速下次解析
+├── conf/                      # 設定檔，例如 local.conf、bblayers.conf
+├── downloads/                 # 下載的原始碼與 SCM mirror，通常由 DL_DIR 指定
+├── sstate-cache/              # Shared State Cache，通常由 SSTATE_DIR 指定
+└── tmp/                       # 建構中間產物與最終輸出，通常由 TMPDIR 指定
+    ├── work/                  # 各 recipe 的工作目錄，含 source、build output、log
+    ├── deploy/                # image、SDK、套件等輸出
+    ├── sysroots-components/   # sysroot 元件資料
+    ├── stamps/                # task stamp，用於判斷 task 是否需要重跑
+    └── log/                   # build log 與部分統計資料
+```
+
+各目錄用途：
+
+- `conf/`：最重要的設定檔所在地，包含 `local.conf` 與 `bblayers.conf`。
+- `downloads/`：`do_fetch` 下載的 tarball、Git mirror 或其他 source cache 會放在這裡。此目錄可跨專案共用，降低重複下載成本。
+- `sstate-cache/`：Shared State Cache，保存可重用的 task 輸出。若 task 的輸入與 signature 沒有變化，BitBake 可從 sstate 還原結果，減少重建時間。
+- `tmp/`：建構過程的主要工作區。`tmp/work/` 是各 recipe 的獨立工作空間，`tmp/deploy/` 是 image、package、SDK 等輸出位置。
+- `tmp/work/<machine或arch>/<recipe>/<version>/`：常見 recipe workdir，可找到 `temp/log.do_*`、`image/`、`package/`、`packages-split/`、source tree 等資料。
+- `tmp/deploy/images/<machine>/`：BMC image、kernel、DTB、U-Boot、manifest、tarball 或 flash image 的常見輸出位置。
+
+實務建議：
+
+- `downloads/` 與 `sstate-cache/` 可透過共用目錄、符號連結或 NFS 提供給多個開發者或 CI 使用，節省網路頻寬與建構時間。
+- CI 環境若共用 sstate，需同時控管 Yocto branch、layer revisions、host distro、compiler 版本與 `MACHINE` / `DISTRO`，避免 cache 命中行為難以追蹤。
+- 若懷疑 sstate 造成舊檔被重用，先針對單一 recipe 使用 `bitbake -c cleansstate <recipe>`，不建議一開始就刪整個 `sstate-cache/`。
+
+#### 7.2.2 設定檔說明
+
+##### `local.conf`：個人建構設定
+
+`local.conf` 是使用者自訂建構選項的主要設定檔，通常位於 `build/conf/local.conf`。它適合放開發者本機或 CI job 層級的設定，例如 target machine、下載目錄、sstate 目錄、package format、平行建構參數等。
+
+| 項目 | 說明 | 變數 | 常見預設或範例 |
+|---|---|---|---|
+| 目標機器 | 要編譯給哪塊板子或 QEMU target | `MACHINE` | `qemux86-64`、`ast2600-evb`、`<project-machine>` |
+| 下載目錄 | source archive / Git mirror 位置 | `DL_DIR` | `${TOPDIR}/downloads` |
+| 快取目錄 | Shared State Cache 位置 | `SSTATE_DIR` | `${TOPDIR}/sstate-cache` |
+| 輸出目錄 | 建構中間產物與 deploy 資料 | `TMPDIR` | `${TOPDIR}/tmp` |
+| 發行版政策 | distro policy，例如 libc、init、feature set | `DISTRO` | `poky`、OpenBMC distro 設定 |
+| 套件格式 | 產生 RPM、DEB 或 IPK | `PACKAGE_CLASSES` | `package_rpm`、`package_ipk` |
+| SDK 架構 | SDK 執行端架構 | `SDKMACHINE` | `x86_64`、`i686` |
+| 映像功能 | debug-tweaks、ssh-server 等 image feature | `EXTRA_IMAGE_FEATURES` | 依 distro / image 而定 |
+| BitBake 任務數 | BitBake 同時排程多少 task | `BB_NUMBER_THREADS` | 可依 CPU 數與 RAM 調整 |
+| 編譯核心數 | 傳給 make / ninja 等工具的平行度 | `PARALLEL_MAKE` | 例如 `-j 16` |
+
+常見設定：
+
+```bitbake
+MACHINE = "<project-machine>"
+DISTRO = "openbmc-phosphor"
+PACKAGE_CLASSES = "package_ipk"
+
+DL_DIR = "/data/yocto/downloads"
+SSTATE_DIR = "/data/yocto/sstate-cache"
+TMPDIR = "${TOPDIR}/tmp"
+
+BB_NUMBER_THREADS = "16"
+PARALLEL_MAKE = "-j 16"
+```
+
+建議：
+
+- `BB_NUMBER_THREADS` 與 `PARALLEL_MAKE` 不一定越大越好。若主機 RAM 或 I/O 不足，過高平行度可能造成 swap、I/O wait 或 random build failure。
+- BMC 專案常見瓶頸包含 C++ service 編譯、Rust package、node / web UI、kernel build 與 image rootfs；可透過 `buildstats` 或 CI log 觀察實際耗時。
+- 若多人共用 `DL_DIR` / `SSTATE_DIR`，建議放在 `site.conf` 或 CI template，而不是每個人的 `local.conf` 各自維護。
+
+##### `bblayers.conf`：決定載入哪些 layers
+
+`bblayers.conf` 定義 BitBake 要載入哪些 layers，通常位於 `build/conf/bblayers.conf`。BitBake 解析 base configuration 時會讀取此檔，並依此找到每個 layer 的 `conf/layer.conf`。
+
+```bitbake
+POKY_BBLAYERS_CONF_VERSION = "2"
+
+BBPATH = "${TOPDIR}"
+BBFILES ?= ""
+
+BBLAYERS ?= " \
+  /home/yocto/poky/meta \
+  /home/yocto/poky/meta-poky \
+  /home/yocto/poky/meta-yocto-bsp \
+  /home/yocto/openbmc/meta-phosphor \
+  /home/yocto/openbmc/meta-aspeed \
+  /home/yocto/project/meta-my-platform \
+  "
+```
+
+重點變數：
+
+- `BBLAYERS`：列出所有 layer 的路徑。BitBake 會讀取每個 layer 的 `conf/layer.conf`。
+- `BBPATH`：BitBake 搜尋 `.conf`、`.bbclass` 等檔案的路徑基礎。
+- `BBFILES`：定位 `.bb` 與 `.bbappend` 檔案的 pattern，通常由各 layer 的 `layer.conf` 追加。
+
+注意事項：
+
+- `BBLAYERS` 的順序會影響 layer 被加入 `BBPATH` 與 metadata 搜尋的先後，但 recipe 選擇與覆蓋不只看順序；更關鍵的是各 layer 在 `layer.conf` 中設定的 `BBFILE_PRIORITY_<collection>`、recipe version、`PREFERRED_PROVIDER`、`PREFERRED_VERSION` 與 override。
+- 若同一 recipe 被多個 layer 提供，可用 `bitbake-layers show-overlayed` 與 `bitbake-layers show-recipes <name>` 確認實際採用來源。
+- 若 `.bbappend` 沒有套上，常見原因是檔名版本不匹配、layer 沒有加入 `BBLAYERS`、`BBFILES` pattern 沒有包含該路徑，或 layer dependency 沒有滿足。
+
+##### `layer.conf`：每個 layer 的自我介紹
+
+每個 layer 根目錄下通常都有 `conf/layer.conf`，用來宣告該 layer 的 collection name、recipe 搜尋 pattern、priority 與相依 layer。
+
+| 參數 | 說明 |
+|---|---|
+| `BBPATH` | 將該 layer 加入 BitBake 搜尋路徑 |
+| `BBFILES` | 指定該 layer 內 `.bb` 與 `.bbappend` 的位置 |
+| `BBFILE_COLLECTIONS` | 註冊 layer collection name |
+| `BBFILE_PATTERN_<name>` | 比對路徑，判斷某個 recipe 屬於哪個 collection |
+| `BBFILE_PRIORITY_<name>` | layer priority，數字越大優先權越高 |
+| `LAYERDEPENDS_<name>` | 宣告此 layer 依賴哪些其他 layer |
+| `LAYERSERIES_COMPAT_<name>` | 宣告此 layer 相容哪些 Yocto release series |
+
+```bitbake
+BBPATH .= ":${LAYERDIR}"
+BBFILES += "${LAYERDIR}/recipes-*/*/*.bb \
+            ${LAYERDIR}/recipes-*/*/*.bbappend"
+
+BBFILE_COLLECTIONS += "myplatform"
+BBFILE_PATTERN_myplatform = "^${LAYERDIR}/"
+BBFILE_PRIORITY_myplatform = "10"
+
+LAYERDEPENDS_myplatform = "core openembedded-layer meta-phosphor"
+LAYERSERIES_COMPAT_myplatform = "scarthgap styhead walnascar"
+```
+
+BMC porting 建議：
+
+- SoC vendor layer、OpenBMC core layer、company common layer、platform layer 最好有清楚的相依順序與責任邊界。
+- 平台差異優先放在 `meta-<platform>`，不要直接改 `meta-phosphor`、`meta-aspeed`、`meta-nuvoton` 或 upstream layer。
+- 新增 `.bbappend` 後，先用 `bitbake-layers show-appends | grep <recipe>` 確認有被 BitBake 看到。
+
+#### 7.2.3 常用變數
+
+##### 套件命名相關
+
+| 變數 | 說明 | 範例 |
+|---|---|---|
+| `PN` | recipe / package name，通常由 recipe 檔名推導 | `busybox` |
+| `PV` | package version | `1.36.1` |
+| `PR` | package revision，常見預設為 `r0` | `r0` |
+| `PE` | epoch，用於特殊版本排序 | `1` |
+| `PF` | 完整 recipe working name，常見為 `${PN}-${PV}-${PR}` | `busybox-1.36.1-r0` |
+| `BP` | base package name，常見為 `${BPN}-${PV}` | `busybox-1.36.1` |
+| `BPN` | 不含特殊 prefix / suffix 的 base package name | `busybox` |
+
+##### 目錄路徑相關
+
+| 變數 | 說明 | 常見用途 |
+|---|---|---|
+| `TOPDIR` | build directory，例如 `build/` | 設定相對於 build root 的路徑 |
+| `TMPDIR` | 建構中間產物 root | 預設常見為 `${TOPDIR}/tmp` |
+| `WORKDIR` | 單一 recipe 的工作目錄 | 找 source、patch、log、image staging |
+| `S` | 原始碼目錄 | `do_configure` / `do_compile` 常用工作目錄 |
+| `B` | build directory | out-of-tree build 時與 `S` 分開 |
+| `D` | 暫存安裝 root | `do_install` 安裝目的地 |
+| `DL_DIR` | source download cache | 共用下載資料 |
+| `SSTATE_DIR` | shared state cache | 共用 task 輸出快取 |
+| `DEPLOY_DIR` | deploy 輸出 root | package/image/SDK 輸出根目錄 |
+| `DEPLOY_DIR_IMAGE` | 目標 machine 的 image 輸出位置 | 找 BMC flash image、kernel、DTB |
+| `sysconfdir` | 設定檔安裝路徑 | 常見為 `/etc` |
+| `systemd_system_unitdir` | systemd system unit 目錄 | 安裝 `.service` |
+
+##### 原始碼與相依相關
+
+| 變數 | 說明 | 範例 |
+|---|---|---|
+| `SRC_URI` | 原始碼、patch、本地檔案來源 | `git://...`、`file://xxx.patch` |
+| `SRCREV` | Git revision | commit hash、`${AUTOREV}` |
+| `FILESEXTRAPATHS` | 擴充 `file://` 搜尋路徑 | bbappend 常用 |
+| `DEPENDS` | build-time dependency | `openssl zlib` |
+| `RDEPENDS:${PN}` | runtime dependency | `${PN}` 執行時需要的 package |
+| `RRECOMMENDS:${PN}` | runtime recommended package | 可被移除的建議相依 |
+| `PROVIDES` | recipe 提供的 virtual target | `virtual/kernel` |
+| `RPROVIDES:${PN}` | runtime package 提供的名稱 | package alias |
+
+##### Package 與 image 相關
+
+| 變數 | 說明 | 常見用途 |
+|---|---|---|
+| `PACKAGES` | recipe 會切出的 package 清單 | `${PN}`、`${PN}-dev`、`${PN}-dbg` |
+| `FILES:${PN}` | 指定哪些檔案進入 package | 補 installation path |
+| `INSANE_SKIP:${PN}` | 跳過特定 QA check | 需謹慎使用並留下原因 |
+| `IMAGE_INSTALL` | image 安裝 package 清單 | 加入工具或 service |
+| `IMAGE_FEATURES` | image feature | ssh-server、package-management 等 |
+| `EXTRA_IMAGE_FEATURES` | 額外 image feature | debug-tweaks 常見於開發版 |
+| `IMAGE_FSTYPES` | image 輸出格式 | `tar.bz2 ext4 wic ubi mtd` |
+
+##### 安裝路徑變數
+
+| 變數 | 典型值 | 說明 |
+|---|---|---|
+| `prefix` | `/usr` | 安裝根目錄 |
+| `exec_prefix` | `${prefix}` | 架構相關檔案的安裝根目錄 |
+| `bindir` | `${exec_prefix}/bin` | 一般命令 |
+| `sbindir` | `${exec_prefix}/sbin` | 系統管理命令 |
+| `libdir` | `${exec_prefix}/lib` 或 `${exec_prefix}/lib64` | 函式庫檔案 |
+| `includedir` | `${exec_prefix}/include` | 標頭檔 |
+| `datadir` | `${prefix}/share` | 架構無關資料 |
+| `sysconfdir` | `/etc` | 設定檔 |
+| `localstatedir` | `/var` | log、spool、state data |
+
+使用範例：
+
+```bitbake
+do_install() {
+    install -d ${D}${bindir}
+    install -m 0755 myapp ${D}${bindir}/
+
+    install -d ${D}${sysconfdir}/myapp
+    install -m 0644 myconfig.conf ${D}${sysconfdir}/myapp/
+}
+```
+
+重點：`${D}` 是 `do_install` 的暫存根目錄，安裝檔案時應安裝到 `${D}${bindir}`、`${D}${sysconfdir}` 等路徑，而不是直接寫到 host 的 `/usr/bin` 或 `/etc`。
+
+#### 7.2.4 BitBake 指令
+
+BitBake 是 Yocto / OpenEmbedded 的建構引擎，負責解析 metadata、管理相依關係、安排 task、使用 sstate 並產生 package / image / SDK。
+
+基本用法：
+
+```bash
+bitbake <recipe_or_image>
+```
+
+例如：
+
+```bash
+bitbake zstd-native
+bitbake core-image-minimal
+bitbake obmc-phosphor-image
+```
+
+常用選項：
+
+| 選項 | 說明 | 範例 |
+|---|---|---|
+| `-c <task>` | 只執行指定 task | `bitbake -c compile zstd-native` |
+| `-e` | 顯示變數展開後的環境 | `bitbake -e zstd-native | grep '^S='` |
+| `-f` | 強制重跑指定 target 或 task | `bitbake -c compile -f zstd-native` |
+| `-k` | 遇到部分錯誤時繼續跑可執行的 task | `bitbake -k obmc-phosphor-image` |
+| `-g` | 產生 dependency graph 檔案 | `bitbake -g obmc-phosphor-image` |
+| `-p` | 只解析 metadata，不執行建構 | `bitbake -p` |
+| `-s` | 顯示 recipe 版本摘要 | `bitbake -s | grep busybox` |
+| `-c listtasks` | 列出 recipe 可用 tasks | `bitbake -c listtasks busybox` |
+
+清理任務：
+
+| 指令 | 說明 | 使用時機 |
+|---|---|---|
+| `bitbake -c clean <recipe>` | 清除該 recipe 的多數 build 輸出，保留下載資料與 sstate | 一般重建 |
+| `bitbake -c cleansstate <recipe>` | `clean` 加上刪除該 recipe 的 sstate | 懷疑 sstate 命中舊結果 |
+| `bitbake -c cleanall <recipe>` | `cleansstate` 加上刪除 `DL_DIR` 內相關下載資料 | source 下載或 mirror 異常時才考慮 |
+
+排查常用：
+
+```bash
+bitbake -e <recipe> | less
+bitbake -e <recipe> | grep '^WORKDIR='
+bitbake -e <recipe> | grep '^SRC_URI='
+bitbake -c listtasks <recipe>
+bitbake -c devshell <recipe>
+bitbake -c compile -f <recipe>
+bitbake-layers show-layers
+bitbake-layers show-recipes <recipe>
+bitbake-layers show-appends
+bitbake-layers show-overlayed
+```
+
+#### 7.2.5 BitBake 執行流程
+
+BitBake 的執行過程可分為兩大階段：**解析階段（Parsing Phase）**與**執行階段（Execution Phase）**。
+
+##### 解析階段（Parsing Phase）
+
+1. 讀取 `bblayers.conf`，確認要載入哪些 layers。
+2. 讀取每個 layer 的 `conf/layer.conf`，建構 `BBPATH`、`BBFILES`、collection、priority 與 layer dependency。
+3. 讀取 `bitbake.conf`、`local.conf`、distro conf、machine conf 與其他 include / require 檔。
+4. 根據 `BBFILES` 找到所有 `.bb` 與 `.bbappend`。
+5. 解析 recipes、classes、configuration、overrides 與 anonymous python。
+6. 建立 providers、preferences、task dependency 與 runqueue。
+
+常見解析階段問題：
+
+| 現象 | 可能方向 | 檢查方式 |
+|---|---|---|
+| recipe 找不到 | layer 未加入、`BBFILES` pattern 不含該路徑 | `bitbake-layers show-recipes` |
+| bbappend 沒套上 | 檔名版本不合、layer 未加入 | `bitbake-layers show-appends` |
+| provider 衝突 | 多個 recipe 提供同一 virtual target | 查 `PREFERRED_PROVIDER_*` |
+| layer dependency error | `LAYERDEPENDS` 未滿足 | `bitbake-layers show-layers` |
+| Yocto series 不相容 | `LAYERSERIES_COMPAT` 不含目前 release | 檢查各 layer `conf/layer.conf` |
+
+##### 執行階段（Execution Phase）
+
+解析完成後，BitBake 依 runqueue 執行 task。task 是否需要重跑取決於 dependency、stamp、signature 與 sstate 狀態。
+
+一般 recipe 的常見 task：
+
+| 順序 | 任務名稱 | 說明 |
+|---:|---|---|
+| 1 | `do_fetch` | 根據 `SRC_URI` 取得原始碼、本地檔案與 patch |
+| 2 | `do_unpack` | 解壓縮或展開 source 到 `WORKDIR` |
+| 3 | `do_patch` | 套用 patches |
+| 4 | `do_configure` | 執行建構前設定，例如 Autotools、CMake、Meson |
+| 5 | `do_compile` | 編譯 source |
+| 6 | `do_install` | 將編譯結果安裝到 `${D}` |
+| 7 | `do_populate_sysroot` | 將 headers、libraries 等部署到 sysroot，供其他 recipe 使用 |
+| 8 | `do_package` | 將 `${D}` 的內容拆成 packages |
+| 9 | `do_package_qa` | 執行 package QA 檢查 |
+| 10 | `do_package_write_rpm` / `do_package_write_ipk` / `do_package_write_deb` | 依 `PACKAGE_CLASSES` 產生套件 |
+| 11 | `do_populate_lic` | 收集授權資訊 |
+| 12 | `do_build` | 預設總任務，依賴完成正常建構所需 tasks |
+
+Image recipe 額外 task：
+
+| 任務名稱 | 說明 |
+|---|---|
+| `do_rootfs` | 建立 root filesystem，安裝 package、執行 postprocess |
+| `do_image` | 將 rootfs 轉為 image 產物前的共用階段 |
+| `do_image_<fstype>` | 產生指定格式，例如 `do_image_ext4`、`do_image_wic`、`do_image_ubi` |
+| `do_image_complete` | image 完成階段，常見 manifest、symlink、deploy 收尾 |
+| `do_populate_sdk` | 產生標準 SDK |
+| `do_populate_sdk_ext` | 產生 extensible SDK |
+
+擴充 task 的常見方式：
+
+```bitbake
+do_install:append() {
+    install -d ${D}${sysconfdir}/myapp
+    install -m 0644 ${WORKDIR}/myapp.conf ${D}${sysconfdir}/myapp/
+}
+
+python do_print_info() {
+    bb.note("PN=%s" % d.getVar("PN"))
+}
+addtask print_info after do_configure before do_compile
+```
+
+#### 7.2.6 Metadata、Recipe 與 Layer
+
+Metadata 是 Yocto 建構系統的核心資料，告訴 BitBake **要建構什麼**以及**如何建構**。主要分為：
+
+- **Recipes（`.bb`）**：描述單一套件的建構方式。
+- **Append files（`.bbappend`）**：在不直接修改原 recipe 的前提下，追加平台差異。
+- **Classes（`.bbclass`）**：定義共用建構邏輯。
+- **Configuration（`.conf`）**：定義 machine、distro、layer、local policy 等。
+
+典型 recipe 目錄：
+
+```text
+meta-my-layer/
+└── recipes-helloworld/
+    └── hello-single/
+        ├── files/
+        │   ├── helloworld.c
+        │   └── hello.service
+        └── hello_1.0.bb
+```
+
+最小 recipe 範例：
+
+```bitbake
+SUMMARY = "Simple hello application"
+LICENSE = "MIT"
+LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
+
+SRC_URI = "file://helloworld.c"
+S = "${WORKDIR}"
+
+do_compile() {
+    ${CC} ${CFLAGS} ${LDFLAGS} helloworld.c -o helloworld
+}
+
+do_install() {
+    install -d ${D}${bindir}
+    install -m 0755 helloworld ${D}${bindir}/
+}
+```
+
+`.bbappend` 可在不改 upstream `.bb` 的狀態下，對 recipe 追加 patch、設定檔、systemd service、編譯參數或安裝內容。
+
+```bitbake
+FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+
+SRC_URI:append = " \
+    file://0001-platform-fix.patch \
+    file://example.conf \
+"
+
+do_install:append() {
+    install -d ${D}${sysconfdir}/example
+    install -m 0644 ${WORKDIR}/example.conf ${D}${sysconfdir}/example/
+}
+```
+
+Layer 是 recipe 之上的組織單元，一個 layer 可以包含 recipes、classes、configuration、machine settings、distro policy 與 image 定義。常見命名包含 `meta`、`meta-poky`、`meta-yocto-bsp`、`meta-phosphor`、`meta-aspeed`、`meta-nuvoton`、`meta-<company>`、`meta-<platform>`。
+
+`bitbake-layers` 常用指令：
+
+```bash
+bitbake-layers create-layer ../meta-my-layer
+bitbake-layers add-layer ../meta-my-layer
+bitbake-layers remove-layer ../meta-my-layer
+bitbake-layers show-layers
+bitbake-layers show-recipes <recipe>
+bitbake-layers show-appends
+bitbake-layers show-overlayed
+```
+
+#### 7.2.7 BMC Porting 檢查重點
+
+| 檢查項目 | 指令 / 檔案 | 預期結果 |
+|---|---|---|
+| machine 是否正確 | `grep ^MACHINE build/conf/local.conf` | 指向目前平台 machine |
+| layer 是否載入 | `bitbake-layers show-layers` | 看到 SoC、OpenBMC、platform layers |
+| recipe 是否選對 | `bitbake-layers show-recipes <recipe>` | 採用預期 layer 版本 |
+| bbappend 是否套上 | `bitbake-layers show-appends | grep <recipe>` | platform bbappend 有列出 |
+| image type 是否正確 | `bitbake -e obmc-phosphor-image | grep ^IMAGE_FSTYPES=` | 符合 flash layout，例如 `mtd`、`ubi` |
+| kernel config 是否進去 | `bitbake -e virtual/kernel`、`tmp/work/.../defconfig` | config fragment 有套用 |
+| DTS 是否進 image | `tmp/deploy/images/<machine>/*.dtb` | 產出正確 DTB |
+| U-Boot env 是否正確 | U-Boot recipe / env / deploy output | bootcmd、mtdparts、slot 設定符合平台 |
+| rootfs 是否含 service | `oe-pkgdata-util find-path`、image rootfs | package 有進 rootfs |
+| sstate 是否異常 | `bitbake -c cleansstate <recipe>` 後重建 | 行為與預期一致 |
+
+#### 7.2.8 本章參考資料
+
+- Yocto Project Reference Manual - Variables: [https://docs.yoctoproject.org/ref-manual/variables.html](https://docs.yoctoproject.org/ref-manual/variables.html)
+- Yocto Project Reference Manual - Tasks: [https://docs.yoctoproject.org/ref-manual/tasks.html](https://docs.yoctoproject.org/ref-manual/tasks.html)
+- BitBake User Manual: [https://docs.yoctoproject.org/bitbake/](https://docs.yoctoproject.org/bitbake/)
+- Yocto Project Development Tasks Manual - Understanding and Creating Layers: [https://docs.yoctoproject.org/dev/dev-manual/layers.html](https://docs.yoctoproject.org/dev/dev-manual/layers.html)
+- OpenEmbedded Layer Index: [https://layers.openembedded.org](https://layers.openembedded.org)
 
 ### 8. Device Tree 通用寫法與排查
 
