@@ -57,6 +57,7 @@
 | 2026-07-06 |  0.13 | Copilot | 撰寫 Voltage Sensor |
 | 2026-07-06 |  0.14 | Copilot | 增加 OpenBMC 常用 Project, 放在 CH11, 原有的 CH11 向後挪一章 |
 | 2026-07-07 |  0.15 | Copilot | 撰寫第一章 Boot Flow 與 SoC 初始化 |
+| 2026-07-07 |  0.16 | Copilot | 撰寫 Current Sensor |
 
 ### 0.7 資料來源可信度分級
 
@@ -5924,6 +5925,663 @@ D-Bus / 系統整合：
 - Linux kernel PMBus register definitions：https://github.com/torvalds/linux/blob/master/drivers/hwmon/pmbus/pmbus.h
 
 #### 12.6 Current Sensor
+
+##### 12.6.1 適用情境
+
+Current Sensor 用於監控系統中各電源軌或負載支路的電流消耗，常用於功耗估算、電源轉換效率分析、過流保護驗證、PSU / VR 健康狀態判讀，以及量產測試時的異常耗電篩查。
+
+常見監控對象包含：
+
+```text
+PSU input current：電源供應器輸入電流
+PSU output current：電源供應器輸出電流
+VR output current：CPU Vcore、VCCIN、DIMM rail 等 VR 輸出電流
+Board rail current：主機板 12V / 5V / 3V3 / standby rail 電流
+GPU current：GPU 或 accelerator module 電流
+DIMM current：記憶體模組或 memory power rail 電流
+Fan current：風扇支路電流，常用於堵轉、短路或異常負載偵測
+Hot-swap / eFuse current：輸入保護或板級支路電流
+```
+
+在 OpenBMC 中，Current Sensor 最終應以標準 sensor object 呈現，典型 D-Bus path 為：
+
+```text
+/xyz/openbmc_project/sensors/current/<sensor_name>
+```
+
+OpenBMC 的 sensor daemon 可能從 hwmon、D-Bus 或 direct driver access 讀值，再發佈 `xyz.openbmc_project.Sensor.Value`、threshold、availability、operational status 與 association 等介面。後續 Redfish、IPMI SDR、logging、fan / thermal policy 或 power policy 會再消費這些 D-Bus sensor object。
+
+##### 12.6.2 資料路徑
+
+Current Sensor 常見資料路徑可分為三類。
+
+###### 路徑 A：分流電阻 + 放大器 + ADC
+
+```text
+電流通過分流電阻（Shunt Resistor）
+    ↓
+產生壓降：V_sense = I × R_shunt
+    ↓
+差動放大器 / current sense amplifier 放大壓降：V_adc = V_sense × Gain
+    ↓
+ADC 取樣，例如 BMC SoC 內建 ADC 或外部 ADC
+    ↓
+IIO / iio-hwmon / hwmon sysfs
+    ↓
+ADCSensor 或平台 sensor daemon
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/current/<Name>
+```
+
+這條路徑適合 board rail、fan branch current、standby current 或客製量測點。主要風險是 scaling 同時受 `R_shunt`、amplifier gain、ADC 參考電壓、driver 輸出單位影響，任一資料錯誤都會造成固定比例偏差。
+
+###### 路徑 B：PMBus / VR / PSU 控制器
+
+```text
+VR / PSU / Hot-swap Controller 內建 current sense 與 ADC
+    ↓
+PMBus command：READ_IIN / READ_IOUT
+    ↓
+Linux PMBus driver 或 chip-specific hwmon driver
+    ↓
+hwmon sysfs：/sys/class/hwmon/hwmonX/curr*_input
+    ↓
+PSUSensor / Hwmon 類 sensor daemon / 平台 sensor daemon
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/current/<Name>
+```
+
+PMBus command code 中，常見 current / power 相關命令如下：
+
+| PMBus command | Code | 常見用途 |
+| --- | ---: | --- |
+| `READ_IIN` | `0x89` | 輸入電流，例如 PSU input current |
+| `READ_IOUT` | `0x8C` | 輸出電流，例如 VR output current / PSU output current |
+| `READ_POUT` | `0x96` | 輸出功率，屬於 Power Sensor 範圍 |
+| `READ_PIN` | `0x97` | 輸入功率，屬於 Power Sensor 範圍 |
+
+Linux PMBus driver 可支援 voltage、current、power、temperature 等 sensor。PMBus generic device 通常不會依賴安全自動 probe，實務上需透過 DTS、I2C device instantiate、platform config 或 Entity Manager 讓 device 被明確建立。
+
+###### 路徑 C：獨立 Current / Power Monitor IC
+
+```text
+INA219 / INA226 / INA233 / INA3221 / LTC2945 / Hot-swap Controller / eFuse
+    ↓
+I2C / SMBus driver
+    ↓
+hwmon sysfs：curr*_input、in*_input、power*_input
+    ↓
+Hwmon 類 daemon / PSUSensor / 平台 daemon
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/current/<Name>
+```
+
+INA2xx 類 current shunt / power monitor 通常同時量測 shunt voltage 與 bus voltage，部分晶片可直接計算 current / power。Porting 時需確認 shunt resistor 設定來源，例如 device tree、platform data 或 driver 預設值，避免 driver 使用錯誤 shunt value。
+
+##### 12.6.3 常見來源分類與特性
+
+| 來源類型 | 感測原理 | Linux / OpenBMC 對應 | 關鍵注意事項 |
+| :--- | :--- | :--- | :--- |
+| 分流電阻 + ADC | `I = V_sense / R_shunt`，再經放大器與 ADC | IIO / iio-hwmon / ADCSensor / 平台 daemon | 需計算 `R_shunt`、Gain、ADC 單位與 `ScaleFactor` |
+| PMBus VR | VR controller 內建 current sense | PMBus hwmon、VR chip driver、Hwmon 類 daemon | 需確認 Page、Phase、`READ_IOUT`、calibration 與 host power state |
+| PMBus PSU | PSU 內建 input/output current telemetry | PMBus hwmon、PSUSensor | 需區分 input current、output current、fault status 與 redundancy 行為 |
+| Hot-swap controller / eFuse | high-side current sense、OCP / fault latch | hwmon、PMBus 或平台 daemon | 常同時涉及 presence、power good、fault latch 與 event |
+| INA2xx / INA3221 | 量測 shunt voltage 與 bus voltage | `ina2xx` / `ina3221` hwmon driver | `shunt-resistor` 設定需與 BOM 一致；多 channel 需建立 label 對照 |
+| 風扇電流偵測 | 分流電阻 + ADC 或支路 current monitor | ADC / hwmon / 客製 daemon | 常用於異常偵測，需與 fan tach 判斷交叉驗證 |
+| GPU / Accelerator current | PMBus / sideband / module controller | PMBus、MCTP / PLDM、GPU sensor daemon | 需注意 power state、module presence、telemetry refresh rate |
+
+##### 12.6.4 單位與 ScaleFactor 設計原則
+
+Current Sensor 最常見問題是單位混淆。建議每個 sensor 都明確記錄：
+
+```text
+硬體量測點：V_sense，通常是 V 或 mV
+ADC sysfs：可能是 raw code、mV，或 driver 定義的 fixed-point value
+hwmon curr*_input：Linux hwmon 規範通常為 milliampere（mA）
+D-Bus Sensor.Value：OpenBMC Current Sensor 建議以 Ampere（A）檢查
+Redfish Reading：依 schema / implementation 呈現，通常應可標示 A
+```
+
+Linux hwmon sysfs 值是 fixed-point single-value 檔案，current input `curr[1-*]_input` 的單位通常為 milliampere。因此：
+
+```text
+cat curr1_input = 15000
+=> 15000 mA
+=> 15 A
+```
+
+###### 12.6.4.1 分流電阻 + ADC 換算
+
+硬體基本式：
+
+```text
+V_sense = I × R_shunt
+V_adc = V_sense × Gain
+I = V_adc / (Gain × R_shunt)
+```
+
+若 sysfs `inY_input` 已是 ADC pin 上的電壓，且單位為 mV：
+
+```text
+ADC_Pin_Voltage_V = inY_input / 1000
+Current_A = ADC_Pin_Voltage_V / (Gain × R_shunt)
+Current_A = inY_input × 0.001 / (Gain × R_shunt)
+ScaleFactor = 0.001 / (Gain × R_shunt)
+```
+
+若 daemon 的輸入值已是 V：
+
+```text
+Current_A = input_V / (Gain × R_shunt)
+ScaleFactor = 1 / (Gain × R_shunt)
+```
+
+若輸入值是 ADC raw code：
+
+```text
+ADC_Pin_Voltage_V = Raw_Code × (V_ref / 2^N)
+Current_A = Raw_Code × (V_ref / 2^N) / (Gain × R_shunt)
+ScaleFactor = (V_ref / 2^N) / (Gain × R_shunt)
+```
+
+範例：
+
+```text
+R_shunt = 0.001 ohm = 1 mΩ
+Gain = 50
+ADC sysfs = 50 mV
+Current_A = 0.05 / (50 × 0.001) = 1.0 A
+
+若 daemon ScaleFactor 乘在 mV 數值上：
+ScaleFactor = 0.001 / (50 × 0.001) = 0.02
+50 × 0.02 = 1.0 A
+
+若 daemon ScaleFactor 乘在 V 數值上：
+ScaleFactor = 1 / (50 × 0.001) = 20.0
+0.05 × 20.0 = 1.0 A
+```
+
+因此，如果文件中寫 `ScaleFactor = 20.0`，需同步註明 daemon 的輸入值是 V；若輸入值是 mV，則應使用 `0.02`。這個差異是 Current Sensor porting 中很常見的 1000 倍錯誤來源。
+
+###### 12.6.4.2 hwmon `curr*_input` 換算
+
+如果 kernel driver 已輸出標準 hwmon `curr*_input`，通常代表：
+
+```text
+sysfs_current_mA = cat currX_input
+Current_A = sysfs_current_mA / 1000
+```
+
+若 OpenBMC daemon 已把 hwmon current 從 mA 轉成 A，`ScaleFactor` 通常保留 `1.0`。若平台 daemon 直接把 sysfs 值當作 D-Bus value，則需補 `ScaleFactor = 0.001`。實務上需以該專案 sensor daemon 的行為為準，不能只看 JSON 欄位名稱判斷。
+
+###### 12.6.4.3 PMBus Linear / Direct 換算
+
+PMBus device 可能以 Linear11、Linear16 或 Direct format 回傳 telemetry。Linux PMBus core 與 chip-specific driver 通常會依 device capability、driver info 或 device-specific conversion 轉成 hwmon 單位。若讀值呈現固定比例偏差，需確認：
+
+```text
+[ ] PMBus driver 是否支援該 chip，或只是使用 generic pmbus
+[ ] 該 channel 使用 Linear 或 Direct format
+[ ] driver 中 m / b / R 係數是否符合 datasheet
+[ ] IOUT / IIN calibration 是否由 driver、device NVM 或平台設定提供
+[ ] Page / Phase 是否正確
+[ ] sysfs 是 mA，還是已被平台 daemon 用其他方式處理
+```
+
+##### 12.6.5 Porting 路徑 A：分流電阻 + ADC 電流偵測
+
+###### Step A1：確認硬體參數
+
+從 schematic、BOM、datasheet 與量測資料取得：
+
+```text
+[ ] 分流電阻值 R_shunt，單位 ohm，例如 0.001 Ω
+[ ] 分流電阻精度與溫度係數，例如 1%、0.5%、50 ppm/°C
+[ ] 分流電阻位置：high-side / low-side
+[ ] current sense amplifier 型號與 Gain
+[ ] amplifier input common-mode range 是否涵蓋待測 rail
+[ ] amplifier output offset / bidirectional current reference
+[ ] ADC 參考電壓 V_ref
+[ ] ADC 解析度 N-bit
+[ ] ADC input range 與保護電路
+[ ] 待測電流最大值與過流保護門檻
+[ ] 電流方向定義：正向 / 反向 / bidirectional
+```
+
+設計檢查建議：
+
+```text
+V_sense_max = I_max × R_shunt
+V_adc_max = V_sense_max × Gain
+P_shunt_max = I_max^2 × R_shunt
+```
+
+需確認 `V_adc_max` 不會超出 ADC input range，`P_shunt_max` 不會超過分流電阻額定功率，且 `V_sense` 在低電流時仍高於 ADC noise floor。
+
+###### Step A2：確認 ADC / iio-hwmon / sysfs
+
+此部分與第 12.3 ADC Sensor 共用。Device Tree 需啟用 ADC controller 與必要的 iio-hwmon mapping。開機後先確認 sysfs：
+
+```bash
+for h in /sys/class/hwmon/hwmon*; do
+    echo "== $h =="
+    cat "$h/name" 2>/dev/null || true
+    ls "$h"/in*_input 2>/dev/null || true
+    ls "$h"/curr*_input 2>/dev/null || true
+done
+
+watch -n 1 'for f in /sys/class/hwmon/hwmon*/in*_input /sys/class/hwmon/hwmon*/curr*_input; do [ -e "$f" ] && echo "$f=$(cat $f)"; done'
+```
+
+若是通用 ADC，常見只會有 `in*_input`，需要在 sensor daemon / Entity Manager 進行換算。若是 current monitor driver，可能直接提供 `curr*_input`。
+
+###### Step A3：建立量測對照表
+
+Bring-up 階段建議至少建立 idle、typical load、stress load 三個負載點。
+
+| 負載狀態 | sysfs raw / mV | DMM / clamp meter 實測 A | D-Bus A | 誤差 | 備註 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Host off / standby | [待填] | [待填] | [待填] | [待填] | [待填] |
+| Host on idle | [待填] | [待填] | [待填] | [待填] | [待填] |
+| CPU / GPU stress | [待填] | [待填] | [待填] | [待填] | [待填] |
+
+若誤差呈固定比例，優先檢查 `R_shunt`、Gain、sysfs 單位與 `ScaleFactor`。若誤差隨負載變化，需檢查 amplifier offset、ADC 線性度、量測工具位置、PCB trace drop、溫度與濾波設定。
+
+##### 12.6.6 Porting 路徑 B：PMBus / VR / PSU 電流偵測
+
+###### Step B1：確認硬體資訊與 PMBus channel
+
+從 schematic、board power tree、VR / PSU datasheet 取得：
+
+```text
+[ ] VR / PSU / HSC 型號
+[ ] I2C bus number、mux channel、7-bit address
+[ ] PMBus Page 對應 rail，例如 Page 0 = Vcore、Page 1 = VCCGT
+[ ] PMBus Phase 是否需要指定
+[ ] Current command：READ_IIN / READ_IOUT
+[ ] IOUT / IIN calibration 或 sense resistor 設定來源
+[ ] Device 是否需要上電或 host on 才回應該 command
+[ ] 是否需要 vendor-specific unlock / telemetry enable
+[ ] Fault / warning command：STATUS_IOUT、STATUS_INPUT、IOUT_OC_WARN_LIMIT 等
+```
+
+多 rail VR 需建立 Page 對照表：
+
+| Device | Bus | Address | Page | Rail | 預期 sysfs | 備註 |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| CPU0 VR | 8 | 0x40 | 0 | CPU0_VCORE | curr1_input | [待填] |
+| CPU0 VR | 8 | 0x40 | 1 | CPU0_VCCGT | curr2_input | [待填] |
+| DIMM VR | 8 | 0x42 | 0 | P1V1_DIMM | curr1_input | [待填] |
+
+###### Step B2：I2C / PMBus 基本通訊驗證
+
+先確認 bus、mux channel 與 address。`i2cdetect` 對部分 device 可能有副作用，使用前需確認 device 行為。
+
+```bash
+i2cdetect -y <bus>
+
+# 視 device 是否支援，讀 MFR_ID / MFR_MODEL
+ i2cget -y <bus> <addr> 0x99
+ i2cget -y <bus> <addr> 0x9A
+```
+
+讀取 Page 0 的 output current 前，可先切 Page。下列指令僅作 bring-up 輔助，實際 byte order 需依 `i2cget` 顯示與 PMBus word 格式確認：
+
+```bash
+# 設定 PAGE = 0
+ i2cset -y <bus> <addr> 0x00 0x00
+
+# READ_IOUT = 0x8C，word read
+ i2cget -y <bus> <addr> 0x8C w
+
+# READ_IIN = 0x89，word read
+ i2cget -y <bus> <addr> 0x89 w
+```
+
+注意事項：
+
+```text
+- 某些 PMBus device 在 host off 或 rail disabled 時會回傳 0、NACK、0xffff 或設定 status fault。
+- `i2cget ... w` 顯示的 word 可能需要 byte swap 後才符合 PMBus raw word。
+- 手動讀取 telemetry 不代表 kernel driver conversion 一定正確，仍需比對 hwmon sysfs。
+- 不建議在不了解 device 行為時寫入 calibration、limit 或 operation command。
+```
+
+###### Step B3：Device Tree / driver binding
+
+PMBus VR 範例：
+
+```dts
+&i2c8 {
+    status = "okay";
+    clock-frequency = <100000>;
+
+    vr-controller@40 {
+        compatible = "mps,mp2971";
+        reg = <0x40>;
+        label = "cpu0_vr";
+    };
+};
+```
+
+INA2xx 類 current monitor 範例：
+
+```dts
+&i2c8 {
+    status = "okay";
+
+    current-monitor@41 {
+        compatible = "ti,ina226";
+        reg = <0x41>;
+        shunt-resistor = <1000>; /* micro-ohm，需依 binding 與專案 kernel 確認 */
+        label = "p12v_current_monitor";
+    };
+};
+```
+
+Kernel config 檢查方向：
+
+```text
+CONFIG_HWMON
+CONFIG_I2C
+CONFIG_PMBUS
+CONFIG_SENSORS_PMBUS
+CONFIG_SENSORS_INA2XX
+CONFIG_SENSORS_INA3221
+對應 VR / PSU / HSC chip-specific driver，例如 MP297x、TPS536xx、LTC、ADM、MAX、IR 等
+```
+
+實際 symbol 名稱會隨 kernel 版本與 vendor BSP 不同而改變，請以 `bitbake -c menuconfig virtual/kernel`、`.config`、driver Kconfig 與 `dmesg` 為準。
+
+###### Step B4：確認 driver probe 與 hwmon sysfs
+
+```bash
+dmesg | grep -Ei 'pmbus|mp297|tps536|ina2|ina3221|hwmon|i2c'
+
+for h in /sys/class/hwmon/hwmon*; do
+    echo "== $h =="
+    cat "$h/name" 2>/dev/null || true
+    for f in "$h"/curr*_label "$h"/curr*_input "$h"/in*_input "$h"/power*_input; do
+        [ -e "$f" ] && echo "$(basename "$f")=$(cat "$f")"
+    done
+done
+```
+
+`curr*_label` 若存在，優先以 label 建立對照；若不存在，需依 driver 文件、Page 順序、實際負載變化與 PMBus 手動讀值建立 mapping。
+
+##### 12.6.7 Entity Manager / Sensor JSON 配置
+
+不同 OpenBMC branch、平台 layer 與 sensor daemon 對 JSON 欄位的名稱可能不同。以下範例用於說明欄位意義，實際需參考專案的 Entity Manager schema、`sensor-info.json`、既有平台 JSON 與 daemon source。
+
+###### PMBus / VR current 範例
+
+```json
+{
+  "Name": "CPU0_VCORE_CURRENT",
+  "Type": "MP2971",
+  "Bus": 8,
+  "Address": "0x40",
+  "Page": 0,
+  "PollInterval": 500,
+  "ScaleFactor": 1.0,
+  "Offset": 0.0,
+  "MaxValue": 300.0,
+  "MinValue": 0.0,
+  "PowerState": "On",
+  "Thresholds": [
+    {
+      "Name": "upper critical",
+      "Direction": "greater than",
+      "Severity": 1,
+      "Value": 250.0
+    },
+    {
+      "Name": "upper non critical",
+      "Direction": "greater than",
+      "Severity": 0,
+      "Value": 200.0
+    }
+  ]
+}
+```
+
+設定重點：
+
+```text
+- 若 daemon 已把 hwmon mA 轉成 D-Bus A，ScaleFactor 通常為 1.0。
+- 若 daemon 直接使用 curr*_input 數值，需設定 ScaleFactor = 0.001。
+- CPU / DIMM VR 通常只在 host power on 後有效，PowerState 可設為 On。
+- PSU input current 或 standby rail current 可能為 AlwaysOn。
+- Page 錯誤時可能仍有合理數字，因此需用負載變化驗證對應 rail。
+```
+
+###### 分流電阻 + ADC current 範例
+
+```json
+{
+  "Name": "P12V_CURRENT",
+  "Type": "ADC",
+  "Index": 2,
+  "ScaleFactor": 0.02,
+  "Offset": 0.0,
+  "PollInterval": 500,
+  "MaxValue": 60.0,
+  "MinValue": 0.0,
+  "PowerState": "AlwaysOn",
+  "Thresholds": [
+    {
+      "Name": "upper critical",
+      "Direction": "greater than",
+      "Severity": 1,
+      "Value": 50.0
+    }
+  ]
+}
+```
+
+上例假設 ADC sysfs 輸入值單位為 mV，且 `R_shunt = 1 mΩ`、`Gain = 50`：
+
+```text
+ScaleFactor = 0.001 / (50 × 0.001) = 0.02
+```
+
+若 ADC daemon 讀到的值已是 V，則同一組硬體應使用：
+
+```text
+ScaleFactor = 1 / (50 × 0.001) = 20.0
+```
+
+##### 12.6.8 啟動服務與 D-Bus 驗證
+
+先找出平台實際的 sensor service：
+
+```bash
+systemctl list-units '*sensor*' --no-pager
+systemctl list-units '*psu*' --no-pager
+```
+
+依平台重啟相關服務。若專案使用 HwmonCurrentSensor 類服務，可用：
+
+```bash
+systemctl restart xyz.openbmc_project.HwmonCurrentSensor.service
+journalctl -u xyz.openbmc_project.HwmonCurrentSensor.service -b --no-pager | tail -100
+```
+
+若 Current Sensor 由 PSUSensor 或其他 daemon 產生，請改查對應 service：
+
+```bash
+journalctl -b --no-pager | grep -Ei 'current|curr|pmbus|psu|sensor|mp297|ina2'
+```
+
+確認 D-Bus object 是否存在：
+
+```bash
+busctl tree /xyz/openbmc_project/sensors
+busctl tree /xyz/openbmc_project/sensors/current
+```
+
+讀取 Current Sensor 數值：
+
+```bash
+busctl get-property \
+  <service_name> \
+  /xyz/openbmc_project/sensors/current/CPU0_VCORE_CURRENT \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+```
+
+若不知道 service owner，使用 ObjectMapper 查：
+
+```bash
+busctl call xyz.openbmc_project.ObjectMapper \
+  /xyz/openbmc_project/object_mapper \
+  xyz.openbmc_project.ObjectMapper GetObject \
+  sas \
+  /xyz/openbmc_project/sensors/current/CPU0_VCORE_CURRENT \
+  0
+```
+
+建議至少比對三層讀值：
+
+```text
+PMBus / ADC 原始讀值
+    ↔ hwmon / IIO sysfs
+        ↔ D-Bus Sensor.Value
+            ↔ Redfish / IPMI 顯示
+```
+
+##### 12.6.9 Redfish / IPMI / Event 整合驗證
+
+Redfish 驗證：
+
+```bash
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/Sensors | jq
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/Sensors/CPU0_VCORE_CURRENT | jq
+```
+
+驗證重點：
+
+```text
+[ ] Sensor 名稱與 D-Bus path 對應
+[ ] Reading / Value 與 D-Bus 一致
+[ ] ReadingUnits 為 A 或可清楚表示 Ampere
+[ ] Warning / Critical threshold 顯示正確
+[ ] Status.Health / State 與 D-Bus availability、operational status 一致
+```
+
+IPMI 驗證：
+
+```bash
+ipmitool sensor | grep -i current
+ipmitool sdr elist | grep -i current
+```
+
+若 IPMI 看不到 Current Sensor，但 D-Bus / Redfish 都正常，需檢查 SDR generation、sensor number、entity ID、sensor type、threshold mapping 與 IPMI bridge policy。
+
+Threshold / event 驗證：
+
+```bash
+busctl introspect <service_name> \
+  /xyz/openbmc_project/sensors/current/CPU0_VCORE_CURRENT
+
+journalctl -b --no-pager | grep -Ei 'CPU0_VCORE_CURRENT|threshold|critical|warning|current'
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Systems/system/LogServices/EventLog/Entries | jq
+```
+
+##### 12.6.10 進階除錯與常見陷阱
+
+| 問題現象 | 可能方向 | 排查 / 處理方式 |
+| :--- | :--- | :--- |
+| `curr*_input` 讀值為 0 | Host off、VR disabled、PSU standby、Page 錯、driver 未更新 | 確認 power state、enable signal、Page、sysfs refresh；與 PMBus `READ_IOUT` 比對 |
+| `curr*_input` 不存在 | Driver 未 bind、compatible 錯、PMBus command 不支援、kernel config 未啟用 | 查 `dmesg`、DTS、Kconfig、`/sys/bus/i2c/devices/*/driver` |
+| D-Bus sensor 未出現 | JSON `Type` / `Bus` / `Address` / `Page` 不符合 daemon 預期 | 查 Entity Manager log、sensor daemon log、ObjectMapper subtree |
+| 讀值為負數 | current sense 正負端接反、bidirectional sensor offset 未處理 | 查 schematic high-side / low-side、shunt direction、driver sign handling |
+| 讀值固定大 1000 倍 | mA 被當成 A，或 daemon 未做 hwmon 單位轉換 | 確認 `curr*_input` 單位；必要時設定 `ScaleFactor = 0.001` |
+| 讀值固定小 1000 倍 | 已轉成 A 後又乘 0.001 | 比對 sysfs、D-Bus、Redfish；移除重複 scaling |
+| 讀值與勾表差異固定比例 | `R_shunt`、Gain、PMBus coefficient、shunt-resistor 設定錯 | 查 BOM、datasheet、DTS、driver conversion、量測點位置 |
+| 讀值隨負載跳動劇烈 | ADC noise、shunt 壓降太小、I2C refresh 慢、負載本身 pulse | 增加 averaging、調整 poll interval、用示波器檢查 ripple |
+| 多 Page 電流全部相同 | driver 未正確切 Page、JSON Page 未生效、讀到同一 channel | 手動寫 PAGE 後讀 `READ_IOUT`；查 driver page support |
+| PMBus 讀到 `0xffff` 或 NACK | rail off、command unsupported、device fault、bus timeout | 查 `STATUS_WORD`、`STATUS_IOUT`、host power、I2C 波形 |
+| Redfish 數值不變 | sensor daemon 未更新、PowerState gating、sysfs cache、bmcweb route cache | 直接 `cat curr*_input`，再比對 D-Bus `Value` 與 Redfish |
+| Threshold 觸發但無事件 | threshold interface 未建立、logging policy 未接、alarm flag 未變化 | 查 D-Bus threshold properties、phosphor-logging、EventLog |
+
+##### 12.6.11 Current Sensor Porting 驗收 Checklist
+
+硬體設計階段：
+
+```text
+[ ] Current source 類型確認：分流電阻 + ADC / PMBus VR / PSU / INA / HSC / eFuse
+[ ] Power tree 中 sensor 量測點與 rail 名稱確認
+[ ] 若為分流電阻架構：R_shunt、精度、溫度係數、額定功率確認
+[ ] 若有 amplifier：Gain、offset、common-mode range、輸出範圍確認
+[ ] 若為 PMBus VR：I2C bus、mux channel、address、Page、Phase 確認
+[ ] 若為 INA / HSC：shunt-resistor / calibration 設定來源確認
+[ ] 待測電流範圍、正常值、warning、critical、硬體 OCP 門檻確認
+[ ] current sense 方向確認，避免正負號或 bidirectional offset 問題
+```
+
+Device Tree / Kernel：
+
+```text
+[ ] I2C bus node status = "okay"
+[ ] I2C mux channel 與 bus number 對照完成
+[ ] PMBus / VR / INA / HSC device node 加入，compatible 與 reg 正確
+[ ] 必要 kernel config 已啟用，如 PMBus、chip-specific driver、INA2xx、hwmon
+[ ] 開機後 dmesg 無 probe failure、timeout、unsupported command 相關錯誤
+[ ] /sys/class/hwmon/hwmonX/name 可對應到目標 device
+[ ] curr*_input 存在，且單位已確認為 mA 或平台定義值
+[ ] curr*_label 或 Page 對照表已建立
+[ ] 使用 DMM / clamp meter / PSU telemetry 比對，工程誤差在可接受範圍內
+```
+
+Entity Manager / Userspace：
+
+```text
+[ ] JSON 設定檔加入正確 layer，並已編入 image
+[ ] `Name` 命名符合平台 sensor naming rule
+[ ] `Type` 與 daemon / sensor-info 定義一致
+[ ] 分流 + ADC 架構：Index、ScaleFactor、Offset 計算完成
+[ ] PMBus 架構：Bus、Address、Page、PowerState 設定正確
+[ ] ScaleFactor 已依 sysfs 單位確認，不重複乘 0.001 或漏轉 mA → A
+[ ] PollInterval 符合需求，常見建議 500～1000 ms
+[ ] PowerState 設定符合 rail 行為，例如 CPU VR 使用 On、standby rail 使用 AlwaysOn
+[ ] Thresholds 與硬體保護門檻、系統降載策略一致
+```
+
+D-Bus / Redfish / IPMI：
+
+```text
+[ ] 對應 sensor service 啟動無錯誤
+[ ] ObjectMapper 可找到 /xyz/openbmc_project/sensors/current/<Name>
+[ ] busctl get-property 可讀取 Value，且單位以 A 檢查合理
+[ ] Warning / Critical threshold property 存在且數值正確
+[ ] Redfish Sensor resource 可看到該 current sensor
+[ ] IPMI SDR / sensor list 依平台需求可看到該 sensor
+[ ] 施加負載變化時，sysfs、D-Bus、Redfish 數值同步變化
+[ ] Threshold 觸發時，D-Bus alarm flag、phosphor-logging、SEL / EventLog 行為符合預期
+[ ] 若用於 P = V × I，已確認 voltage sensor 與 current sensor 的量測點相同或可接受
+```
+
+##### 12.6.12 Current Sensor 資料表範本
+
+| Sensor Name | Source Type | Device | Bus / Addr | Page / Channel | Raw sysfs | sysfs unit | ScaleFactor | D-Bus unit | PowerState | Threshold | 備註 |
+| --- | --- | --- | --- | --- | --- | --- | ---: | --- | --- | --- | --- |
+| CPU0_VCORE_CURRENT | PMBus VR | MP2971 | 8 / 0x40 | Page 0 | curr1_input | mA | 1.0 或 0.001 | A | On | [待填] | [待填] |
+| P12V_CURRENT | ADC + Shunt | ADC channel 2 | N/A | Index 2 | in2_input | mV | 0.02 | A | AlwaysOn | [待填] | R=1mΩ, Gain=50 |
+| PSU0_INPUT_CURRENT | PMBus PSU | PSU0 | [待填] | input | curr1_input | mA | [待填] | A | AlwaysOn | [待填] | [待填] |
+
+##### 12.6.13 本節參考資料
+
+- Linux kernel hwmon sysfs interface：`curr[1-*]_input` 為 current input value，單位為 milliampere；hwmon sysfs 使用固定命名與 fixed-point single-value 檔案格式。
+- Linux kernel PMBus driver documentation：PMBus driver 支援 voltage、current、power、temperature 等 sensor，且 PMBus device 通常需明確建立，不依賴安全自動 probe。
+- Linux PMBus register definitions：`READ_IIN = 0x89`、`READ_IOUT = 0x8C`、`READ_POUT = 0x96`、`READ_PIN = 0x97`。
+- OpenBMC dbus-sensors README：sensor daemon 可從 hwmon、D-Bus 或 direct driver access 讀取資料，並以 `/xyz/openbmc_project/sensors/<type>/<sensor_name>` 發佈 D-Bus sensor object。
+- Linux INA2xx hwmon documentation：INA2xx 類 current shunt / power monitor 會量測 shunt drop 與 bus voltage，shunt resistor 可由 platform data、device tree 或部分 sysfs attribute 指定。
+
 #### 12.7 Power Sensor
 #### 12.8 Fan Tach Sensor
 #### 12.9 PSU Sensor
