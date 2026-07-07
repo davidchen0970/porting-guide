@@ -63,6 +63,7 @@
 | 2026-07-07 |  0.19 | Copilot | 撰寫 Fan PWM / Fan Control |
 | 2026-07-07 |  0.20 | Copilot | 撰寫 PSU Sensor |
 | 2026-07-07 |  0.21 | Copilot | 撰寫 Fan Control 與 Thermal Policy |
+| 2026-07-07 |  0.22 | Copilot | 撰寫 CPU Sensor / PECI / APML |
 
 ### 0.7 資料來源可信度分級
 
@@ -8949,7 +8950,690 @@ D-Bus / Redfish / IPMI：
 - OpenBMC Entity Manager README / schema / configurations: https://github.com/openbmc/entity-manager
 - OpenBMC phosphor-power: https://github.com/openbmc/phosphor-power
 
-#### 12.11 CPU / PECI Sensor
+#### 12.11 CPU Sensor / PECI / APML
+
+##### 12.11.1 適用情境
+
+CPU Sensor 用於監控伺服器中央處理器的溫度、功耗與健康狀態，是散熱政策、功耗管理、事件紀錄與系統保護的重要輸入。x86 伺服器平台依 CPU 廠商不同，常見有兩條 out-of-band 管理路徑：Intel 使用 PECI，AMD EPYC 使用 APML。
+
+| 廠商 | 介面 | 全名 | 主要用途 |
+| :--- | :--- | :--- | :--- |
+| Intel | PECI | Platform Environment Control Interface | BMC 讀取 CPU package / core / DIMM thermal telemetry。 |
+| AMD | APML | Advanced Platform Management Link | BMC 透過 SB-TSI / SB-RMI 讀 CPU temperature、power、power cap、DIMM thermal 與 APML event。 |
+
+Intel PECI 常見項目：
+
+```text
+CPU package temperature
+CPU DTS / thermal margin
+CPU core temperature
+Tcontrol / Tthrottle / Tjmax
+DIMM temperature
+CPU presence / CPU reachable state
+```
+
+AMD APML 常見項目：
+
+```text
+CPU package temperature, via SB-TSI
+CPU package power, via SB-RMI
+power cap / power cap max, via SB-RMI
+DIMM TS0 / TS1 thermal sensor, via SB-RMI mailbox
+APML_ALERT_L event notification, if routed to BMC GPIO
+CPU presence / CPU reachable state
+```
+
+OpenBMC 中常見 D-Bus sensor path：
+
+```text
+# Intel PECI
+/xyz/openbmc_project/sensors/temperature/CPU0_Temp
+/xyz/openbmc_project/sensors/temperature/CPU0_Core0_Temp
+/xyz/openbmc_project/sensors/temperature/DIMM0_Temp
+
+# AMD APML
+/xyz/openbmc_project/sensors/temperature/CPU0_Temp
+/xyz/openbmc_project/sensors/temperature/DIMM_TS0_UMC0_Temp
+/xyz/openbmc_project/sensors/temperature/DIMM_TS1_UMC0_Temp
+/xyz/openbmc_project/sensors/power/CPU0_Power
+```
+
+CPU Sensor 與一般 board sensor 最大差異是 host power state dependency。CPU / DIMM telemetry 通常只有在 host 上電、CPU 初始化到一定階段、BIOS / firmware 完成必要訓練後才會穩定。因此 CPU sensor porting 不只要看 kernel driver，也要同步 host power state、BIOS 設定、socket presence、CPU generation 與 BMC service rescan 行為。
+
+##### 12.11.2 Intel PECI 架構與資料路徑
+
+PECI 是 Intel server CPU 常見 out-of-band thermal 管理介面。BMC 作為 originator，CPU 作為 responder。常見 PECI client address 依 socket 位置排列：
+
+| Socket | PECI address |
+| :--- | :--- |
+| CPU0 | `0x30` |
+| CPU1 | `0x31` |
+| CPU2 | `0x32` |
+| CPU3 | `0x33` |
+
+Intel PECI 資料路徑：
+
+```text
+Intel CPU PECI responder, e.g. 0x30 / 0x31
+    ↓
+PECI single-wire bus
+    ↓
+BMC PECI controller, e.g. ASPEED PECI
+    ↓
+Linux PECI subsystem
+    ├── PECI controller driver
+    ├── PECI client device
+    ├── peci-cputemp   CPU package / core temperature
+    └── peci-dimmtemp  DIMM temperature
+    ↓
+hwmon sysfs
+    ├── /sys/class/hwmon/hwmonX/temp*_input
+    ├── /sys/class/hwmon/hwmonX/temp*_label
+    ├── /sys/class/hwmon/hwmonX/temp*_max
+    └── /sys/class/hwmon/hwmonX/temp*_crit
+    ↓
+IntelCPUSensor, dbus-sensors
+    ↓
+D-Bus Sensor.Value / Threshold / Availability / OperationalStatus
+    ↓
+Redfish / IPMI / phosphor-pid-control / phosphor-logging
+```
+
+Linux `peci-cputemp` 會提供 CPU package、DTS、Tcontrol、Tthrottle、Tjmax 與 per-core temperature 等 hwmon 屬性；所有 temperature value 以 millidegree Celsius 表示，且只有 target CPU powered on 時可量測。`peci-dimmtemp` 會提供 DIMM temperature，同樣以 millidegree Celsius 表示，且 DIMM thermal 屬性需等 BIOS 完成 memory training / testing 後才會出現。
+
+##### 12.11.3 AMD APML 架構與資料路徑
+
+AMD APML 由多個 sideband 協定與 driver 組成，常見子介面如下：
+
+| 介面 | 全名 | 主要用途 |
+| :--- | :--- | :--- |
+| SB-TSI | Sideband Thermal Sensor Interface | CPU socket temperature、temperature threshold。 |
+| SB-RMI | Sideband Remote Management Interface | socket power、power cap、power cap max、DIMM thermal mailbox、進階 mailbox command。 |
+| APML_ALERT_L | APML alert line | APML event notification，視平台設計接到 GPIO。 |
+
+常見 SB-RMI address：
+
+| Socket | 常見 8-bit 表示 | 常見 7-bit 表示 |
+| :--- | :--- | :--- |
+| CPU0 | `0x78` | `0x3C` |
+| CPU1 | `0x70` | `0x38` |
+
+常見 SB-TSI address 依平台 address select pin 而定；許多平台使用 `0x4C` / `0x48`，仍需以 schematic 與 PPR 為準。
+
+AMD APML 資料路徑：
+
+```text
+AMD EPYC CPU APML responder
+    ↓
+I2C or I3C bus from BMC to CPU socket
+    ↓
+Linux kernel drivers
+    ├── sbtsi / apml_sbtsi
+    │     CPU socket temperature, threshold
+    ├── sbrmi / apml_sbrmi
+    │     power1_input / power1_cap / power1_cap_max
+    │     DIMM TS0 / TS1 temperature, if firmware supports mailbox command
+    └── apml_alertl, optional
+          APML_ALERT_L GPIO event notification
+    ↓
+hwmon sysfs
+    ├── temp*_input / temp*_label
+    ├── power1_input
+    ├── power1_cap
+    └── power1_cap_max
+    ↓
+HwmonTempSensor / platform daemon
+    ↓
+D-Bus Sensor.Value / Threshold / Availability / OperationalStatus
+    ↓
+Redfish / IPMI / phosphor-pid-control / phosphor-logging
+```
+
+AMD APML modules 主要支援 AMD Family 19h（包含第三代 AMD EPYC Milan）或更新的 server CPU。AMD APML library 也增加 Family 19h model 90h~9Fh 與 Family 1Ah model 00h~0Fh 相關功能；實際可用功能需以 CPU PPR、platform firmware、kernel driver 與 APML library 版本交叉確認。
+
+##### 12.11.4 Porting 前需確認的硬體資料
+
+Intel PECI：
+
+```text
+[必填] CPU vendor / generation / socket count
+[必填] PECI bus 連到 BMC 哪個 controller
+[必填] PECI address：CPU0=0x30、CPU1=0x31...
+[必填] PECI pinmux / 電壓準位 / pull-up / routing
+[必填] CPU presence / socket ID / board SKU 關係
+[必填] Host power state dependency
+[必填] BIOS 是否允許 BMC 透過 PECI 取得 thermal telemetry
+[建議] CPU package / core / DIMM threshold
+[建議] Fan policy 使用哪個 CPU sensor：Die / DTS / Tcontrol / margin
+[建議] QEMU 無法驗證 PECI，需規劃實機 validation
+```
+
+AMD APML：
+
+```text
+[必填] CPU vendor / generation / socket count
+[必填] CPU family / model 是否受 APML driver 支援
+[必填] APML 使用 I2C 或 I3C
+[必填] SB-TSI bus / address
+[必填] SB-RMI bus / address
+[必填] APML_ALERT_L GPIO 是否接到 BMC
+[必填] Host power state dependency
+[必填] Platform firmware 是否支援 SB-RMI mailbox command
+[建議] DIMM TS0 / TS1 / UMC 對照
+[建議] Power cap policy 與 host power budget
+[建議] I3C bus support patch / kernel symbol dependency，若平台使用 I3C
+```
+
+##### 12.11.5 Intel PECI Device Tree 與 Kernel Config
+
+Device Tree 範例：
+
+```dts
+&peci0 {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_peci0_default>;
+
+    cpu@30 {
+        compatible = "intel,peci-client";
+        reg = <0x30>;
+    };
+
+    cpu@31 {
+        compatible = "intel,peci-client";
+        reg = <0x31>;
+    };
+};
+```
+
+Kernel config：
+
+```text
+CONFIG_PECI=y
+CONFIG_PECI_ASPEED=y
+CONFIG_SENSORS_PECI_CPUTEMP=y
+CONFIG_SENSORS_PECI_DIMMTEMP=y
+```
+
+OpenBMC / Yocto 需確認 `dbus-sensors` 的 Intel CPU sensor 有被建入 image。不同分支的 PACKAGECONFIG 名稱可能略有差異，需先查該 branch 的 `meson.options` 與 recipe：
+
+```bash
+bitbake -e dbus-sensors | grep -i intel
+bitbake-layers show-appends | grep dbus-sensors
+```
+
+常見 `.bbappend` 概念：
+
+```bitbake
+PACKAGECONFIG:append = " intelcpusensor"
+```
+
+##### 12.11.6 Intel PECI sysfs 與 IntelCPUSensor 驗證
+
+Kernel / device 檢查：
+
+```bash
+dmesg | grep -i peci
+ls -l /dev/peci-* 2>/dev/null
+ls -l /sys/bus/peci/devices/ 2>/dev/null
+```
+
+hwmon 檢查：
+
+```bash
+for i in /sys/class/hwmon/hwmon*; do
+    echo "$i: $(cat "$i/name" 2>/dev/null)"
+done
+
+HWMON=/sys/class/hwmon/hwmonX
+cat $HWMON/name
+ls $HWMON/temp*_input
+cat $HWMON/temp1_label
+cat $HWMON/temp1_input
+cat $HWMON/temp1_max 2>/dev/null
+cat $HWMON/temp1_crit 2>/dev/null
+```
+
+`peci-cputemp` 常見 label：
+
+| label | 說明 |
+| :--- | :--- |
+| `Die` | CPU package die temperature。 |
+| `DTS` | 依 DTS thermal profile 調整後的 CPU package temperature。 |
+| `Tcontrol` | Fan Temperature target，常與 fan policy 相關。 |
+| `Tthrottle` | Throttle temperature。 |
+| `Tjmax` | Maximum junction temperature。 |
+| `Core X` | Per-core temperature。 |
+
+IntelCPUSensor service 檢查：
+
+```bash
+systemctl status xyz.openbmc_project.IntelCPUSensor.service --no-pager
+journalctl -u xyz.openbmc_project.IntelCPUSensor.service -b --no-pager
+
+busctl tree xyz.openbmc_project.IntelCPUSensor
+busctl tree xyz.openbmc_project.ObjectMapper | grep -Ei 'cpu|dimm|peci'
+```
+
+讀取 D-Bus sensor：
+
+```bash
+busctl get-property   xyz.openbmc_project.IntelCPUSensor   /xyz/openbmc_project/sensors/temperature/CPU0_Temp   xyz.openbmc_project.Sensor.Value   Value
+```
+
+##### 12.11.7 IntelCPUSensor 偵測狀態機
+
+IntelCPUSensor 有 CPU detection / DIMM readiness 狀態機，用來處理 CPU 尚未上電、PECI 尚未回應、hwmon device 尚未建立、DIMM 尚未完成 training 等情境。
+
+| 狀態 | 說明 | 常見觀察 |
+| :--- | :--- | :--- |
+| `OFF` | CPU 尚未偵測到或 PECI ping 失敗 | Host off、CPU absent、PECI pinmux / driver 問題。 |
+| `ON` | CPU ping 成功，已讀到 CPU ID，開始建立 PECI client / hwmon | CPU 已可通訊，但 DIMM sensor 不一定 ready。 |
+| `READY` | CPU 與 DIMM thermal path 已就緒 | CPU / DIMM sensor 應可出現在 D-Bus。 |
+
+典型流程：
+
+```text
+OFF
+    CPU ping 成功
+    ↓
+ON
+    讀 CPU ID
+    export PECI client device
+    等待 peci-cputemp / peci-dimmtemp hwmon
+    ↓
+READY
+    建立 CPU / core / DIMM D-Bus sensors
+```
+
+若只看到 CPU sensor，沒有 DIMM sensor，需先確認 host BIOS 是否已完成 memory training、DIMM 是否安裝、`peci-dimmtemp` driver 是否建立 hwmon，以及 IntelCPUSensor 是否持續 rescan。
+
+##### 12.11.8 AMD APML Device Tree 與 Kernel Config
+
+AMD APML I2C device 範例：
+
+```dts
+&i2c3 {
+    status = "okay";
+    clock-frequency = <100000>;
+
+    sbtsi@4c {
+        compatible = "amd,sbtsi";
+        reg = <0x4c>;
+    };
+
+    sbrmi@3c {
+        compatible = "amd,sbrmi";
+        reg = <0x3c>;
+    };
+};
+
+&i2c4 {
+    status = "okay";
+    clock-frequency = <100000>;
+
+    sbtsi@48 {
+        compatible = "amd,sbtsi";
+        reg = <0x48>;
+    };
+
+    sbrmi@38 {
+        compatible = "amd,sbrmi";
+        reg = <0x38>;
+    };
+};
+```
+
+若 SB-RMI driver / platform firmware 支援 DIMM thermal mailbox，可在 `sbrmi` node 補 `dimm-ids`。此屬性用於指出 populated UMC instance 的 TS0 mailbox address；TS1 通常由 driver 設定 bit 6 取得。
+
+```dts
+sbrmi@3c {
+    compatible = "amd,sbrmi";
+    reg = <0x3c>;
+    dimm-ids = <0x80 0x90 0x81 0x91 0x82 0x92 0x83 0x93>;
+};
+```
+
+Kernel config：
+
+```text
+CONFIG_SENSORS_SBTSI=y
+CONFIG_SENSORS_SBRMI=y
+```
+
+若使用 AMD APML out-of-tree modules，需依專案 recipe / kernel source 整合：
+
+```text
+CONFIG_AMD_APML_SBTSI=m 或 y
+CONFIG_AMD_APML_SBRMI=m 或 y
+CONFIG_AMD_APML_ALERTL=m 或 y，若使用 APML_ALERT_L
+```
+
+##### 12.11.9 AMD APML sysfs 驗證
+
+Driver / device 檢查：
+
+```bash
+dmesg | grep -Ei 'sbtsi|sbrmi|apml'
+lsmod | grep -Ei 'sbtsi|sbrmi|apml'
+```
+
+I2C 掃描：
+
+```bash
+# 範例：socket 0 APML bus
+i2cdetect -y 3
+```
+
+hwmon 檢查：
+
+```bash
+for i in /sys/class/hwmon/hwmon*; do
+    echo "$i: $(cat "$i/name" 2>/dev/null)"
+done
+
+# SB-TSI CPU temperature
+HWMON_TSI=/sys/class/hwmon/hwmonX
+cat $HWMON_TSI/name
+cat $HWMON_TSI/temp1_input
+cat $HWMON_TSI/temp1_max 2>/dev/null
+cat $HWMON_TSI/temp1_min 2>/dev/null
+
+# SB-RMI package power / power cap
+HWMON_RMI=/sys/class/hwmon/hwmonY
+cat $HWMON_RMI/name
+cat $HWMON_RMI/power1_input
+cat $HWMON_RMI/power1_cap 2>/dev/null
+cat $HWMON_RMI/power1_cap_max 2>/dev/null
+
+# SB-RMI DIMM thermal channels, if supported
+ls $HWMON_RMI/temp*_input 2>/dev/null
+cat $HWMON_RMI/temp1_label 2>/dev/null
+cat $HWMON_RMI/temp17_label 2>/dev/null
+```
+
+AMD APML units：
+
+```text
+temp*_input      millidegree Celsius (m°C)
+power1_input     microwatt (µW)
+power1_cap       microwatt (µW)
+power1_cap_max   microwatt (µW)
+```
+
+SB-RMI DIMM thermal channel 對應：
+
+| hwmon channel | label pattern | 說明 |
+| :--- | :--- | :--- |
+| `temp1` ~ `temp16` | `DIMM_TS0_UMC0` ~ `DIMM_TS0_UMC15` | TS0 for UMC 0~15。 |
+| `temp17` ~ `temp32` | `DIMM_TS1_UMC0` ~ `DIMM_TS1_UMC15` | TS1 for UMC 0~15。 |
+
+##### 12.11.10 Entity Manager 配置
+
+不同 OpenBMC 分支與平台 JSON schema 有差異；以下內容作為設計範本，實際欄位需對齊專案 branch 的 Entity Manager schema 與 sensor daemon 支援項目。
+
+Intel CPU：
+
+```json
+{
+    "Name": "CPU0",
+    "Type": "CPU",
+    "Address": 48,
+    "Index": 0,
+    "MaxReading": 127,
+    "MinReading": -10,
+    "PowerState": "On",
+    "Thresholds": [
+        {
+            "Name": "upper critical",
+            "Direction": "greater than",
+            "Severity": 1,
+            "Value": 95.0
+        },
+        {
+            "Name": "upper non critical",
+            "Direction": "greater than",
+            "Severity": 0,
+            "Value": 85.0
+        }
+    ]
+}
+```
+
+Intel DIMM：
+
+```json
+{
+    "Name": "DIMM0",
+    "Type": "DIMM",
+    "Address": 48,
+    "Index": 0,
+    "MaxReading": 127,
+    "MinReading": -10,
+    "PowerState": "On",
+    "Thresholds": [
+        {
+            "Name": "upper critical",
+            "Direction": "greater than",
+            "Severity": 1,
+            "Value": 85.0
+        }
+    ]
+}
+```
+
+注意：Intel PECI address 在許多 Entity Manager 配置中使用十進位；例如 `0x30` 寫成 `48`，`0x31` 寫成 `49`。若 schema 不接受十六進位字串，使用十進位可避免 service parse 失敗。
+
+AMD SB-TSI：
+
+```json
+{
+    "Name": "CPU0",
+    "Type": "SBTSI",
+    "Bus": 3,
+    "Address": "0x4C",
+    "Index": 0,
+    "MaxReading": 127,
+    "MinReading": -10,
+    "PowerState": "On",
+    "Thresholds": [
+        {
+            "Name": "upper critical",
+            "Direction": "greater than",
+            "Severity": 1,
+            "Value": 95.0
+        }
+    ]
+}
+```
+
+AMD SB-RMI power：
+
+```json
+{
+    "Name": "CPU0_Power",
+    "Type": "SBRMI",
+    "Bus": 3,
+    "Address": "0x3C",
+    "Index": 0,
+    "MaxReading": 400.0,
+    "MinReading": 0.0,
+    "PowerState": "On",
+    "Thresholds": [
+        {
+            "Name": "upper critical",
+            "Direction": "greater than",
+            "Severity": 1,
+            "Value": 350.0
+        }
+    ]
+}
+```
+
+##### 12.11.11 啟動服務與 D-Bus 驗證
+
+Intel PECI：
+
+```bash
+systemctl status xyz.openbmc_project.IntelCPUSensor.service --no-pager
+journalctl -u xyz.openbmc_project.IntelCPUSensor.service -b --no-pager
+
+busctl tree xyz.openbmc_project.ObjectMapper | grep -Ei 'cpu|dimm|peci'
+
+busctl get-property   xyz.openbmc_project.IntelCPUSensor   /xyz/openbmc_project/sensors/temperature/CPU0_Temp   xyz.openbmc_project.Sensor.Value   Value
+```
+
+AMD APML：
+
+```bash
+systemctl status xyz.openbmc_project.HwmonTempSensor.service --no-pager
+journalctl -u xyz.openbmc_project.HwmonTempSensor.service -b --no-pager
+
+busctl tree xyz.openbmc_project.ObjectMapper | grep -Ei 'cpu|dimm|sbrmi|sbtsi|apml'
+
+busctl get-property   xyz.openbmc_project.HwmonTempSensor   /xyz/openbmc_project/sensors/temperature/CPU0_Temp   xyz.openbmc_project.Sensor.Value   Value
+```
+
+若 AMD power sensor 由 PowerSensor / PSUSensor-like daemon 或平台 daemon 發佈，service owner 可能不是 `HwmonTempSensor`，需先用 ObjectMapper 找出 owner。
+
+##### 12.11.12 Redfish / IPMI / Fan Policy 驗證
+
+Redfish：
+
+```bash
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Systems/system/Processors
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Thermal
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Sensors
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/ThermalSubsystem
+```
+
+IPMI：
+
+```bash
+ipmitool sdr list | grep -Ei 'cpu|dimm|temp|power'
+ipmitool sensor | grep -Ei 'cpu|dimm|temp|power'
+ipmitool sel list
+```
+
+Fan policy：
+
+```bash
+journalctl -b | grep -Ei 'pid|thermal|fan|cpu|dimm|failsafe'
+busctl tree xyz.openbmc_project.ObjectMapper | grep -Ei 'pid|thermal|fan'
+```
+
+驗證重點：
+
+```text
+[ ] Host off 時 CPU sensor 狀態符合設計：Unavailable、無 sensor，或保留但不更新
+[ ] Host on 後 CPU sensor 會自動出現或恢復更新
+[ ] CPU stress test 時 temperature 上升
+[ ] Fan policy 使用的 CPU / DIMM sensor path 正確
+[ ] 過溫 threshold 能產生 D-Bus alarm / SEL / Journal event
+[ ] Redfish / IPMI 顯示與 D-Bus 值一致
+```
+
+##### 12.11.13 進階除錯與常見陷阱
+
+| 問題現象 | Intel PECI 可能方向 | AMD APML 可能方向 | 排查 |
+| :--- | :--- | :--- | :--- |
+| device node 不存在 | PECI controller driver 未載入、DTS disabled、pinmux 錯 | I2C/I3C device 未建立、driver 未啟用 | 查 `dmesg`、DTS、kernel config。 |
+| `i2cdetect` 看不到 APML address | 不適用 | bus / mux / address / host power state / address select pin | 查 schematic、host power、I2C waveform。 |
+| hwmon 不存在 | CPU 未上電、PECI client 未 export、cputemp/dimmtemp 未 bind | sbtsi/sbrmi driver 未 bind、APML function 不支援 | 查 `/sys/bus/peci` 或 `/sys/bus/i2c/devices`。 |
+| CPU temp 有，DIMM temp 無 | BIOS memory training 未完成、DIMM absent、dimmtemp driver 問題 | SB-RMI mailbox command 不支援、dimm-ids 錯 | 查 BIOS log、DIMM population、driver log。 |
+| 讀值固定 0 或異常 | PECI completion code / host state / scaling 問題 | APML mailbox fail、firmware 不支援、unit 換算錯 | 比對 sysfs、D-Bus、Redfish。 |
+| service 起不來 | IntelCPUSensor 未建入 image、EM JSON 格式錯 | HwmonTempSensor 未匹配 hwmon、JSON Type 不符 | 查 journal 與 Entity Manager log。 |
+| Host reboot 後 sensor 沒回來 | rescan / state machine 卡住 | I2C bus stuck、driver 未重新 bind | restart sensor service，查 bus recovery。 |
+| Fan 全速 | required CPU sensor unavailable | required CPU sensor unavailable | 查 fan policy required sensor 與 failsafe reason。 |
+| Redfish 看不到 CPU sensor | association / naming / bmcweb mapping 不完整 | association / naming / bmcweb mapping 不完整 | 查 ObjectMapper、bmcweb log。 |
+
+##### 12.11.14 CPU Sensor Porting 驗收 Checklist
+
+```text
+硬體 / 規格：
+[ ] CPU vendor / model / generation 確認
+[ ] Socket count / socket ID 確認
+[ ] Intel PECI address 或 AMD APML bus/address 確認
+[ ] Host power state dependency 確認
+[ ] BIOS / firmware 支援情況確認
+[ ] CPU / DIMM threshold 確認
+
+Intel PECI：
+[ ] PECI pinmux / DTS / controller status 正確
+[ ] CONFIG_PECI / CONFIG_PECI_ASPEED 啟用
+[ ] CONFIG_SENSORS_PECI_CPUTEMP 啟用
+[ ] CONFIG_SENSORS_PECI_DIMMTEMP 啟用
+[ ] /dev/peci-* 或 /sys/bus/peci/devices 存在
+[ ] peci-cputemp hwmon 存在
+[ ] peci-dimmtemp hwmon 存在，若平台需要 DIMM temp
+[ ] IntelCPUSensor service 啟動正常
+
+AMD APML：
+[ ] CPU family / model 符合 driver 支援範圍
+[ ] SB-TSI / SB-RMI DTS node 正確
+[ ] CONFIG_SENSORS_SBTSI / CONFIG_SENSORS_SBRMI 啟用
+[ ] 若使用 out-of-tree APML modules，recipe / module load 正常
+[ ] sbtsi hwmon temp 可讀
+[ ] sbrmi hwmon power 可讀
+[ ] DIMM TS0 / TS1 channel 可讀，若 firmware 支援
+[ ] APML_ALERT_L GPIO 驗證完成，若平台使用
+
+Entity Manager / Userspace：
+[ ] CPU / DIMM / SBTSI / SBRMI JSON 加入 image
+[ ] Address 格式符合 schema
+[ ] PowerState 設定符合 host state dependency
+[ ] Thresholds 設定完成
+[ ] D-Bus sensor path 命名符合平台規範
+
+整合驗證：
+[ ] Host off / on / reboot sensor 行為符合設計
+[ ] busctl 可讀取 CPU / DIMM / power Value
+[ ] Redfish 可看到 CPU / DIMM / thermal sensors
+[ ] IPMI SDR / sensor reading 正常
+[ ] CPU stress test 後溫度上升合理
+[ ] Sensor missing 會觸發 fan failsafe 或 degraded policy
+[ ] 過溫事件可產生 Journal / SEL
+```
+
+##### 12.11.15 CPU Sensor 資料表範本
+
+| Socket | Vendor | Interface | Bus / Controller | Address | Driver | hwmon name | Label | sysfs | D-Bus Path | PowerState | 備註 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| CPU0 | Intel | PECI | peci0 | 0x30 | peci-cputemp | [待填] | Die | tempX_input | /xyz/openbmc_project/sensors/temperature/CPU0_Temp | On | [待填] |
+| CPU0 | Intel | PECI | peci0 | 0x30 | peci-dimmtemp | [待填] | DIMM CI | tempX_input | /xyz/openbmc_project/sensors/temperature/DIMM0_Temp | On | [待填] |
+| CPU0 | AMD | SB-TSI | i2c3 | 0x4C | sbtsi | [待填] | temp1 | temp1_input | /xyz/openbmc_project/sensors/temperature/CPU0_Temp | On | [待填] |
+| CPU0 | AMD | SB-RMI | i2c3 | 0x3C | sbrmi | [待填] | power1 | power1_input | /xyz/openbmc_project/sensors/power/CPU0_Power | On | [待填] |
+
+##### 12.11.16 本節參考資料
+
+- Linux Kernel Documentation - peci-cputemp: https://docs.kernel.org/hwmon/peci-cputemp.html
+- Linux Kernel Documentation - peci-dimmtemp: https://mjmwired.net/kernel/Documentation/hwmon/peci-dimmtemp.rst
+- Linux Kernel Documentation - sbrmi: https://www.kernel.org/doc/html/latest/hwmon/sbrmi.html
+- OpenBMC dbus-sensors README: https://github.com/openbmc/dbus-sensors
+- OpenBMC Intel CPU Sensors: https://deepwiki.com/openbmc/dbus-sensors/3.1.2-intel-cpu-sensors
+- AMD APML modules: https://github.com/amd/apml_modules
+- AMD APML Library: https://www.amd.com/en/developer/e-sms/apml-library.html
+- OpenBMC Entity Manager: https://github.com/openbmc/entity-manager
+
+##### 12.11.17 回查結果
+
+本節依 CPU Sensor / PECI / APML 需求補強後，已完成下列回查：
+
+```text
+[x] 是否說明 Intel PECI 與 AMD APML 差異
+[x] 是否補上 Intel PECI 資料路徑與 Linux hwmon 對應
+[x] 是否補上 AMD SB-TSI / SB-RMI / APML_ALERT_L 架構
+[x] 是否補上 Device Tree、kernel config、Yocto / service 驗證
+[x] 是否補上 IntelCPUSensor OFF / ON / READY 狀態機
+[x] 是否補上 AMD APML DIMM TS0 / TS1 channel 對應
+[x] 是否補上 Entity Manager JSON 範本與 address 格式提醒
+[x] 是否補上 Host power state dependency
+[x] 是否補上 Redfish / IPMI / Fan policy 驗證
+[x] 是否補上常見陷阱、驗收 checklist 與資料表範本
+```
+
+上述項目已補齊，暫無需回到資料蒐集階段。
+
 #### 12.12 NVMe Sensor
 #### 12.13 GPU Sensor
 #### 12.14 External / Virtual Sensor
