@@ -59,6 +59,7 @@
 | 2026-07-07 |  0.15 | Copilot | 撰寫第一章 Boot Flow 與 SoC 初始化 |
 | 2026-07-07 |  0.16 | Copilot | 撰寫 Current Sensor |
 | 2026-07-07 |  0.17 | Copilot | 撰寫 Power Sensor |
+| 2026-07-07 |  0.18 | Copilot | 撰寫 Fan Tach Sensor |
 
 ### 0.7 資料來源可信度分級
 
@@ -7199,6 +7200,622 @@ D-Bus / Redfish / IPMI / Policy：
 - OpenBMC dbus-sensors README：sensor daemon 可從 hwmon、D-Bus 或 direct driver access 讀取資料，並以 `/xyz/openbmc_project/sensors/<type>/<sensor_name>` 發佈 D-Bus sensor object。
 
 #### 12.8 Fan Tach Sensor
+
+##### 12.8.1 適用情境
+
+Fan Tach Sensor（風扇轉速感測器）用於讀取風扇實際轉速，單位通常是 RPM（Revolutions Per Minute，每分鐘轉數）。在 BMC 平台中，fan tach 是風扇控制迴路的回授訊號，用來確認 PWM 輸出後風扇是否確實轉到目標轉速，也用來偵測停轉、堵轉、轉速過低、風扇拔除、雙轉子風扇單 rotor 失效，以及風扇冗餘不足。
+
+常見監控對象包含：
+
+```text
+System inlet fan：系統進風扇
+System exhaust fan：系統出風扇
+CPU heatsink fan：CPU 散熱風扇
+PSU fan：電源供應器內建風扇
+GPU fan：GPU / accelerator 散熱風扇
+HDD / backplane fan：硬碟背板或風扇牆風扇
+Fan module rotor：風扇模組內的單一 rotor，例如雙轉子風扇的 front / rear rotor
+```
+
+在 OpenBMC 中，fan tach sensor 典型 D-Bus path 為：
+
+```text
+/xyz/openbmc_project/sensors/fan_tach/<sensor_name>
+```
+
+`fan_tach` 的 `Value` 應以 RPM 檢查。若底層 Linux hwmon `fan*_input` 已輸出 RPM，通常不需要比例換算。若數值與外部轉速計呈現 2 倍、1/2、4 倍或 1/4 倍關係，優先檢查每轉脈衝數（Pulses Per Revolution, PPR）、tach divisor 與 channel 對應。
+
+##### 12.8.2 資料路徑
+
+Fan Tach Sensor 的完整資料路徑如下：
+
+```text
+風扇本體產生 Tachometer 脈衝訊號
+    ↓
+風扇連接器 Tach pin 經 pull-up / buffer / mux / CPLD 接到 BMC Tach input
+    ↓
+BMC Tachometer controller 計數脈衝或量測週期
+    ↓
+Linux kernel driver 依 PPR、clock、divisor、sample window 換算 RPM
+    ↓
+hwmon sysfs：/sys/class/hwmon/hwmonX/fan*_input
+    ↓
+FanSensor / PSUSensor / 平台 sensor daemon 讀取 sysfs
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/fan_tach/<Name>
+    ↓
+phosphor-fan-presence / phosphor-fan-monitor / phosphor-pid-control / bmcweb / IPMI SDR
+```
+
+PWM 與 Tach 需分開看：
+
+```text
+PWM：BMC 輸出控制訊號，常見 25 kHz，用來控制風扇轉速
+Tach：風扇輸出回授訊號，常見 open-drain，每轉 1～4 個脈衝
+```
+
+ASPEED G6 / AST2600 的 PWM controller 與 Fan Tacho controller 是獨立硬體區塊，常見 binding 中也將 PWM outputs 與 fan tach inputs 分開描述。因此 Device Tree 需同時確認 PWM pin、Tach pin、fan child node 與 channel 對應。
+
+##### 12.8.3 關鍵硬體參數
+
+Porting 前需從 schematic、BOM、風扇規格書、CPLD register map 與 board bring-up 記錄取得下列資料：
+
+```text
+[ ] 風扇型號、供應商、料號、風扇規格書版本
+[ ] 風扇線材定義：GND、Power、Tach、PWM、Presence、Fault、FRU EEPROM
+[ ] Tach 電氣型態：open-drain / open-collector / push-pull
+[ ] Tach pull-up 電壓與阻值：BMC rail、fan rail、CPLD rail，是否有 level shift
+[ ] 每轉脈衝數 PPR：常見為 2，也可能為 1、4 或 vendor-specific
+[ ] Tach channel：連到 BMC Tach0 / Tach1 / ... 或經 CPLD / mux 後的 channel
+[ ] PWM channel：控制該風扇的 PWM0 / PWM1 / ...
+[ ] PWM 頻率需求：常見 25 kHz，但需以風扇規格書為準
+[ ] PWM polarity：正常 duty 定義、是否反相、是否需要 pull-up
+[ ] 最小啟動 duty / start boost：低速啟動失敗時需先給較高 PWM
+[ ] Min RPM / Max RPM / Rated RPM / RPM tolerance
+[ ] Lower warning / lower critical threshold
+[ ] 風扇存在偵測：無、Tach-based、GPIO presence、CPLD presence、FRU EEPROM
+[ ] 單顆風扇是否多 rotor：一個 PWM 可能對應兩個 tach feedback
+[ ] 風扇模組對應 inventory path、FRU path 與 LED fault indicator
+```
+
+Tach 訊號頻率與 RPM 的關係：
+
+```text
+Tach_Frequency_Hz = RPM / 60 × PPR
+RPM = Tach_Frequency_Hz × 60 / PPR
+```
+
+例：風扇 6000 RPM、PPR = 2：
+
+```text
+Tach_Frequency = 6000 / 60 × 2 = 200 Hz
+```
+
+若示波器量到 200 Hz，但 sysfs 顯示 12000 RPM，常見方向是 PPR 設成 1；若 sysfs 顯示 3000 RPM，常見方向是 PPR 設成 4，或 driver / DTS 對 PPR 的欄位沒有生效。
+
+Tach 線常見為 open-drain / open-collector，需要外部 pull-up。設計與排查時需確認：
+
+```text
+[ ] Pull-up 電壓是否符合 BMC input absolute maximum rating
+[ ] 若 fan tach 為 5V pull-up，是否有 level shifter 或 BMC pin 可容忍 5V
+[ ] Pull-up 阻值是否造成上升時間過慢，尤其高轉速與長線材場景
+[ ] 是否經 CPLD / buffer / mux，且該路徑在 BMC 讀取前已 enable
+[ ] Tach pin 是否與其他 multi-function pin 或 strap function 衝突
+[ ] 風扇拔除時 tach line 是否浮動，是否需 board-side pull-up / pull-down
+```
+
+##### 12.8.4 常見來源分類與特性
+
+| 來源類型 | 底層來源 | OpenBMC 常見服務 | 注意事項 |
+| :--- | :--- | :--- | :--- |
+| BMC SoC tach controller | BMC Tach input → hwmon `fan*_input` | FanSensor | 需對齊 pinctrl、tach channel、PPR、PWM 對應 |
+| generic `pwm-fan` driver | PWM + 可選 tach interrupt | FanSensor / hwmon | `fan1_input` 為 RPM；PWM 以 `pwm1` 0～255 控制 |
+| ASPEED G6 PWM/Tach driver | `aspeed,ast2600-pwm-tach` | FanSensor | PWM 與 Tach 為獨立硬體；fan child node 需含 `tach-ch` |
+| Nuvoton NPCM PWM/Fan | NPCM PWM / fan tach controller | FanSensor | 需確認 SoC binding 的 fan child node 與 channel 編號 |
+| PSU 內建風扇 | PMBus / PSU hwmon `fan*_input` | PSUSensor | fan path 可能由 PSU service 建立，不一定是 FanSensor |
+| Fan controller IC | I2C fan controller，例如 MAX / NCT / EMC | hwmon / FanSensor | 通常有 fan divisor、target RPM、PWM、fault register |
+| CPLD / FPGA 計數 | CPLD register / I2C / LPC / mailbox | 客製 daemon / ExternalSensor | 需定義 register update rate、scale、timeout、stale condition |
+| GPU / accelerator 風扇 | vendor telemetry | GPU daemon / ExternalSensor | 需區分 GPU internal fan 與 chassis fan |
+
+##### 12.8.5 Porting 步驟 A：Device Tree / Kernel
+
+###### Step A1：確認 SoC PWM/Tach controller node
+
+AST2600 常見控制器節點形式如下，實際名稱與位置以專案 DTS / dtsi 為準：
+
+```dts
+&pwm_tach {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_pwm0_default &pinctrl_pwm1_default
+                 &pinctrl_tach0_default &pinctrl_tach1_default>;
+};
+```
+
+若使用 upstream ASPEED G6 PWM/Tach binding，fan child node 常見格式如下：
+
+```dts
+&pwm_tach {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_pwm0_default &pinctrl_pwm1_default
+                 &pinctrl_tach0_default &pinctrl_tach1_default
+                 &pinctrl_tach2_default>;
+
+    fan-0 {
+        tach-ch = /bits/ 8 <0x0>;
+        pwms = <&pwm_tach 0 40000 0>;
+    };
+
+    fan-1 {
+        tach-ch = /bits/ 8 <0x1 0x2>;
+        pwms = <&pwm_tach 1 40000 0>;
+    };
+};
+```
+
+說明：
+
+```text
+pwms = <&pwm_tach 0 40000 0>
+    0      ：PWM channel 0
+    40000  ：period = 40000 ns = 25 kHz
+    0      ：PWM flags，是否反相需依 binding / driver 定義
+
+tach-ch = /bits/ 8 <0x1 0x2>
+    表示該 fan node 有兩個 tach input，常見於雙轉子風扇或雙回授線
+```
+
+###### Step A2：generic `pwm-fan` driver 場景
+
+若平台使用 generic `pwm-fan`，常見 DTS 如下：
+
+```dts
+fan0: pwm-fan {
+    compatible = "pwm-fan";
+    pwms = <&pwm 0 40000 0>;
+    interrupts-extended = <&gpio5 1 IRQ_TYPE_EDGE_FALLING>;
+    pulses-per-revolution = <2>;
+    cooling-levels = <0 80 120 160 200 255>;
+    #cooling-cells = <2>;
+};
+```
+
+`pwm-fan` binding 使用 `pulses-per-revolution` 描述每轉脈衝數，預設常見為 2。若專案使用 vendor binding 或舊版 ASPEED driver，可能使用 `fan-ppr`、`aspeed,fan-ppr` 或其他欄位；請以 kernel binding 與 driver source 為準。
+
+###### Step A3：Kernel config
+
+確認必要 kernel config 已啟用：
+
+```text
+CONFIG_HWMON
+CONFIG_PWM
+CONFIG_SENSORS_PWM_FAN
+CONFIG_PWM_ASPEED 或 SoC 對應 PWM driver
+CONFIG_SENSORS_ASPEED_G6_PWM_TACH 或 vendor BSP 對應 ASPEED fan tach driver
+CONFIG_GPIOLIB / CONFIG_GPIO_CDEV（若 presence 使用 GPIO）
+CONFIG_THERMAL（若 fan 同時作為 cooling device）
+```
+
+實際 symbol 名稱會隨 kernel branch、OpenBMC branch 與 vendor BSP 改變，請以 `bitbake -c menuconfig virtual/kernel`、`tmp/work/.../.config`、Kconfig 與 `dmesg` 為準。
+
+###### Step A4：開機 probe 與 pinctrl 檢查
+
+```bash
+dmesg | grep -Ei 'pwm|tach|fan|hwmon|aspeed|npcm'
+
+cat /sys/kernel/debug/pinctrl/*/pinmux-pins 2>/dev/null | grep -Ei 'pwm|tach|fan'
+
+for h in /sys/class/hwmon/hwmon*; do
+    echo "== $h =="
+    cat "$h/name" 2>/dev/null || true
+    for f in "$h"/fan*_label "$h"/fan*_input "$h"/fan*_min "$h"/fan*_max "$h"/pwm*; do
+        [ -e "$f" ] && echo "$(basename "$f")=$(cat "$f")"
+    done
+done
+```
+
+##### 12.8.6 Porting 步驟 B：sysfs 與硬體訊號驗證
+
+###### Step B1：確認 hwmon fan input
+
+```bash
+find /sys/class/hwmon -maxdepth 2 -name 'fan*_input' -print
+cat /sys/class/hwmon/hwmonX/fan1_input
+```
+
+預期輸出：
+
+```text
+3000
+```
+
+代表目前風扇轉速約 3000 RPM。`fan*_input` 若來自標準 hwmon 介面，通常就是 RPM。
+
+###### Step B2：手動調整 PWM 並觀察 RPM
+
+若 driver 提供 `pwm1`：
+
+```bash
+cat /sys/class/hwmon/hwmonX/pwm1_enable 2>/dev/null || true
+
+# 依 driver 支援情況切到 manual；需在實驗室與安全負載下執行
+echo 1 > /sys/class/hwmon/hwmonX/pwm1_enable
+
+for v in 80 120 160 200 255; do
+    echo $v > /sys/class/hwmon/hwmonX/pwm1
+    sleep 5
+    echo "pwm=$v rpm=$(cat /sys/class/hwmon/hwmonX/fan1_input)"
+done
+```
+
+驗證重點：
+
+```text
+[ ] PWM 提高時 RPM 應跟著上升
+[ ] PWM 降低時 RPM 應跟著下降，但會有機械慣性延遲
+[ ] PWM = 0 時風扇是否停止，取決於 pwm1_enable mode、風扇規格與 board power design
+[ ] 某些風扇低 duty 無法啟動，需要 start boost 或最小 duty
+```
+
+###### Step B3：示波器 / 邏輯分析儀量測 Tach
+
+量測點建議：
+
+```text
+1. 風扇連接器 Tach pin
+2. pull-up 後的 board-side tach node
+3. buffer / CPLD / level shifter 後的 BMC-side tach node
+4. BMC pin 附近，若 layout 允許
+```
+
+量測項目：
+
+```text
+[ ] Tach 高低電位是否符合 BMC input 規格
+[ ] 是否有脈衝，頻率是否符合 RPM / 60 × PPR
+[ ] 上升 / 下降時間是否過慢，是否有 ringing 或毛刺
+[ ] 風扇拔除時 tach line 是否固定在預期狀態
+[ ] PWM 改變後 tach frequency 是否同步變化
+```
+
+##### 12.8.7 Entity Manager / dbus-sensors 配置
+
+OpenBMC 不同 branch 的 FanSensor schema 可能不同，以下以常見概念說明；實際欄位需以 `entity-manager` schema、平台既有 JSON、FanSensor source 與 journal log 為準。
+
+###### 方式一：完整 Fan 裝置定義
+
+```json
+{
+  "Name": "Fan0",
+  "Type": "Fan",
+  "Pwm": 0,
+  "Tachs": [
+    {
+      "Name": "Fan0_Tach",
+      "Index": 0
+    }
+  ],
+  "MaxPwm": 255,
+  "MinPwm": 30,
+  "PollInterval": 1000,
+  "PowerState": "AlwaysOn",
+  "Thresholds": [
+    {
+      "Name": "lower critical",
+      "Direction": "less than",
+      "Severity": 1,
+      "Value": 500
+    },
+    {
+      "Name": "lower non critical",
+      "Direction": "less than",
+      "Severity": 0,
+      "Value": 1000
+    }
+  ]
+}
+```
+
+###### 方式二：雙轉子風扇
+
+```json
+{
+  "Name": "Fan0",
+  "Type": "Fan",
+  "Pwm": 0,
+  "Tachs": [
+    {
+      "Name": "Fan0_Front_Rotor",
+      "Index": 0
+    },
+    {
+      "Name": "Fan0_Rear_Rotor",
+      "Index": 1
+    }
+  ],
+  "MaxPwm": 255,
+  "MinPwm": 40,
+  "PowerState": "AlwaysOn",
+  "Thresholds": [
+    {
+      "Name": "lower critical",
+      "Direction": "less than",
+      "Severity": 1,
+      "Value": 800
+    }
+  ]
+}
+```
+
+###### 方式三：獨立 Tach sensor
+
+```json
+{
+  "Name": "Fan0_Tach",
+  "Type": "Tach",
+  "Index": 0,
+  "PollInterval": 1000,
+  "MaxValue": 30000,
+  "MinValue": 0,
+  "PowerState": "AlwaysOn",
+  "Thresholds": [
+    {
+      "Name": "lower critical",
+      "Direction": "less than",
+      "Severity": 1,
+      "Value": 500
+    }
+  ]
+}
+```
+
+欄位檢查重點：
+
+```text
+[ ] Name：需符合平台命名規則，避免空白、特殊字元與重名
+[ ] Type：需與 FanSensor / entity-manager schema 支援的 Type 一致
+[ ] Pwm：需對應控制該風扇的 PWM channel
+[ ] Tachs / Index：需對應 hwmon fanN_input 或 driver channel mapping
+[ ] Thresholds：風扇 tach 通常以 lower threshold 為主
+[ ] PowerState：系統風扇多為 AlwaysOn；host-only 風扇可能需依 chassis / host state gating
+[ ] PollInterval：建議 500～1000 ms，需與控制迴路反應時間協調
+```
+
+##### 12.8.8 Fan Presence / Fan Monitor / PID Control 整合
+
+`phosphor-fan-presence` 可用於更新 fan inventory object 上的 `xyz.openbmc_project.Inventory.Item.Present`。常見偵測方式包含：
+
+```text
+Tach-based：依 fan_tach sensor 是否存在且 RPM 合理判斷
+GPIO-based：依 presence pin、CPLD GPIO 或 connector detect 判斷
+Fallback / mixed：多種方式擇一或組合判斷
+```
+
+現代 phosphor-fan-presence 常見 runtime JSON 設定檔位置包含：
+
+```text
+/usr/share/phosphor-fan-presence/presence/config.json
+/etc/phosphor-fan-presence/presence/config.json   # 測試覆寫用
+/usr/share/phosphor-fan-presence/presence/<compatible-name>/config.json
+```
+
+概念例：
+
+```json
+[
+  {
+    "name": "Fan0",
+    "path": "/system/chassis/motherboard/fan0",
+    "methods": [
+      {
+        "type": "tach",
+        "sensors": ["Fan0_Tach"]
+      }
+    ]
+  },
+  {
+    "name": "Fan1",
+    "path": "/system/chassis/motherboard/fan1",
+    "methods": [
+      {
+        "type": "gpio",
+        "key": 123,
+        "physpath": "/sys/devices/platform/fan1_presence"
+      }
+    ]
+  }
+]
+```
+
+Fan monitor 常用於判斷 fan functional 狀態，例如 fan presence = true 但 tach = 0、目標 PWM 很高但 RPM 無法上升、雙轉子風扇其中一顆 rotor 失效。Presence 與 Functional 應分開定義：absent 不等同 failed，present 也不代表 rotor 正常。
+
+`phosphor-pid-control` 或平台風扇控制服務會讀取溫度 sensor 與 fan tach sensor，再輸出 PWM target。整合時需確認 PWM sensor path 與 fan tach sensor path 對應正確、zone 設定包含該風扇、fan fail policy 已定義，例如任一 rotor fail 時進入 failsafe PWM。
+
+##### 12.8.9 啟動服務與 D-Bus 驗證
+
+先找出實際服務名稱：
+
+```bash
+systemctl list-units '*Fan*' --no-pager
+systemctl list-units '*fan*' --no-pager
+systemctl list-units '*sensor*' --no-pager
+```
+
+重啟與看 log：
+
+```bash
+systemctl restart xyz.openbmc_project.FanSensor.service
+journalctl -u xyz.openbmc_project.FanSensor.service -b --no-pager | tail -100
+journalctl -b --no-pager | grep -Ei 'fansensor|fan tach|fan_tach|tach|pwm|presence|fan-monitor'
+```
+
+確認 D-Bus object：
+
+```bash
+busctl tree xyz.openbmc_project.FanSensor
+busctl tree /xyz/openbmc_project/sensors/fan_tach
+```
+
+讀取 RPM：
+
+```bash
+busctl get-property \
+  xyz.openbmc_project.FanSensor \
+  /xyz/openbmc_project/sensors/fan_tach/Fan0_Tach \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+```
+
+若 service owner 不確定：
+
+```bash
+busctl call xyz.openbmc_project.ObjectMapper \
+  /xyz/openbmc_project/object_mapper \
+  xyz.openbmc_project.ObjectMapper GetObject \
+  sas \
+  /xyz/openbmc_project/sensors/fan_tach/Fan0_Tach \
+  0
+```
+
+確認 inventory presence：
+
+```bash
+busctl get-property \
+  xyz.openbmc_project.Inventory.Manager \
+  /system/chassis/motherboard/fan0 \
+  xyz.openbmc_project.Inventory.Item \
+  Present
+```
+
+##### 12.8.10 Redfish / IPMI / Event 驗證
+
+```bash
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/Sensors | jq
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/Sensors/Fan0_Tach | jq
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/Thermal | jq
+
+ipmitool sensor | grep -Ei 'fan|tach|rpm'
+ipmitool sdr elist | grep -Ei 'fan|tach|rpm'
+```
+
+Event / alarm：
+
+```bash
+journalctl -b --no-pager | grep -Ei 'Fan0_Tach|fan|tach|threshold|critical|warning'
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Systems/system/LogServices/EventLog/Entries | jq
+```
+
+驗證重點：
+
+```text
+[ ] Redfish sensor Reading 與 D-Bus Value 一致
+[ ] ReadingUnits 為 RPM 或可清楚表示 fan speed
+[ ] IPMI sensor type、unit 與 threshold 合理
+[ ] fan absent 時 Redfish / IPMI 狀態符合平台政策
+[ ] lower critical 觸發時 D-Bus alarm flag 與事件 log 同步產生
+```
+
+##### 12.8.11 進階除錯與常見陷阱
+
+| 問題現象 | 可能方向 | 排查 / 處理方式 |
+| :--- | :--- | :--- |
+| `fan*_input` 不存在 | DTS 未啟用、driver 未載入、hwmon device 未建立、tach channel 未宣告 | 查 `dmesg`、kernel config、pinctrl、DTS compatible、fan child node |
+| `fan*_input` 為 0 | 風扇未轉、PWM = 0、風扇沒供電、tach pin 接錯、PPR / divisor 不合理 | 先手動提高 PWM，確認風扇供電，再用示波器看 tach |
+| RPM 為預期 2 倍或 1/2 | PPR 設錯 | 用示波器算頻率，套 `RPM = Hz × 60 / PPR` 回推 |
+| RPM 偶發跳到極大值 | tach 毛刺、pull-up 過弱或過強、線材雜訊、divisor 太小 | 檢查波形、調整 fan divisor / sample、改善走線與濾波 |
+| RPM 反應很慢 | sample window 太長、daemon poll 太慢、風扇慣性 | 區分 driver 更新率與 D-Bus poll interval，調整 PollInterval |
+| PWM 改變但 RPM 不變 | PWM channel 對錯風扇、風扇固定全速、PWM polarity 錯、fan controller 接管 | 比對 schematic，逐一改 PWM 並觀察對應風扇 |
+| 某一顆雙轉子風扇只看到一個 tach | DTS 只宣告一個 tach channel、Tachs JSON 只填一個 Index | 檢查 fan module pinout、tach-ch list、Entity Manager Tachs |
+| fan_tach D-Bus object 未出現 | Entity Manager Type / Index 不符合 FanSensor 預期 | 查 FanSensor log、Entity Manager log、ObjectMapper |
+| Presence=false 但 RPM 有值 | presence path / config 錯、GPIO polarity 錯、inventory path 不一致 | 比對 presence config sensor name、GPIO active state、inventory path |
+| Presence=true 但 RPM=0 | 風扇插入但停止、tach pin 斷線、presence pin 無法代表 rotor OK | 區分 presence 與 functional，讓 monitor 負責 rotor fail |
+| Redfish 顯示 N/A | bmcweb sensor mapping、association 或 D-Bus path 不完整 | 確認 sensor path、association、bmcweb log |
+| 低轉速門檻誤觸發 | boot 初期風扇尚未啟動、host off policy、MinPwm 太低 | 加入 power state gating、啟動延遲、合理 MinPwm 與 hysteresis |
+| Fan fail 後沒有 failsafe | fan monitor / PID policy 未接到該 sensor | 查 PID zone、fan monitor config、failsafe event |
+
+##### 12.8.12 Fan Tach Sensor Porting 驗收 Checklist
+
+硬體設計階段：
+
+```text
+[ ] 風扇型號與規格書確認：PPR、Max RPM、Min RPM、PWM 頻率、PWM duty 定義
+[ ] Tach 電氣型態確認：open-drain / push-pull、pull-up 電壓、pull-up 阻值
+[ ] Tach pin 到 BMC Tach channel 的 schematic 對照確認
+[ ] PWM pin 到風扇 PWM input 的 schematic 對照確認
+[ ] 是否經 CPLD / buffer / mux / level shifter，enable 條件已確認
+[ ] Presence pin / Fault pin / FRU EEPROM 是否存在及其 owner 確認
+[ ] 單風扇或雙轉子風扇、tach 數量確認
+[ ] Lower warning / lower critical RPM 門檻與 thermal policy 確認
+```
+
+Device Tree / Kernel：
+
+```text
+[ ] PWM/Tach controller node status = "okay"
+[ ] compatible、reg、clocks、resets、#pwm-cells 與 SoC binding 對齊
+[ ] pinctrl 包含所有使用的 PWM 與 Tach pin，且無 pinmux 衝突
+[ ] fan child node 已加入，pwms 與 tach-ch 正確
+[ ] PPR 欄位已依 driver binding 設定，例如 pulses-per-revolution / fan-ppr
+[ ] 必要 kernel config 啟用：HWMON、PWM、pwm-fan、SoC PWM/Tach driver
+[ ] dmesg 無 probe failure、pinctrl failure、invalid channel 相關錯誤
+[ ] /sys/class/hwmon/hwmonX/fan*_input 存在
+[ ] 手動調整 PWM 時 RPM 會合理變化
+[ ] 使用示波器或轉速計比對 RPM，誤差在工程可接受範圍內
+```
+
+Entity Manager / Userspace：
+
+```text
+[ ] Fan / Tach JSON 已加入正確 layer 並進 image
+[ ] Type 與 FanSensor 支援 schema 一致
+[ ] Pwm、Tachs、Index 與 DTS / hwmon channel mapping 一致
+[ ] 雙轉子風扇已建立兩個 tach sensor 或符合平台命名規則
+[ ] PollInterval 設定合理，常見建議 500～1000 ms
+[ ] Thresholds 設定完成，以 lower warning / lower critical 為主
+[ ] PowerState gating 符合平台狀態，例如 AlwaysOn、On、ChassisOn
+[ ] phosphor-fan-presence config 中 sensor 名稱與 D-Bus sensor name 一致
+[ ] fan monitor / PID config 有納入該 fan tach sensor
+```
+
+D-Bus / Redfish / IPMI / Event：
+
+```text
+[ ] FanSensor service 啟動無錯誤
+[ ] ObjectMapper 可找到 /xyz/openbmc_project/sensors/fan_tach/<Name>
+[ ] busctl get-property 可讀取 Value，單位以 RPM 檢查合理
+[ ] Threshold interfaces 與 alarm properties 存在
+[ ] Redfish Sensors 或 Thermal 可查到該 fan tach sensor
+[ ] IPMI SDR / sensor list 依平台需求可查到 fan sensor
+[ ] 手動降低 PWM 或停止風扇時，RPM 會下降並觸發 lower threshold
+[ ] threshold 觸發時，D-Bus alarm flag、phosphor-logging、SEL / EventLog 符合預期
+[ ] presence 狀態正確反映風扇插入 / 拔除
+[ ] fan fail 時 failsafe PWM / thermal policy / shutdown policy 符合平台需求
+```
+
+##### 12.8.13 Fan Tach Sensor 資料表範本
+
+| Fan Name | Rotor / Tach Name | PWM Channel | Tach Channel | PPR | hwmon input | D-Bus Path | Max RPM | Lower Warning | Lower Critical | Presence Method | 備註 |
+| --- | --- | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | --- | --- |
+| Fan0 | Fan0_Tach | 0 | 0 | 2 | fan1_input | /xyz/openbmc_project/sensors/fan_tach/Fan0_Tach | [待填] | [待填] | [待填] | Tach / GPIO | [待填] |
+| Fan1 | Fan1_Front_Rotor | 1 | 1 | 2 | fan2_input | /xyz/openbmc_project/sensors/fan_tach/Fan1_Front_Rotor | [待填] | [待填] | [待填] | Tach / GPIO | dual rotor |
+| Fan1 | Fan1_Rear_Rotor | 1 | 2 | 2 | fan3_input | /xyz/openbmc_project/sensors/fan_tach/Fan1_Rear_Rotor | [待填] | [待填] | [待填] | Tach / GPIO | dual rotor |
+
+##### 12.8.14 本節參考資料
+
+- Linux kernel `pwm-fan` 文件：`pwm-fan` 以 generic PWM interface 驅動風扇，透過 hwmon sysfs 暴露 `fan1_input`、`pwm1_enable` 與 `pwm1`；`fan1_input` 代表 fan tachometer speed in RPM。
+- Linux kernel `pwm-fan` Device Tree binding：`compatible = "pwm-fan"`，`pwms` 為必要欄位；`pulses-per-revolution` 用來定義每轉脈衝數，範圍 1～4，預設為 2。
+- Linux kernel ASPEED G6 PWM/Tach binding：AST2600 PWM controller 可支援最多 16 個 PWM outputs，Fan Tacho controller 可支援最多 16 個 fan tach input，兩者為獨立硬體區塊；fan child node 需描述 `tach-ch` 與 `pwms`。
+- OpenBMC dbus-sensors README：sensor daemon 可從 hwmon、D-Bus 或 direct driver access 讀取感測資料，並以 `/xyz/openbmc_project/sensors/<type>/<sensor_name>` 發佈 D-Bus object。
+- OpenBMC phosphor-fan-presence 文件：fan presence detection 透過設定檔更新 fan inventory object 的 `Present` property；目前常見 runtime JSON 設定檔位置包含 `/usr/share/phosphor-fan-presence/presence/config.json` 與 `/etc/phosphor-fan-presence/presence/config.json`。
+
 #### 12.9 PSU Sensor
 #### 12.10 CPU / PECI Sensor
 #### 12.11 NVMe Sensor
