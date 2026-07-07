@@ -60,6 +60,7 @@
 | 2026-07-07 |  0.16 | Copilot | 撰寫 Current Sensor |
 | 2026-07-07 |  0.17 | Copilot | 撰寫 Power Sensor |
 | 2026-07-07 |  0.18 | Copilot | 撰寫 Fan Tach Sensor |
+| 2026-07-07 |  0.19 | Copilot | 撰寫 Fan PWM / Fan Control |
 
 ### 0.7 資料來源可信度分級
 
@@ -7816,14 +7817,753 @@ D-Bus / Redfish / IPMI / Event：
 - OpenBMC dbus-sensors README：sensor daemon 可從 hwmon、D-Bus 或 direct driver access 讀取感測資料，並以 `/xyz/openbmc_project/sensors/<type>/<sensor_name>` 發佈 D-Bus object。
 - OpenBMC phosphor-fan-presence 文件：fan presence detection 透過設定檔更新 fan inventory object 的 `Present` property；目前常見 runtime JSON 設定檔位置包含 `/usr/share/phosphor-fan-presence/presence/config.json` 與 `/etc/phosphor-fan-presence/presence/config.json`。
 
-#### 12.9 PSU Sensor
-#### 12.10 CPU / PECI Sensor
-#### 12.11 NVMe Sensor
-#### 12.12 GPU Sensor
-#### 12.13 External / Virtual Sensor
-#### 12.14 Presence / Intrusion / GPIO State Sensor
-#### 12.15 Redfish Association
-#### 12.16 Sensor 共用除錯指令與附錄
+#### 12.9 Fan PWM / Fan Control
+
+##### 12.9.1 適用情境
+
+Fan PWM（Pulse Width Modulation）用於控制散熱風扇的轉速，是 OpenBMC 熱管理系統中的輸出端。Fan Tach Sensor 負責回報實際 RPM，Fan PWM 則負責把控制器計算出的目標 duty 或目標轉速轉成硬體輸出訊號。兩者常一起出現在同一個風扇模組，但在 bring-up、DTS、JSON 與除錯時必須分開檢查。
+
+常見應用場景包含：
+
+```text
+依溫度感測器動態調整風扇轉速
+工廠測試、維修模式、熱流測試時固定 PWM
+Thermal Policy / PID / Stepwise 風扇控制
+風扇失效或溫度 sensor 失效時進入 failsafe PWM
+開機預設轉速設定，避免 BMC 服務尚未啟動前風扇停止
+風扇冗餘管理，例如單一風扇失效時提高同 zone 其他風扇轉速
+電源狀態切換，例如 host off / standby / chassis on 的不同風扇策略
+聲學目標與功耗最佳化，例如 idle 低轉速、stress 提高轉速
+```
+
+在 OpenBMC 中，PWM 不一定只以一般 numeric sensor 呈現。常見呈現方式包含：
+
+```text
+/xyz/openbmc_project/sensors/fan_pwm/<Name>
+/xyz/openbmc_project/control/fanpwm/<Name>
+/xyz/openbmc_project/sensors/fan_tach/<Name> 上的 Control.FanPwm interface
+```
+
+實際 path 與 interface 會受 OpenBMC branch、dbus-sensors、phosphor-hwmon、phosphor-fan-control、phosphor-pid-control 與平台 JSON/YAML 設定影響。Porting 時建議不要只記 `Fan0`，而是同時記錄：
+
+```text
+Fan inventory path
+Fan Tach D-Bus path
+Fan PWM D-Bus path
+sysfs pwmN path
+sysfs fanN_input path
+控制服務名稱與 zone id
+```
+
+##### 12.9.2 資料路徑
+
+Fan PWM / Fan Control 的典型資料流如下：
+
+```text
+Temperature / Margin / Power / Host telemetry sensors
+    ↓
+phosphor-pid-control / phosphor-fan-control / platform fan control daemon
+    ↓
+Zone policy：PID、Stepwise、fixed table、failsafe、manual override
+    ↓
+D-Bus control interface：Control.FanPwm 或 Control.FanSpeed
+    ↓
+FanSensor / PwmSensor / phosphor-hwmon / platform daemon
+    ↓
+sysfs：/sys/class/hwmon/hwmonX/pwmN 或 driver-specific pwm path
+    ↓
+Linux PWM driver：pwm-fan、ASPEED PWM/Tach、SoC PWM、I2C fan controller
+    ↓
+PWM pin / fan controller IC / power stage
+    ↓
+Fan motor speed changes
+    ↓
+Fan Tach 回授 RPM
+```
+
+依控制方式可分為兩種：
+
+```text
+PWM target control：控制器直接輸出 0～255 或 0～100% 類型的 PWM 值
+RPM target control：控制器輸出目標 RPM，下一層 fan controller 再調整 PWM 以追 RPM
+```
+
+PWM target control 較直觀，常見於 BMC 直接接風扇 PWM 線的系統。RPM target control 則適合有硬體 fan controller IC 或平台軟體已建立內層 fan PID 的系統。兩者不可混用：若上層輸出 6000（原意 RPM）但下層當成 PWM raw value，通常會被 clamp 到最大值；若上層輸出 128（原意 PWM）但下層當成 RPM，風扇可能維持極低轉速或被判定異常。
+
+##### 12.9.3 關鍵硬體參數
+
+Porting 前需從 schematic、layout、風扇規格書、CPLD register map、power sequence 與 thermal requirement 取得下列資訊：
+
+```text
+[ ] 風扇型號、料號、風扇規格書版本
+[ ] PWM 訊號電壓準位：3.3V / 5V / open-drain / push-pull / level shifted
+[ ] PWM input 是否需要 pull-up、pull-down 或 series resistor
+[ ] PWM 頻率範圍：常見 25 kHz，但需以風扇規格書為準
+[ ] PWM duty range：0～100%、20～100%、30～100% 或 vendor-defined
+[ ] PWM polarity：高 duty 轉速增加 / 反相 / 訊號斷線時全速
+[ ] 最小啟動 duty：風扇從停止到開始轉動所需 duty
+[ ] 最小穩定 duty：風扇已轉動後可維持不停止的 duty
+[ ] 全速 duty：通常 100% 或 raw 255
+[ ] 停止 duty：0% 是否真的停止，或風扇是否有內建最低轉速
+[ ] PWM channel：PWM0 / PWM1 / ... 到 fan connector 的對照
+[ ] Tach channel：用於驗證 PWM 效果的回授 sensor
+[ ] 風扇供電 rail：12V / 5V 是否受 BMC、CPLD 或 host state 控制
+[ ] 風扇模組是否一個 PWM 控多個 rotors
+[ ] 風扇 fail 後的硬體預設：PWM floating、BMC reset、CPLD failsafe 時是否全速
+```
+
+###### 12.9.3.1 PWM 週期與頻率換算
+
+Device Tree 中常用 period 表示 PWM 週期，單位通常是 ns：
+
+```text
+Frequency_Hz = 1,000,000,000 / Period_ns
+Period_ns = 1,000,000,000 / Frequency_Hz
+```
+
+常見例：
+
+```text
+25 kHz → 40,000 ns
+20 kHz → 50,000 ns
+10 kHz → 100,000 ns
+30 kHz → 33,333 ns
+```
+
+若風扇規格書建議 25 kHz，DTS 設為 `40000` ns 是常見起點。若出現低 duty 無法轉、噪音異常、轉速曲線不連續或 PWM duty 改變但 RPM 不明顯，需與硬體團隊確認實際 pin 波形與風扇接收頻率。
+
+###### 12.9.3.2 raw PWM、百分比與 RPM
+
+常見層級：
+
+```text
+sysfs pwmN：常見 raw 0～255，255 代表最大 duty
+D-Bus fan_pwm Sensor.Value：部分實作顯示百分比 0～100
+Control.FanPwm.Target：常見 raw target 0～255
+phosphor-pid-control failsafePercent：語意為百分比，實際寫入需看 fan sensor scaling
+FanSpeed.Target：語意為 RPM
+```
+
+建議資料表同時記錄 raw PWM 與百分比：
+
+```text
+PWM_percent = raw_pwm / 255 × 100
+raw_pwm = round(PWM_percent × 255 / 100)
+```
+
+例：
+
+```text
+raw 30  ≈ 11.8%
+raw 64  ≈ 25.1%
+raw 128 ≈ 50.2%
+raw 192 ≈ 75.3%
+raw 255 = 100%
+```
+
+##### 12.9.4 常見控制架構
+
+| 架構 | 輸出目標 | 寫入路徑 | 使用場景 | 注意事項 |
+| :--- | :--- | :--- | :--- | :--- |
+| SoC PWM 直接控風扇 | raw PWM / % | hwmon `pwmN` | BMC PWM pin 直接連 fan PWM input | 需確認 polarity、period、pinctrl、failsafe 預設 |
+| `pwm-fan` | raw 0～255 | hwmon `pwm1` | generic Linux PWM fan | `pwm1_enable` mode 影響 `pwm1=0` 時行為 |
+| ASPEED PWM/Tach | raw 0～255 | hwmon or driver path | AST2600 常見 | PWM 與 Tach 獨立；需對 channel |
+| I2C fan controller | RPM 或 PWM | I2C register / hwmon | MAX31785 / MAX31790 / NCT 類 | 控制 IC 可能有內建閉環與 fault rule |
+| phosphor-pid-control → sysfs | raw PWM 或 RPM | `writePath` | 使用 swampd 控制 zone | `readPath` / `writePath` 與 scaling 必須對齊 |
+| phosphor-fan-control | FanSpeed / FanPWM | control path | fan presence/control/monitor stack | target_interface 與 target_path 需一致 |
+| PSU fan | PSU command / PMBus | PSUSensor / PSU daemon | PSU 內建風扇 | 可能不是 chassis FanSensor，且尺度可能 0～100 |
+
+##### 12.9.5 Porting 步驟 A：Device Tree / Kernel
+
+###### Step A1：啟用 PWM controller 與 pinctrl
+
+AST2600 / ASPEED G6 常見 PWM/Tach controller 節點：
+
+```dts
+&pwm_tach {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_pwm0_default &pinctrl_pwm1_default
+                 &pinctrl_tach0_default &pinctrl_tach1_default>;
+};
+```
+
+若 fan child node 同時描述 PWM 與 Tach：
+
+```dts
+&pwm_tach {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_pwm0_default &pinctrl_pwm1_default
+                 &pinctrl_tach0_default &pinctrl_tach1_default>;
+
+    fan-0 {
+        tach-ch = /bits/ 8 <0x0>;
+        pwms = <&pwm_tach 0 40000 0>;
+    };
+
+    fan-1 {
+        tach-ch = /bits/ 8 <0x1>;
+        pwms = <&pwm_tach 1 40000 0>;
+    };
+};
+```
+
+`pwms = <&pwm_tach 0 40000 0>` 的典型含意：
+
+```text
+&pwm_tach：PWM provider
+0        ：PWM channel 0
+40000    ：period = 40000 ns = 25 kHz
+0        ：PWM flags，例如 normal polarity；反相需依 binding / driver 定義
+```
+
+###### Step A2：generic `pwm-fan` DTS 範例
+
+若採 generic `pwm-fan`：
+
+```dts
+fan0: pwm-fan {
+    compatible = "pwm-fan";
+    pwms = <&pwm_tach 0 40000 0>;
+    cooling-levels = <0 64 128 192 255>;
+    #cooling-cells = <2>;
+};
+```
+
+若同時接 tach interrupt：
+
+```dts
+fan0: pwm-fan {
+    compatible = "pwm-fan";
+    pwms = <&pwm 0 40000 0>;
+    interrupts-extended = <&gpio5 1 IRQ_TYPE_EDGE_FALLING>;
+    pulses-per-revolution = <2>;
+    cooling-levels = <0 80 120 160 200 255>;
+    #cooling-cells = <2>;
+};
+```
+
+###### Step A3：Kernel config
+
+```text
+CONFIG_HWMON
+CONFIG_PWM
+CONFIG_SENSORS_PWM_FAN
+CONFIG_PWM_ASPEED 或 SoC 對應 PWM driver
+CONFIG_SENSORS_ASPEED_G6_PWM_TACH 或 vendor BSP 對應 ASPEED PWM/Tach driver
+CONFIG_THERMAL（若使用 cooling-levels / thermal zone）
+CONFIG_REGULATOR（若 fan-supply 由 regulator 控制）
+```
+
+###### Step A4：開機 probe 檢查
+
+```bash
+dmesg | grep -Ei 'pwm|fan|tach|hwmon|aspeed|npcm'
+
+cat /sys/kernel/debug/pinctrl/*/pinmux-pins 2>/dev/null | grep -Ei 'pwm|tach|fan'
+
+for h in /sys/class/hwmon/hwmon*; do
+    echo "== $h =="
+    cat "$h/name" 2>/dev/null || true
+    for f in "$h"/pwm* "$h"/fan*_input "$h"/fan*_label; do
+        [ -e "$f" ] && echo "$(basename "$f")=$(cat "$f")"
+    done
+done
+```
+
+##### 12.9.6 Porting 步驟 B：sysfs PWM 驗證
+
+###### Step B1：找出 PWM 節點
+
+```bash
+find /sys/class/hwmon -maxdepth 2 -name 'pwm*' -print
+
+for h in /sys/class/hwmon/hwmon*; do
+    echo "== $h =="
+    cat "$h/name" 2>/dev/null || true
+    ls "$h"/pwm* 2>/dev/null || true
+done
+```
+
+常見節點：
+
+```text
+pwm1
+pwm1_enable
+pwm1_auto_point1_pwm
+pwm1_auto_point1_temp
+```
+
+不同 driver 的 `pwm1_enable` 語意可能不同。generic `pwm-fan` 文件中，`pwm1` 是 0～255，`255` 代表最大轉速；`pwm1_enable` 會影響 `pwm1=0` 時 PWM 與 regulator 的保留或關閉行為。實機測試前需先看當前 driver 文件與 sysfs 說明。
+
+###### Step B2：安全手動測試
+
+測試前建議：
+
+```text
+[ ] 確認可安全降低風扇轉速，避免 CPU / GPU / VR / DIMM 過熱
+[ ] 確認有序列埠或 SSH session 可恢復控制
+[ ] 準備回復全速指令
+[ ] 若 host 正在高負載，先停止 stress test 或固定 failsafe
+```
+
+手動測試：
+
+```bash
+H=/sys/class/hwmon/hwmonX
+
+# 記錄初始值
+cat $H/name
+cat $H/pwm1 2>/dev/null || true
+cat $H/pwm1_enable 2>/dev/null || true
+cat $H/fan1_input 2>/dev/null || true
+
+# 視 driver 支援情況切到可由 pwm1 控制的模式
+# 注意：pwm1_enable 值語意依 driver 而異，請先確認文件
+echo 1 > $H/pwm1_enable 2>/dev/null || true
+
+# 測試 duty 與 RPM 對應
+for v in 64 128 192 255; do
+    echo $v > $H/pwm1
+    sleep 5
+    echo "raw_pwm=$v rpm=$(cat $H/fan1_input 2>/dev/null || echo NA)"
+done
+
+# 回到安全值
+echo 255 > $H/pwm1
+```
+
+測試記錄表：
+
+| PWM raw | PWM % | RPM | Tach sensor | 溫度 | 備註 |
+| ---: | ---: | ---: | --- | ---: | --- |
+| 64 | 25.1 | [待填] | [待填] | [待填] | [待填] |
+| 128 | 50.2 | [待填] | [待填] | [待填] | [待填] |
+| 192 | 75.3 | [待填] | [待填] | [待填] | [待填] |
+| 255 | 100.0 | [待填] | [待填] | [待填] | [待填] |
+
+##### 12.9.7 Entity Manager / FanSensor / PwmSensor 配置
+
+OpenBMC branch 與平台 layer 對 fan JSON 欄位差異較大，下列範例作為 porting 記錄範本。實際欄位需以 `entity-manager` schema、`dbus-sensors` FanSensor / PwmSensor source、既有平台 JSON 與 journal log 為準。
+
+###### SoC PWM + Tach 風扇範例
+
+```json
+{
+  "Name": "Fan0",
+  "Type": "AspeedFan",
+  "Pwm": 0,
+  "Tachs": [
+    {
+      "Name": "Fan0_Tach",
+      "Index": 0
+    }
+  ],
+  "PwmName": "Fan0_PWM",
+  "MaxPwm": 255,
+  "MinPwm": 30,
+  "PollInterval": 1000,
+  "PowerState": "AlwaysOn",
+  "Thresholds": [
+    {
+      "Name": "lower critical",
+      "Direction": "less than",
+      "Severity": 1,
+      "Value": 500
+    }
+  ]
+}
+```
+
+###### I2C fan controller 範例
+
+```json
+{
+  "Type": "I2CFan",
+  "Name": "FCB_FAN0_TACH",
+  "Bus": 18,
+  "Address": "0x23",
+  "Index": 11,
+  "Connector": {
+    "Name": "FCB_FAN0_PWM",
+    "Pwm": 0,
+    "PwmName": "FCB_FAN0_PWM_PCT",
+    "Tachs": [11]
+  },
+  "MaxReading": 25000,
+  "PowerState": "AlwaysOn"
+}
+```
+
+###### 純 PWM control object 範例
+
+若平台將 PWM 視為 `fan_pwm` control object，而 tach sensor 另行建立：
+
+```json
+{
+  "Name": "Fan0_PWM",
+  "Type": "PwmSensor",
+  "Index": 0,
+  "MaxValue": 255,
+  "MinValue": 0,
+  "DefaultValue": 80,
+  "PowerState": "AlwaysOn"
+}
+```
+
+欄位檢查：
+
+```text
+[ ] Type 與 schema / daemon 支援型別一致
+[ ] Pwm / Index 對應到 sysfs pwmN 與硬體 PWM channel
+[ ] PwmName 對應 D-Bus fan_pwm object name
+[ ] MinPwm 大於或等於風扇最低啟動需求
+[ ] MaxPwm 符合 raw scale，系統 fan 常見 255，PSU fan 可能是 100
+[ ] Tachs 對應 fan_tach sensor，方便用 RPM 驗證 PWM 效果
+[ ] PowerState 與風扇供電 rail 一致
+```
+
+##### 12.9.8 D-Bus FanPwm / FanSpeed 介面驗證
+
+OpenBMC 常見 fan control interface：
+
+```text
+xyz.openbmc_project.Control.FanPwm：Target 屬性常用於 PWM raw target
+xyz.openbmc_project.Control.FanPWM：部分文件或舊設定以全大寫 PWM 命名，需以實機 introspect 為準
+xyz.openbmc_project.Control.FanSpeed：Target 屬性常用於 RPM target
+xyz.openbmc_project.Sensor.Value：部分 fan_pwm object 會以百分比顯示 Value
+```
+
+查找 fan PWM object：
+
+```bash
+busctl tree /xyz/openbmc_project | grep -Ei 'fan_pwm|fanpwm|pwm'
+
+busctl tree xyz.openbmc_project.FanSensor 2>/dev/null | grep -Ei 'pwm|fan'
+```
+
+讀取與設定：
+
+```bash
+# 找出 service owner
+busctl call xyz.openbmc_project.ObjectMapper \
+  /xyz/openbmc_project/object_mapper \
+  xyz.openbmc_project.ObjectMapper GetObject \
+  sas \
+  /xyz/openbmc_project/sensors/fan_pwm/Fan0_PWM \
+  0
+
+# 檢查 interface
+busctl introspect <service_name> \
+  /xyz/openbmc_project/sensors/fan_pwm/Fan0_PWM
+
+# 設定 raw PWM target，signature 可能是 t 或 q，需以 introspect 為準
+busctl set-property \
+  <service_name> \
+  /xyz/openbmc_project/sensors/fan_pwm/Fan0_PWM \
+  xyz.openbmc_project.Control.FanPwm \
+  Target t 128
+
+# 讀回 Target
+busctl get-property \
+  <service_name> \
+  /xyz/openbmc_project/sensors/fan_pwm/Fan0_PWM \
+  xyz.openbmc_project.Control.FanPwm \
+  Target
+```
+
+驗證順序：
+
+```text
+D-Bus Target 變更
+    ↓
+sysfs pwmN 變更
+    ↓
+PWM pin 波形 duty 改變
+    ↓
+風扇 RPM 變化
+    ↓
+fan_tach D-Bus Value 變化
+```
+
+##### 12.9.9 Thermal Policy：PID / Stepwise / Fan Control
+
+###### 12.9.9.1 phosphor-pid-control JSON
+
+`phosphor-pid-control` 可從 dedicated JSON 或 D-Bus 取得設定。常見 JSON 位置為：
+
+```text
+/usr/share/swampd/config.json
+```
+
+fan sensor 以 `readPath` 讀 fan tach，以 `writePath` 寫 PWM：
+
+```json
+{
+  "sensors": [
+    {
+      "name": "fan0",
+      "type": "fan",
+      "readPath": "/xyz/openbmc_project/sensors/fan_tach/Fan0_Tach",
+      "writePath": "/sys/class/hwmon/hwmon*/pwm1",
+      "min": 0,
+      "max": 255,
+      "timeout": 4,
+      "ignoreDbusMinMax": true,
+      "unavailableAsFailed": true
+    },
+    {
+      "name": "Ambient_Temp",
+      "type": "temp",
+      "readPath": "/xyz/openbmc_project/sensors/temperature/Ambient_Temp",
+      "timeout": 5,
+      "unavailableAsFailed": true
+    }
+  ],
+  "zones": [
+    {
+      "id": 0,
+      "minThermalOutput": 30.0,
+      "failsafePercent": 100.0,
+      "pids": ["fan0", "Ambient_Temp"]
+    }
+  ]
+}
+```
+
+注意：`minThermalOutput` 在某些配置中常以最小 RPM 使用；若 fan controller 的輸出是 PWM percentage 或 raw PWM，需確認該值的語意和下層 scaling。`failsafePercent` 是 zone 進入 fail-safe 時用來寫 fan sensor 的值，常見策略為 100% 或全速。
+
+###### 12.9.9.2 PID 參數與控制模式
+
+常見控制策略：
+
+```text
+Stepwise：依溫度區間查表輸出 PWM 或 RPM，調校簡單、可預期性高
+PID：依誤差、積分、微分與 feed-forward 調整，適合需要平滑控制的系統
+Fan PID：追目標 RPM，輸出 PWM
+Thermal PID：依溫度或 margin 產生目標 fan output
+Open loop：只看溫度輸出 PWM，不看 tach 回授
+Closed loop：比較目標 RPM 與實際 RPM，再調 PWM
+```
+
+調校時建議先完成下列資料：
+
+```text
+[ ] PWM raw → RPM 曲線
+[ ] 溫度 sensor 位置、熱慣性與有效冷卻 fan zone
+[ ] fan fail 時 failsafe PWM
+[ ] acoustic target 與 idle 最低轉速
+[ ] stress test 下 steady state 溫度
+[ ] step up / step down 斜率限制，避免轉速忽高忽低
+```
+
+###### 12.9.9.3 phosphor-fan-control fans.json / zones
+
+phosphor-fan-presence / fan-control 文件中，fan control 可指定 target interface：
+
+```json
+[
+  {
+    "name": "fan0",
+    "zone": "0",
+    "sensors": ["Fan0_Tach"],
+    "target_interface": "xyz.openbmc_project.Control.FanPWM",
+    "target_path": "/xyz/openbmc_project/control/fanpwm/"
+  }
+]
+```
+
+RPM 控制則可使用：
+
+```json
+[
+  {
+    "name": "fan0",
+    "zone": "0",
+    "sensors": ["Fan0_Tach"],
+    "target_interface": "xyz.openbmc_project.Control.FanSpeed",
+    "target_path": "/xyz/openbmc_project/sensors/fan_tach/"
+  }
+]
+```
+
+實機上要以 `busctl introspect` 確認 casing 與 path，例如 `FanPWM`、`FanPwm`、`fanpwm` 可能在不同元件或版本中有差異。
+
+##### 12.9.10 Failsafe 與開機預設
+
+Fan PWM 的 failsafe 設計需要覆蓋下列階段：
+
+```text
+BMC reset / BootROM / U-Boot 階段
+Kernel probe 前
+Kernel driver probe 後但 userspace service 未啟動
+FanSensor / PwmSensor 啟動後
+PID / fan-control 啟動後
+PID service 停止、重啟或 reload configuration
+溫度 sensor unavailable / fan tach unavailable / inventory absent
+BMC kernel panic 或 watchdog reset
+```
+
+建議策略：
+
+```text
+[ ] 硬體預設：PWM floating 或 BMC reset 時風扇全速或安全轉速
+[ ] Bootloader：若可控，維持安全 PWM，不依賴 userspace
+[ ] Kernel driver：probe 後不要把 PWM 變成 0，或設定 default PWM
+[ ] FanSensor / PwmSensor：當目前 PWM 為 0 時可設 default PWM
+[ ] PID：sensor fail 或 zone fail-safe 時設 failsafePercent
+[ ] offline failsafe：PID offline 或 service stop 時 fan 保持安全 PWM
+[ ] strict failsafe：進入 fail-safe 時是否固定為 failsafePercent，或取 calculated PWM 與 failsafe 較高者
+```
+
+驗證項目：
+
+```bash
+# 觀察服務停止後是否進入安全 PWM
+systemctl stop phosphor-pid-control.service
+sleep 5
+cat /sys/class/hwmon/hwmonX/pwm1
+cat /sys/class/hwmon/hwmonX/fan1_input
+
+# 恢復服務
+systemctl start phosphor-pid-control.service
+journalctl -u phosphor-pid-control.service -b --no-pager | tail -100
+```
+
+##### 12.9.11 Redfish / IPMI / Telemetry 驗證
+
+Fan PWM 不一定會在 Redfish `Thermal` 或 `Sensors` 中呈現；許多平台只呈現 fan tach RPM，不呈現 PWM duty。若平台需求要顯示 PWM，需確認 bmcweb sensor mapping、sensor type、D-Bus path 與 association。
+
+```bash
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/Sensors | jq
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/Thermal | jq
+
+ipmitool sensor | grep -Ei 'fan|pwm|tach|rpm'
+ipmitool sdr elist | grep -Ei 'fan|pwm|tach|rpm'
+```
+
+Telemetry / log 建議保存：
+
+```text
+[ ] PWM target
+[ ] sysfs pwmN
+[ ] fan tach RPM
+[ ] controlling temperature / margin sensor
+[ ] zone mode：auto / manual / failsafe
+[ ] fan presence / functional state
+[ ] service restart / fail / reload event
+```
+
+##### 12.9.12 進階除錯與常見陷阱
+
+| 問題現象 | 可能方向 | 排查 / 處理方式 |
+| :--- | :--- | :--- |
+| `pwm*` sysfs 不存在 | DTS 未啟用、driver 未載入、kernel config 缺少 PWM / pwm-fan / SoC driver | 查 `dmesg`、`.config`、pinctrl、controller compatible |
+| 寫入 `pwm1` 後 RPM 不變 | `pwm1_enable` 模式不對、風扇固定全速、PWM channel 對錯、PWM pin 無波形 | 先量 PWM pin，再逐一比對 fan connector 與 tach |
+| 風扇無法從停止啟動 | duty 低於 start duty、供電 rail 未穩、風扇需要 start boost | 提高 MinPwm，加入啟動 boost 或開機預設全速 |
+| PWM 與 RPM 不成比例 | 風扇內部控制曲線、PWM 頻率不合、tach PPR 錯、控制 IC 另有閉環 | 建 PWM→RPM 表，確認 PWM period 與 tach PPR |
+| 設 0 後風扇未停 | 風扇內建最低轉速、`pwm1_enable` 保留 regulator、硬體 pull-up 導致全速 | 查風扇規格、driver 文件與 PWM pin 波形 |
+| 設 255 仍非全速 | PWM polarity 反相、MaxPwm scale 不符、fan controller 限速 | 確認 flags、polarity、controller register、MaxPwm |
+| D-Bus FanPwm 找不到 | PwmSensor 未建立、JSON Type / PwmName 不符合、service 未啟動 | 查 FanSensor log、ObjectMapper、Entity Manager log |
+| 手動設定後很快被覆寫 | PID / fan-control 正在 auto mode | 切明確 manual mode、停止控制服務或使用平台提供的 override flow |
+| 風扇長期全速 | failsafe 被觸發、溫度 sensor unavailable、fan tach timeout、zone mode 在 fail-safe | 查 phosphor-pid-control log、zone mode、failed sensors |
+| 服務啟動時風扇短暫降到 0 | default PWM 不足、service 順序、driver probe 初始值為 0 | 設硬體 failsafe、kernel default、PwmSensor default、systemd dependency |
+| Redfish 看不到 PWM | 平台只 expose tach，不 expose pwm | 確認需求；若需呈現，補 D-Bus sensor 與 bmcweb mapping |
+| PSU fan PWM 尺度不對 | PSU fan 可能是 0～100，不是 0～255 | 查 PwmSensor scale、PSU daemon 與 PSU PMBus command |
+
+##### 12.9.13 Fan PWM / Fan Control Porting 驗收 Checklist
+
+硬體設計階段：
+
+```text
+[ ] 風扇型號與規格書確認：PWM frequency、voltage、duty range、polarity
+[ ] PWM channel 與 fan connector 對照完成
+[ ] Tach channel 與 PWM channel 配對完成
+[ ] PWM pull-up / level shift / buffer / CPLD path 確認
+[ ] 最小啟動 duty、最小穩定 duty、全速 duty 確認
+[ ] 硬體 failsafe 狀態確認：BMC reset / pin floating / CPLD failsafe 時風扇狀態
+[ ] host off / standby / chassis on 的風扇策略確認
+```
+
+Device Tree / Kernel：
+
+```text
+[ ] PWM controller node status = "okay"
+[ ] pinctrl 包含所有 PWM pin，且無 pinmux 衝突
+[ ] fan child node 或 pwm-fan node 加入，pwms channel 與 period 正確
+[ ] 若使用 tach 回授，tach-ch / pulses-per-revolution 也已設定
+[ ] kernel config 啟用 HWMON、PWM、pwm-fan、SoC PWM/Tach driver
+[ ] dmesg 無 probe failure、invalid channel、pinctrl failure
+[ ] /sys/class/hwmon/hwmonX/pwmN 存在
+[ ] 手動設定 pwmN 後，示波器可看到 duty 改變
+[ ] fan_tach RPM 隨 PWM 變化
+```
+
+Entity Manager / Userspace：
+
+```text
+[ ] Fan / PWM JSON 已加入正確 layer 並進 image
+[ ] Type、Pwm、PwmName、Tachs / Index 與 schema 及硬體一致
+[ ] MinPwm / MaxPwm / Default PWM 設定合理
+[ ] PowerState gating 與風扇供電狀態一致
+[ ] FanSensor / PwmSensor service 啟動無錯誤
+[ ] ObjectMapper 可找到 fan_pwm 或 fan control object
+[ ] Control.FanPwm / Control.FanPWM / Control.FanSpeed interface 依平台需求存在
+```
+
+Thermal Policy：
+
+```text
+[ ] phosphor-pid-control 或 fan-control 設定檔已加入 image
+[ ] sensors readPath 對應 fan_tach 與 temperature sensor
+[ ] fan writePath 對應 sysfs pwmN 或 D-Bus fan control path
+[ ] zones id、minThermalOutput、failsafePercent、pids 設定合理
+[ ] PID / Stepwise 參數已初步調校
+[ ] manual / auto / failsafe mode 切換路徑已驗證
+[ ] 溫度上升時 PWM 增加，溫度下降時 PWM 降低
+[ ] fan fail 或 sensor fail 時進入預期 failsafe PWM
+```
+
+D-Bus / Redfish / IPMI / Event：
+
+```text
+[ ] busctl 可讀寫 Target，且 signature 與實機 introspect 一致
+[ ] 設定 Target 後 sysfs pwmN 同步變化
+[ ] sysfs pwmN 變化後 fan_tach RPM 同步變化
+[ ] Redfish 依平台需求可看到 fan tach，若需要也可看到 fan_pwm
+[ ] IPMI SDR / sensor list 依平台需求可看到 fan tach / pwm
+[ ] 停止 PID service、拔除風扇、temperature sensor unavailable 等情境都有預期 log
+[ ] SEL / Journal / EventLog 符合平台 event policy
+```
+
+##### 12.9.14 Fan PWM / Fan Control 資料表範本
+
+| Fan Name | PWM Channel | PWM Path | PWM Period / Hz | MinPwm | MaxPwm | Default / Failsafe | Tach Sensor | Control Path | Zone | 備註 |
+| --- | ---: | --- | --- | ---: | ---: | --- | --- | --- | ---: | --- |
+| Fan0 | 0 | `/sys/class/hwmon/hwmonX/pwm1` | 40000 ns / 25 kHz | 30 | 255 | 255 | Fan0_Tach | `/xyz/openbmc_project/sensors/fan_pwm/Fan0_PWM` | 0 | [待填] |
+| Fan1 | 1 | `/sys/class/hwmon/hwmonX/pwm2` | 40000 ns / 25 kHz | 30 | 255 | 255 | Fan1_Tach | `/xyz/openbmc_project/sensors/fan_pwm/Fan1_PWM` | 0 | [待填] |
+| PSU0_FAN | [待填] | [待填] | [待填] | [待填] | 100 | 100 | PSU0_FAN_TACH | [待填] | [待填] | PSU fan scale may be 0～100 |
+
+##### 12.9.15 本節參考資料
+
+- Linux kernel `pwm-fan` 文件：`pwm-fan` 使用 generic PWM interface 驅動風扇，並透過 hwmon sysfs 提供 `fan1_input`、`pwm1_enable` 與 `pwm1`；其中 `pwm1` 為 0～255，255 代表最大轉速。
+- OpenBMC dbus-sensors PwmSensor 架構資料：PwmSensor 透過 sysfs `pwm*` 控制風扇，並可提供 `Sensor.Value` 百分比與 `Control.FanPwm` raw target；系統風扇常見 raw scale 為 0～255，PSU fan 可能為 0～100。
+- OpenBMC phosphor-dbus-interfaces control namespace：FanPwm 提供 `Target` 屬性用於 duty cycle，FanSpeed 提供 `Target` 屬性用於 RPM target。
+- OpenBMC phosphor-fan-presence fan control 文件：fan control 可使用 `xyz.openbmc_project.Control.FanSpeed` 或 `xyz.openbmc_project.Control.FanPWM` 作為 target interface。
+- OpenBMC phosphor-pid-control configure 文件：設定包含 `sensors` 與 `zones`；fan sensor 可透過 `readPath` 讀取 fan tach，透過 `writePath` 寫入 PWM；zone 中 `minThermalOutput` 常用作最低 thermal output，`failsafePercent` 用於 fail-safe 輸出。
+
+#### 12.10 PSU Sensor
+#### 12.11 CPU / PECI Sensor
+#### 12.12 NVMe Sensor
+#### 12.13 GPU Sensor
+#### 12.14 External / Virtual Sensor
+#### 12.15 Presence / Intrusion / GPIO State Sensor
+#### 12.16 Redfish Association
+#### 12.17 Sensor 共用除錯指令與附錄
 
 ### 13. Fan Control
 
