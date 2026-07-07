@@ -61,6 +61,7 @@
 | 2026-07-07 |  0.17 | Copilot | 撰寫 Power Sensor |
 | 2026-07-07 |  0.18 | Copilot | 撰寫 Fan Tach Sensor |
 | 2026-07-07 |  0.19 | Copilot | 撰寫 Fan PWM / Fan Control |
+| 2026-07-07 |  0.20 | Copilot | 撰寫 PSU Sensor |
 
 ### 0.7 資料來源可信度分級
 
@@ -8557,6 +8558,396 @@ D-Bus / Redfish / IPMI / Event：
 - OpenBMC phosphor-pid-control configure 文件：設定包含 `sensors` 與 `zones`；fan sensor 可透過 `readPath` 讀取 fan tach，透過 `writePath` 寫入 PWM；zone 中 `minThermalOutput` 常用作最低 thermal output，`failsafePercent` 用於 fail-safe 輸出。
 
 #### 12.10 PSU Sensor
+
+##### 12.10.1 適用情境
+
+Power Supply Unit（PSU）是伺服器系統的電源核心。現代伺服器 PSU 多數支援 PMBus over I2C/SMBus，可提供電壓、電流、功率、溫度、風扇轉速、告警、FRU / Asset 與冗餘狀態。Linux kernel 的 PMBus hwmon driver 會把支援的 PMBus command 轉成 `/sys/class/hwmon/hwmonX/` 下的標準 hwmon 屬性；OpenBMC userspace 再由 `dbus-sensors` 的 `PSUSensor` 搭配 Entity Manager 設定建立 D-Bus sensor。
+
+常見 PSU sensor：
+
+```text
+Input voltage / Output voltage
+Input current / Output current
+Input power / Output power
+Temperature
+Fan speed
+Presence
+Fault status
+FRU / Asset data
+Redundancy status
+```
+
+常見 D-Bus path：
+
+```text
+/xyz/openbmc_project/sensors/voltage/PSU0_Input_Voltage
+/xyz/openbmc_project/sensors/voltage/PSU0_Output_Voltage
+/xyz/openbmc_project/sensors/current/PSU0_Input_Current
+/xyz/openbmc_project/sensors/current/PSU0_Output_Current
+/xyz/openbmc_project/sensors/power/PSU0_Input_Power
+/xyz/openbmc_project/sensors/power/PSU0_Output_Power
+/xyz/openbmc_project/sensors/temperature/PSU0_Temp
+/xyz/openbmc_project/sensors/fan_tach/PSU0_Fan
+```
+
+需分清楚三種狀態：
+
+- `Sensor.Value`：電壓、電流、功率、溫度、轉速等讀值。
+- `Inventory.Item.Present`：PSU 是否插入。
+- `OperationalStatus.Functional`：PSU 在存在狀態下是否健康。
+
+Presence 與 Functional 不宜混用。拔除 PSU 通常是 `Present=false`；插著但故障時通常是 `Present=true` 且 `Functional=false` 或產生 fault / event。
+
+##### 12.10.2 資料路徑（Data Flow）
+
+```text
+PSU / CRPS / CFFPS / Vendor PSU
+    PMBus over I2C/SMBus
+    ↓
+Linux Kernel
+    pmbus / vendor-specific pmbus driver
+    ↓
+/sys/class/hwmon/hwmonX/
+    ├── in*_input / in*_label          voltage, mV
+    ├── curr*_input / curr*_label      current, mA
+    ├── power*_input / power*_label    power, µW
+    ├── temp*_input / temp*_label      temperature, m°C
+    ├── fan*_input                     RPM
+    └── *_alarm / *_fault / *_crit / *_max / *_min
+    ↓
+Userspace Daemons
+    ├── Entity Manager                 inventory / Exposes / sensor config
+    ├── PSUSensor (dbus-sensors)       hwmon → D-Bus sensor
+    ├── phosphor-power / psu monitor   presence / fault / redundancy / event
+    └── phosphor-regulators            VR / regulator rail，視平台需求啟用
+    ↓
+D-Bus
+    ├── xyz.openbmc_project.Sensor.Value
+    ├── xyz.openbmc_project.Sensor.Threshold.Warning / Critical
+    ├── xyz.openbmc_project.State.Decorator.Availability
+    ├── xyz.openbmc_project.State.Decorator.OperationalStatus
+    ├── xyz.openbmc_project.Inventory.Item
+    └── xyz.openbmc_project.Inventory.Decorator.Asset
+    ↓
+Northbound Interfaces
+    ├── Redfish: /redfish/v1/Chassis/<id>/Power
+    ├── Redfish: /redfish/v1/Chassis/<id>/PowerSubsystem/PowerSupplies
+    ├── Redfish: /redfish/v1/Chassis/<id>/Sensors
+    └── IPMI: SDR / Sensor reading / SEL
+```
+
+Linux PMBus driver 的 hwmon 屬性只會出現硬體與 driver 判定支援的項目；若 PSU 不支援某 command，或通用 `pmbus` driver 無法安全偵測該能力，對應 sysfs 檔案可能不存在。
+
+##### 12.10.3 常見來源分類與特性
+
+| 來源類型 | 通訊協定 | Linux / OpenBMC 對應 | 關鍵注意事項 |
+| :--- | :--- | :--- | :--- |
+| 標準 PMBus PSU | PMBus over I2C/SMBus | `pmbus` driver + `PSUSensor` | 需明確建立 I2C device；確認 bus / address / page / label。 |
+| 廠商專用 PSU | PMBus + vendor extension | vendor pmbus driver，例如 `ibm-cffps`、`inspur-ipsps` | 可能需要客製 command、狀態解碼、FRU 讀取方式或 fan/fault 對應。 |
+| CRPS / CFFPS PSU | PMBus + FRU EEPROM / vendor commands | `pmbus` / vendor driver + phosphor-power | 需處理 presence、redundancy、AC lost、fault LED、hot-plug。 |
+| PSU fan | PMBus fan command 或 PSU 內部 controller | `fan*_input` → `fan_tach` sensor | 很多 PSU fan 只回報 RPM 與 fault，不由 BMC PWM 直接控制。 |
+| PSU presence | GPIO、CPLD、PMBus ACK、FRU EEPROM | phosphor-power / GPIO monitor / platform daemon | GPIO 極性、CPLD bit、I2C NACK 與真正拔除需分開判讀。 |
+| PSU fault / health | PMBus `STATUS_WORD` / `STATUS_*`、GPIO fault、CPLD latch | phosphor-power / vendor daemon / event monitor | `STATUS_WORD` 通常需搭配 `STATUS_INPUT` / `STATUS_TEMPERATURE` / `STATUS_FANS` 等細項解讀。 |
+
+##### 12.10.4 Porting 前需確認的硬體與規格資料
+
+```text
+[必填] PSU 型號、廠商、form factor（CRPS / CFFPS / 客製）
+[必填] PSU 數量與 slot 編號（PSU0、PSU1、...）
+[必填] I2C bus number、mux channel、7-bit address
+[必填] 使用通用 pmbus driver 或 vendor-specific driver
+[必填] PMBus command 支援清單：READ_VIN、READ_VOUT、READ_IIN、READ_IOUT、READ_PIN、READ_POUT、READ_TEMPERATURE、READ_FAN_SPEED、STATUS_WORD 等
+[必填] PSU main output 與 standby output：12V、12VSB、48V、54V 或其他設計
+[必填] Presence 偵測來源：GPIO、CPLD bit、I2C ACK、FRU EEPROM、PMBus read
+[必填] Fault / AC OK / DC OK / PSU FAIL / fan fault 訊號來源與極性
+[建議] FRU / Asset data 來源：EEPROM、PMBus MFR_ID / MFR_MODEL / MFR_SERIAL
+[建議] 冗餘策略：1+1、N+1、N+N、cold redundancy、active/standby
+[建議] Threshold：輸入電壓上下限、輸出電壓上下限、功率上限、溫度上限、fan RPM 下限
+```
+
+PMBus 常見 command 與 hwmon 對應：
+
+| PMBus command | Command code | 常見 sysfs / label | 單位 | 說明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `READ_VIN` | `0x88` | `inX_input`, `inX_label=vin` | mV | 輸入電壓。 |
+| `READ_IIN` | `0x89` | `currX_input`, `currX_label=iin` | mA | 輸入電流。 |
+| `READ_VOUT` | `0x8B` | `inX_input`, `inX_label=voutY` | mV | 輸出電壓。 |
+| `READ_IOUT` | `0x8C` | `currX_input`, `currX_label=ioutY` | mA | 輸出電流。 |
+| `READ_TEMPERATURE_1` | `0x8D` | `tempX_input` | m°C | PSU 內部溫度。 |
+| `READ_FAN_SPEED_1` | `0x90` | `fanX_input` | RPM | PSU 內部風扇轉速。 |
+| `READ_POUT` | `0x96` | `powerX_input`, `powerX_label=poutY` | µW | 輸出功率。 |
+| `READ_PIN` | `0x97` | `powerX_input`, `powerX_label=pin` | µW | 輸入功率。 |
+| `STATUS_WORD` | `0x79` | `*_alarm` / `*_fault` 或 vendor daemon | bit field | PSU 總狀態。 |
+
+##### 12.10.5 I2C / PMBus 通訊驗證
+
+```bash
+i2cdetect -y 4
+
+# READ_VIN，word read；回傳是 PMBus raw format，不建議直接把十六進位值當電壓
+i2cget -y 4 0x58 0x88 w
+
+# READ_PIN
+i2cget -y 4 0x58 0x97 w
+
+# STATUS_WORD
+i2cget -y 4 0x58 0x79 w
+```
+
+注意事項：
+
+- `i2cdetect` / `i2cget` 對某些 device 可能造成副作用；bring-up 前需確認同 bus 上 device 可接受這類 access。
+- `i2cget ... w` 顯示的是 SMBus word，endianness 與 PMBus Linear-11 / Linear-16 解碼需另外處理；進入 kernel hwmon 後，driver 會轉成標準單位。
+- 若 bus 上有 I2C mux，需確認 mux channel、idle disconnect 設定與 BMC service 是否會改變 mux 狀態。
+- I2C NACK 不一定代表 PSU 被拔除，也可能是 AC lost、standby rail 未穩、PSU booting、bus stuck 或 CPLD gate 關閉。
+
+##### 12.10.6 Kernel Driver 與 Device Tree
+
+Linux PMBus driver 通常不會任意掃描所有位址來尋找 PSU，需透過 Device Tree、board file 或 runtime `new_device` 明確建立 I2C client。`i2cdetect` 看得到位址，不代表 kernel driver 已經 bind。
+
+```dts
+&i2c4 {
+    status = "okay";
+    clock-frequency = <100000>;
+
+    psu0: power-supply@58 {
+        compatible = "pmbus";
+        reg = <0x58>;
+        label = "psu0";
+    };
+
+    psu1: power-supply@59 {
+        compatible = "pmbus";
+        reg = <0x59>;
+        label = "psu1";
+    };
+};
+```
+
+Kernel config 檢查：
+
+```text
+CONFIG_I2C=y
+CONFIG_HWMON=y
+CONFIG_PMBUS=y
+CONFIG_SENSORS_PMBUS=y
+CONFIG_SENSORS_IBM_CFFPS=y        # 若使用 IBM CFFPS
+CONFIG_SENSORS_INSPUR_IPSPS=y     # 若使用 Inspur PSU
+```
+
+```bash
+dmesg | grep -Ei 'pmbus|cffps|ipsps|psu|power-supply'
+ls -l /sys/bus/i2c/devices/4-0058/
+readlink /sys/bus/i2c/devices/4-0058/driver
+
+# 臨時驗證 driver bind
+modprobe pmbus
+echo pmbus 0x58 > /sys/bus/i2c/devices/i2c-4/new_device
+```
+
+##### 12.10.7 hwmon sysfs 節點與單位確認
+
+```bash
+for i in /sys/class/hwmon/hwmon*; do
+    echo "$i: $(cat "$i/name" 2>/dev/null)"
+done
+
+HWMON=/sys/class/hwmon/hwmonX
+cat $HWMON/name
+ls $HWMON
+cat $HWMON/in1_input       # voltage, mV
+cat $HWMON/in1_label       # vin / vout1 / ...
+cat $HWMON/curr1_input     # current, mA
+cat $HWMON/curr1_label     # iin / iout1 / ...
+cat $HWMON/power1_input    # power, µW
+cat $HWMON/power1_label    # pin / pout1 / ...
+cat $HWMON/temp1_input     # temperature, m°C
+cat $HWMON/fan1_input      # RPM
+```
+
+hwmon 標準單位：
+
+```text
+in*_input       millivolt (mV)
+curr*_input     milliampere (mA)
+power*_input    microwatt (µW)
+temp*_input     millidegree Celsius (m°C)
+fan*_input      RPM
+```
+
+PSUSensor 會依 hwmon label 與 Entity Manager 設定建立 sensor。Bring-up 時建議建立「label → sysfs → D-Bus path」對照表，而不是假設 `in1` 一定是輸入電壓、`in2` 一定是輸出電壓。
+
+```bash
+for f in $HWMON/*_label; do
+    base=${f%_label}
+    echo "$(basename "$base") label=$(cat "$f") input=$(cat "${base}_input" 2>/dev/null)"
+done
+
+find $HWMON -maxdepth 1 -type f | grep -E 'alarm|fault|crit|max|min' | sort
+```
+
+##### 12.10.8 Entity Manager 配置
+
+不同 OpenBMC 分支的 schema 與 dbus-sensors 支援欄位會有差異；以下為常見結構，實際需以專案 branch 的 schema、既有平台 JSON 與 `PSUSensorMain.cpp` 支援項目為準。
+
+```json
+{
+    "Name": "PSU0",
+    "Type": "PowerSupply",
+    "Probe": "TRUE",
+    "Exposes": [
+        {
+            "Name": "PSU0",
+            "Type": "pmbus",
+            "Bus": 4,
+            "Address": "0x58",
+            "PollRate": 5.0,
+            "Labels": ["vin", "vout1", "iin", "iout1", "pin", "pout1", "temp1", "fan1"],
+            "vin_Name": "PSU0_Input_Voltage",
+            "vout1_Name": "PSU0_Output_Voltage",
+            "iin_Name": "PSU0_Input_Current",
+            "iout1_Name": "PSU0_Output_Current",
+            "pin_Name": "PSU0_Input_Power",
+            "pout1_Name": "PSU0_Output_Power",
+            "temp1_Name": "PSU0_Temp",
+            "fan1_Name": "PSU0_Fan"
+        }
+    ],
+    "xyz.openbmc_project.Inventory.Decorator.Asset": {
+        "Manufacturer": "[待填]",
+        "Model": "[待填]",
+        "PartNumber": "[待填]",
+        "SerialNumber": "[待填]"
+    }
+}
+```
+
+PSU 需和 chassis / baseboard 建立供電關係，讓 Redfish 能把 sensor 與 power supply inventory 正確關聯。常見概念是 baseboard 端建立 `powered_by` port，PSU 端建立 `powering` port；實際 JSON 寫法需依專案 schema 確認。
+
+##### 12.10.9 PSU Presence、Fault 與 Inventory
+
+PSU presence 常見來源：GPIO、CPLD、PMBus ACK、FRU EEPROM。建議判讀原則：
+
+| 情境 | Presence | Functional / Health | Sensor 行為 |
+| :--- | :--- | :--- | :--- |
+| PSU 拔除 | false | false 或 unavailable | sensor 可移除、標記 unavailable，或依平台策略保留但不更新。 |
+| PSU 插入且正常 | true | true | sensor 正常更新。 |
+| PSU 插入但 AC lost | true | false / warning | input voltage/power 可能為 0 或 unavailable，需產生事件。 |
+| PSU 插入但 PMBus timeout | true 或待確認 | false / unavailable | 需區分 bus stuck、PSU booting、driver issue。 |
+| PSU fan fault / OT / OC | true | false | D-Bus health 與 log 要能反映。 |
+
+```bash
+systemctl list-units | grep -Ei 'psu|power'
+journalctl -b | grep -Ei 'psu|power supply|redundan|pmbus|cffps'
+```
+
+##### 12.10.10 啟動服務與 D-Bus 驗證
+
+```bash
+systemctl status xyz.openbmc_project.EntityManager.service --no-pager
+journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager
+
+systemctl status xyz.openbmc_project.PSUSensor.service --no-pager
+journalctl -u xyz.openbmc_project.PSUSensor.service -b --no-pager
+
+busctl tree xyz.openbmc_project.PSUSensor
+busctl tree xyz.openbmc_project.ObjectMapper | grep -Ei 'PSU|PowerSupply|Input|Output'
+
+busctl get-property \
+  xyz.openbmc_project.PSUSensor \
+  /xyz/openbmc_project/sensors/voltage/PSU0_Input_Voltage \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+```
+
+##### 12.10.11 Redfish / IPMI / Event 驗證
+
+```bash
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Power
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/PowerSubsystem
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/PowerSubsystem/PowerSupplies
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Sensors
+
+ipmitool sdr list | grep -Ei 'psu|power|vin|vout|pin|pout|fan'
+ipmitool sensor | grep -Ei 'psu|power|vin|vout|pin|pout|fan'
+ipmitool sel list
+
+journalctl -b | grep -Ei 'psu|power supply|threshold|critical|warning|fault'
+```
+
+需驗證拔除、插入、AC lost、fan fault、over temperature、over current、threshold event、Redundancy 狀態與 SEL / Journal 行為。
+
+##### 12.10.12 進階除錯與常見陷阱
+
+| 問題現象 | 可能方向 | 排查 / 解法 |
+| :--- | :--- | :--- |
+| `i2cdetect` 掃不到 PSU 位址 | PSU 未插入、AC/standby 未供電、bus / mux / address 錯誤、CPLD gate 關閉 | 確認 PSU slot、AC、mux channel、schematic bus、CPLD register；量測 SCL/SDA。 |
+| `i2cdetect` 看得到，但無 hwmon | DTS 未建立 I2C client、driver 未啟用、compatible 不對 | 查 `dmesg`、`/sys/bus/i2c/devices`、kernel config；臨時用 `new_device` 驗證。 |
+| hwmon 有節點但讀值為 0 | PSU standby、command 不支援、driver 判讀錯、PSU 尚未 ready | 對照 PMBus command list；等待 PSU ready；確認 12V main / 12VSB 狀態。 |
+| 讀值倍率錯 | hwmon 單位與 D-Bus 單位換算錯、重複 scaling、vendor direct format 參數錯 | 同步比對 raw PMBus、sysfs、D-Bus、Redfish；確認 scale/offset 是否重複。 |
+| D-Bus sensor 未出現 | Entity Manager JSON 未載入、Labels 不符、service 未啟動 | 查 Entity Manager log、PSUSensor log、`*_label` 檔案；確認 `Labels` 對上 hwmon label。 |
+| Redfish 看不到 PSU | Association 不完整、inventory path 不符、bmcweb schema/feature 差異 | 檢查 Port association、ObjectMapper、bmcweb log。 |
+| Presence 不正確 | GPIO 極性錯、CPLD bit 定義錯、PMBus timeout 被當拔除 | 拔插實測 GPIO/CPLD bit；區分 Present 與 Functional。 |
+| PSU fault 無 log | STATUS command 未讀、fault bit 未對應 event、daemon 未啟用 | 檢查 `STATUS_WORD`、`*_alarm`、phosphor-power log 與 event mapping。 |
+
+##### 12.10.13 PSU Sensor Porting 驗收 Checklist
+
+```text
+硬體 / 規格：
+[ ] PSU 型號、form factor、slot 編號確認
+[ ] I2C bus / mux channel / address 確認
+[ ] PMBus command 支援清單確認
+[ ] Presence / Fault / AC OK / DC OK 訊號來源與極性確認
+[ ] FRU / Asset data 來源確認
+[ ] Redundancy policy 確認
+[ ] Thresholds 與額定範圍確認
+
+Kernel / DTS：
+[ ] I2C controller node status = okay
+[ ] PSU I2C node compatible / reg 正確
+[ ] CONFIG_PMBUS / CONFIG_SENSORS_PMBUS / vendor driver 啟用
+[ ] dmesg 無 probe fail / timeout / bus error
+[ ] /sys/bus/i2c/devices/<bus>-00<addr>/driver bind 正確
+[ ] /sys/class/hwmon/hwmonX/name 對應 PSU driver
+[ ] in / curr / power / temp / fan hwmon 節點存在且單位正確
+[ ] *_label 對應 vin / vout / iin / iout / pin / pout / temp / fan
+
+Entity Manager / Userspace：
+[ ] PSU JSON 放入正確 layer / image
+[ ] Type / Bus / Address / Labels 與 schema 對齊
+[ ] <label>_Name 命名符合平台規範
+[ ] PollRate 合理，I2C bus loading 可接受
+[ ] Baseboard / Chassis / PSU association 完成
+[ ] Presence / fault daemon 配置完成
+[ ] FRU / Asset 可讀取或以平台資料補齊
+
+D-Bus / Redfish / IPMI：
+[ ] PSUSensor service 啟動無錯誤
+[ ] busctl 可看到 voltage / current / power / temperature / fan_tach sensor
+[ ] sensor Value 與 sysfs 換算一致
+[ ] Availability / Functional 狀態符合插拔與故障情境
+[ ] Redfish 可看到 PSU inventory 與 sensors
+[ ] IPMI SDR / sensor reading / SEL 符合平台需求
+[ ] 拔除 PSU、插入 PSU、AC lost、fault injection 行為都有驗證
+[ ] critical / warning threshold 與 event log 可正常觸發
+```
+
+##### 12.10.14 PSU Sensor 資料表範本
+
+| PSU Slot | I2C Bus | Mux Channel | Address | Driver | hwmon name | Label | sysfs | D-Bus Path | Presence Source | Fault Source | 備註 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| PSU0 | 4 | [待填] | 0x58 | pmbus | [待填] | vin | inX_input | /xyz/openbmc_project/sensors/voltage/PSU0_Input_Voltage | GPIO/CPLD/PMBus | STATUS_WORD/CPLD | [待填] |
+| PSU0 | 4 | [待填] | 0x58 | pmbus | [待填] | pout1 | powerX_input | /xyz/openbmc_project/sensors/power/PSU0_Output_Power | GPIO/CPLD/PMBus | STATUS_WORD/CPLD | [待填] |
+| PSU0 | 4 | [待填] | 0x58 | pmbus | [待填] | temp1 | tempX_input | /xyz/openbmc_project/sensors/temperature/PSU0_Temp | GPIO/CPLD/PMBus | STATUS_WORD/CPLD | [待填] |
+| PSU0 | 4 | [待填] | 0x58 | pmbus | [待填] | fan1 | fanX_input | /xyz/openbmc_project/sensors/fan_tach/PSU0_Fan | GPIO/CPLD/PMBus | STATUS_FANS/CPLD | [待填] |
+
+##### 12.10.15 本節參考資料
+
+- Linux Kernel Documentation - Kernel driver pmbus: https://docs.kernel.org/hwmon/pmbus.html
+- OpenBMC dbus-sensors README 與 PSUSensor source: https://github.com/openbmc/dbus-sensors
+- OpenBMC Entity Manager README / schema / configurations: https://github.com/openbmc/entity-manager
+- OpenBMC phosphor-power: https://github.com/openbmc/phosphor-power
+
 #### 12.11 CPU / PECI Sensor
 #### 12.12 NVMe Sensor
 #### 12.13 GPU Sensor
