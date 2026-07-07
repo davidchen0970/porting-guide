@@ -58,6 +58,7 @@
 | 2026-07-06 |  0.14 | Copilot | 增加 OpenBMC 常用 Project, 放在 CH11, 原有的 CH11 向後挪一章 |
 | 2026-07-07 |  0.15 | Copilot | 撰寫第一章 Boot Flow 與 SoC 初始化 |
 | 2026-07-07 |  0.16 | Copilot | 撰寫 Current Sensor |
+| 2026-07-07 |  0.17 | Copilot | 撰寫 Power Sensor |
 
 ### 0.7 資料來源可信度分級
 
@@ -6583,6 +6584,620 @@ D-Bus / Redfish / IPMI：
 - Linux INA2xx hwmon documentation：INA2xx 類 current shunt / power monitor 會量測 shunt drop 與 bus voltage，shunt resistor 可由 platform data、device tree 或部分 sysfs attribute 指定。
 
 #### 12.7 Power Sensor
+
+##### 12.7.1 適用情境
+
+Power Sensor 用於監控系統中各元件或電源路徑的功耗，常用於能源效率評估、散熱設計驗證、功率預算管理、power capping、PSU redundancy、長測趨勢分析，以及現場耗電異常排查。
+
+常見監控對象包含：
+
+```text
+PSU input power：電源供應器輸入功率，常用於整機 AC / DC 輸入耗電
+PSU output power：電源供應器輸出功率，常用於 PSU loading 與 redundancy 判斷
+CPU package power：CPU 封裝功率，可能由 CPU telemetry、PECI 或 VR PMBus 間接取得
+GPU power：GPU 或 accelerator 模組功率，可能由 MCTP / PLDM、SMBPBI 或 vendor path 提供
+Board power：主機板總功耗，可能由 HSC、PSU output 或 V × I 彙總取得
+VR power：電壓調節模組輸出功率，例如 Vcore / DIMM rail power
+DIMM power：記憶體模組或 memory rail 功耗
+NVMe power：NVMe / EDSFF / U.2 / M.2 裝置功耗，可能由 NVMe-MI / PLDM 或平台控制器提供
+```
+
+在 OpenBMC 中，Power Sensor 最終應以標準 sensor object 呈現，典型 D-Bus path 為：
+
+```text
+/xyz/openbmc_project/sensors/power/<sensor_name>
+```
+
+Power Sensor 的 D-Bus `Value` 建議以 Watt（W）檢查與記錄；底層 Linux hwmon `power*_input` 通常是 microWatt（µW）。因此 porting 時需要明確記錄「底層 sysfs 單位」、「daemon 是否已換算」以及「D-Bus 顯示單位」。
+
+##### 12.7.2 資料路徑
+
+Power Sensor 的資料來源可分為四類：PMBus 直接讀取功率、軟體 V × I 計算、CPU / GPU / NVMe telemetry，以及平台虛擬彙總功率。
+
+###### 路徑 A：PMBus 直接讀取功率（硬體計算）
+
+```text
+VR Controller / PSU / Hot-swap Controller / Power Monitor 內建功率計算
+    ↓
+PMBus command：READ_POUT / READ_PIN
+    ↓
+Linux PMBus driver 或 chip-specific hwmon driver
+    ↓
+hwmon sysfs：/sys/class/hwmon/hwmonX/power*_input
+    ↓
+PSUSensor / Hwmon 類 sensor daemon / 平台 sensor daemon
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/power/<Name>
+```
+
+此路徑由硬體或 device firmware 直接計算功率，通常比單純 V × I 的軟體計算更接近 device 自身定義的 telemetry。VR、PSU、hot-swap controller、INA233 / INA2xx / LTC 類 power monitor 都可能提供此類資料。
+
+###### 路徑 B：軟體計算功率（V × I）
+
+```text
+Voltage Sensor：/xyz/openbmc_project/sensors/voltage/<voltage_name>
+Current Sensor：/xyz/openbmc_project/sensors/current/<current_name>
+    ↓
+ExternalSensor / VirtualSensor / 客製 daemon 定期讀取兩者
+    ↓
+計算 P = V × I
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/power/<Name>
+```
+
+此路徑適合硬體沒有 `READ_POUT` / `READ_PIN`，但已有穩定 Voltage Sensor 與 Current Sensor 的場景，例如分流電阻 + ADC 架構。主要風險是 voltage 與 current 的取樣時間不一致、量測點不完全相同、單位已被重複換算，以及負載快速變動造成瞬時誤差。
+
+###### 路徑 C：CPU / GPU / NVMe / Accelerator telemetry
+
+```text
+CPU / GPU / NVMe / Accelerator 內部 telemetry
+    ↓
+PECI / MCTP / PLDM / SMBus / SMBPBI / vendor interface
+    ↓
+對應 userspace daemon 或 kernel driver
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/power/<Name>
+```
+
+此路徑常見於 CPU package power、GPU board power、NVMe power state 或 accelerator 功率。數值來源可能是裝置內部估算，不一定等同於 board rail 上的實際輸入功率，因此文件中需清楚標示 measure point 與資料來源。
+
+###### 路徑 D：平台虛擬彙總功率
+
+```text
+多個 power / voltage / current sensors
+    ↓
+VirtualSensor / ExternalSensor / platform daemon
+    ↓
+加總、扣除、平均或效率計算
+    ↓
+D-Bus：/xyz/openbmc_project/sensors/power/<Name>
+```
+
+常見用途包含 board total power、CPU domain total power、GPU tray total power、PSU total output power 或整機估算功率。彙總功率應避免重複計入同一能量路徑，例如 PSU output power 已包含所有 downstream rail，再加上 CPU VR power 會造成 double counting。
+
+##### 12.7.3 常見來源分類與特性
+
+| 來源類型 | 讀取介面 | Linux / OpenBMC 對應 | 關鍵注意事項 |
+| :--- | :--- | :--- | :--- |
+| PMBus VR | `READ_POUT` (`0x96`) | PMBus hwmon、VR chip driver、Hwmon 類 daemon | 需確認 Page / Phase、POUT scaling、host power state |
+| PMBus PSU | `READ_PIN` (`0x97`) / `READ_POUT` (`0x96`) | PMBus hwmon、PSUSensor | input 與 output power 需分開命名與驗證 |
+| Hot-swap / eFuse / HSC | PMBus / I2C / register | hwmon、PMBus 或平台 daemon | 通常同時有 current、voltage、power、fault latch |
+| INA233 / INA2xx / INA3221 | I2C / PMBus / hwmon | `ina2xx` / `ina233` / `ina3221` driver | shunt resistor、calibration、channel label 需對齊 BOM |
+| 軟體 V × I | D-Bus 或 sysfs | ExternalSensor / VirtualSensor / 客製 daemon | Voltage / Current 需同量測點、同單位、同 power state |
+| CPU package power | PECI / CPU telemetry / VR PMBus | IntelCPUSensor、PECI、VR hwmon | CPU package power 與 VR input/output power 定義不同 |
+| GPU power | MCTP / PLDM / SMBPBI / vendor path | GPU sensor daemon / ExternalSensor | 需注意 GPU presence、driver readiness、功率限制狀態 |
+| NVMe power | NVMe-MI / PLDM / vendor path | NVMe sensor daemon / ExternalSensor | 多數為裝置內部狀態或估算，需標示來源 |
+| Board total power | PSU output、HSC input、sensor 加總 | PSUSensor / VirtualSensor | 需避免 double counting，並定義 AC input 或 DC board input |
+
+##### 12.7.4 單位與 ScaleFactor 設計原則
+
+Power Sensor 必須先分清楚三層單位：
+
+```text
+PMBus raw word：Linear11 / Linear16 / Direct format，依 device 與 driver 轉換
+Linux hwmon power*_input：通常為 microwatt（µW）
+OpenBMC D-Bus Sensor.Value：Power Sensor 建議以 Watt（W）檢查
+```
+
+Linux hwmon sysfs 規範中，`power[1-*]_input` 是 instantaneous power use，power 類屬性單位通常為 microWatt。換算如下：
+
+```text
+cat power1_input = 15000000
+=> 15,000,000 µW
+=> 15 W
+```
+
+常見 ScaleFactor 判斷：
+
+```text
+若 daemon 已將 hwmon µW 轉成 D-Bus W：ScaleFactor = 1.0
+若 daemon 直接把 power*_input 當 D-Bus value：ScaleFactor = 0.000001
+若來源是 mW：ScaleFactor = 0.001
+若來源已是 W：ScaleFactor = 1.0
+```
+
+PMBus `READ_POUT` / `READ_PIN` 可能以 Linear 或 Direct 格式回傳。Linux PMBus core 與 chip-specific driver 通常會依 driver info、device capability 或 direct coefficient 轉成 hwmon 單位。若出現固定比例誤差，需確認：
+
+```text
+[ ] 該 device 是否由 chip-specific driver 支援，或只使用 generic pmbus
+[ ] 功率 channel 是 Linear11、Linear16 還是 Direct format
+[ ] driver 中 m / b / R 係數是否符合 datasheet
+[ ] device NVM / register 內 POUT exponent / scale 是否與 driver 設定一致
+[ ] sysfs power*_input 是 µW、mW、W 還是 raw-like value
+[ ] OpenBMC daemon 是否已自行把 µW 轉成 W
+```
+
+若 voltage sensor 以 V，current sensor 以 A 發佈：
+
+```text
+Power_W = Voltage_V × Current_A
+```
+
+若底層仍是 mV 與 mA：
+
+```text
+Power_W = Voltage_mV × Current_mA / 1,000,000
+```
+
+PSU 與 VR 常同時具有 input power 與 output power：
+
+```text
+Input Power：進入 PSU / VR / HSC 的功率
+Output Power：由 PSU / VR 輸出到下游負載的功率
+Efficiency = Output Power / Input Power
+Loss = Input Power - Output Power
+```
+
+命名時建議保留方向，例如 `PSU0_INPUT_POWER`、`PSU0_OUTPUT_POWER`、`CPU0_VCORE_VR_INPUT_POWER`、`CPU0_VCORE_OUTPUT_POWER`。若只記錄 `CPU0_POWER`，後續很難判斷它代表 CPU package power、VR output power、VR input power 或 board rail 估算功率。
+
+##### 12.7.5 Porting 路徑 A：PMBus 直接讀取功率
+
+###### Step A1：確認硬體資訊與功率 channel
+
+從 schematic、BOM、power tree、VR / PSU / HSC datasheet 取得：
+
+```text
+[ ] 裝置型號，例如 MP2971、TPS53679、PSU 模組、ADM127x、INA233
+[ ] I2C bus number、mux channel、7-bit address
+[ ] PMBus Page 對應 rail，例如 Page 0 = Vcore、Page 1 = VCCGT
+[ ] PMBus Phase 是否會影響功率讀值
+[ ] 目標命令：READ_POUT（0x96）或 READ_PIN（0x97）
+[ ] Power format：Linear / Direct / vendor-specific
+[ ] POUT / PIN scale、exponent、coefficient 或 calibration 來源
+[ ] 是否需要 host power on、rail enable 或 PSU on 才更新 telemetry
+[ ] 是否有 hardware averaging、update interval 或 telemetry cache
+[ ] fault / warning limit：POUT_OP_WARN_LIMIT、PIN_OP_WARN_LIMIT 等
+```
+
+PMBus command 對照：
+
+| Command | Code | 功能 | 常見 sensor 命名 |
+| --- | ---: | --- | --- |
+| `READ_POUT` | `0x96` | 輸出功率 | `*_OUTPUT_POWER`、`*_VCORE_POWER` |
+| `READ_PIN` | `0x97` | 輸入功率 | `*_INPUT_POWER` |
+| `POUT_OP_WARN_LIMIT` | `0x6A` | output power warning limit | threshold 參考 |
+| `PIN_OP_WARN_LIMIT` | `0x6B` | input power warning limit | threshold 參考 |
+
+###### Step A2：I2C / PMBus 基本通訊驗證
+
+```bash
+# 掃描指定 bus；需先確認可安全使用
+i2cdetect -y <bus>
+
+# 視 device 是否支援，讀 MFR_ID / MFR_MODEL
+i2cget -y <bus> <addr> 0x99
+i2cget -y <bus> <addr> 0x9A
+
+# 設定 PAGE = 0
+i2cset -y <bus> <addr> 0x00 0x00
+
+# READ_POUT = 0x96，word read
+i2cget -y <bus> <addr> 0x96 w
+
+# READ_PIN = 0x97，word read
+i2cget -y <bus> <addr> 0x97 w
+```
+
+注意事項：
+
+```text
+- i2cget ... w 顯示的 word 可能需要 byte swap 才能解讀為 PMBus raw word。
+- raw word 非 0 不代表 driver conversion 一定正確，仍需比對 hwmon sysfs 與外部功率計。
+- host off、VR disabled、PSU standby 或 telemetry disabled 時，READ_POUT / READ_PIN 可能回 0、NACK、0xffff 或 stale value。
+- 不建議在不了解 device 行為時寫入 warning / fault limit 或 calibration register。
+```
+
+###### Step A3：Device Tree / driver binding
+
+PMBus VR 範例：
+
+```dts
+&i2c8 {
+    status = "okay";
+    clock-frequency = <100000>;
+
+    vr-controller@40 {
+        compatible = "mps,mp2971";
+        reg = <0x40>;
+        label = "cpu0_vr";
+    };
+};
+```
+
+INA233 / PMBus power monitor 範例：
+
+```dts
+&i2c8 {
+    status = "okay";
+
+    power-monitor@45 {
+        compatible = "ti,ina233";
+        reg = <0x45>;
+        label = "p12v_power_monitor";
+    };
+};
+```
+
+Kernel config 檢查方向：
+
+```text
+CONFIG_HWMON
+CONFIG_I2C
+CONFIG_PMBUS
+CONFIG_SENSORS_PMBUS
+CONFIG_SENSORS_INA2XX / CONFIG_SENSORS_INA233 / CONFIG_SENSORS_INA3221
+對應 VR / PSU / HSC chip-specific driver，例如 MP297x、TPS536xx、ADM127x、LTC、MAX、IR 等
+```
+
+###### Step A4：確認 driver probe 與 hwmon sysfs
+
+```bash
+dmesg | grep -Ei 'pmbus|mp297|tps536|ina2|ina233|adm127|ltc|psu|hwmon|i2c'
+
+for h in /sys/class/hwmon/hwmon*; do
+    echo "== $h =="
+    cat "$h/name" 2>/dev/null || true
+    for f in "$h"/power*_label "$h"/power*_input "$h"/in*_input "$h"/curr*_input; do
+        [ -e "$f" ] && echo "$(basename "$f")=$(cat "$f")"
+    done
+done
+```
+
+若 `power*_label` 存在，優先用 label 建立 mapping；若不存在，需依 Page、driver 文件、負載變化與 PMBus manual read 建立對照。
+
+```text
+power1_input = 15000000 → 15 W
+power2_input = 0        → 0 W，可能是 rail off、Page 錯、command unsupported 或尚未更新
+```
+
+###### Step A5：量測與對照
+
+| 負載狀態 | sysfs `power*_input` | sysfs 換算 W | D-Bus W | 外部功率計 / PSU W | 誤差 | 備註 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Host off / standby | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+| Host on idle | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+| CPU / GPU stress | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+
+若誤差固定為 1000 或 1,000,000 倍，通常是 mW / µW / W 換算問題。若誤差隨負載增加，需檢查 update interval、averaging、量測點差異、PSU efficiency、VR loss 與時間同步。
+
+##### 12.7.6 Porting 路徑 B：軟體計算功率（V × I）
+
+###### Step B1：確認 Voltage 與 Current Sensor 已正常運作
+
+```bash
+busctl tree /xyz/openbmc_project/sensors/voltage
+busctl tree /xyz/openbmc_project/sensors/current
+
+busctl get-property \
+  <voltage_service> \
+  /xyz/openbmc_project/sensors/voltage/CPU0_VCCIN \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+
+busctl get-property \
+  <current_service> \
+  /xyz/openbmc_project/sensors/current/CPU0_VCORE_CURRENT \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+```
+
+###### Step B2：確認量測點一致性
+
+```text
+[ ] Voltage sensor 量到的是同一 rail 的輸出電壓
+[ ] Current sensor 量到的是同一 rail 的輸出電流
+[ ] Current sensor 不是 upstream input current，也不是多 rail total current
+[ ] Voltage / Current 皆受相同 PowerState 控制
+[ ] PollInterval 接近，且負載快速變化時可接受誤差
+```
+
+常見不一致情境：
+
+```text
+V = CPU Vcore output voltage，但 I = VR input current → P 不是 CPU Vcore output power
+V = PSU output 12V，但 I = board branch current → P 是 branch power，不是 PSU output power
+V = nominal voltage 固定值，但 I 為即時電流 → P 為估算值，不適合高精度 power capping
+```
+
+###### Step B3：ExternalSensor / VirtualSensor 配置
+
+```json
+{
+  "Name": "CPU0_VCORE_POWER",
+  "Type": "ExternalSensor",
+  "PollInterval": 1000,
+  "PowerState": "On",
+  "SensorType": "power",
+  "ScaleFactor": 1.0,
+  "MaxValue": 300.0,
+  "MinValue": 0.0,
+  "Configuration": {
+    "VoltageSensor": "/xyz/openbmc_project/sensors/voltage/CPU0_VCCIN",
+    "CurrentSensor": "/xyz/openbmc_project/sensors/current/CPU0_VCORE_CURRENT",
+    "Formula": "voltage * current"
+  },
+  "Thresholds": [
+    {
+      "Name": "upper critical",
+      "Direction": "greater than",
+      "Severity": 1,
+      "Value": 250.0
+    },
+    {
+      "Name": "upper non critical",
+      "Direction": "greater than",
+      "Severity": 0,
+      "Value": 200.0
+    }
+  ]
+}
+```
+
+若 voltage / current 已是 D-Bus V / A，`Formula = voltage * current` 的結果就是 W。若讀取來源是 mV / mA，需在 formula 或 ScaleFactor 統一換算。
+
+##### 12.7.7 Entity Manager / Sensor JSON 配置
+
+###### PMBus VR output power 範例
+
+```json
+{
+  "Name": "CPU0_VCORE_POWER",
+  "Type": "MP2971",
+  "Bus": 8,
+  "Address": "0x40",
+  "Page": 0,
+  "PollInterval": 500,
+  "ScaleFactor": 1.0,
+  "Offset": 0.0,
+  "MaxValue": 300.0,
+  "MinValue": 0.0,
+  "PowerState": "On",
+  "Thresholds": [
+    {
+      "Name": "upper critical",
+      "Direction": "greater than",
+      "Severity": 1,
+      "Value": 250.0
+    },
+    {
+      "Name": "upper non critical",
+      "Direction": "greater than",
+      "Severity": 0,
+      "Value": 200.0
+    }
+  ]
+}
+```
+
+###### PSU input power 範例
+
+```json
+{
+  "Name": "PSU0_INPUT_POWER",
+  "Type": "PSU",
+  "Bus": 4,
+  "Address": "0x58",
+  "PollInterval": 1000,
+  "ScaleFactor": 1.0,
+  "MaxValue": 1000.0,
+  "MinValue": 0.0,
+  "PowerState": "AlwaysOn",
+  "Thresholds": [
+    {
+      "Name": "upper critical",
+      "Direction": "greater than",
+      "Severity": 1,
+      "Value": 900.0
+    }
+  ]
+}
+```
+
+配置重點：
+
+```text
+- Name 必須清楚包含 input/output、rail/domain、device index。
+- Type 需與專案 sensor-info / schema / daemon 支援類型一致。
+- PMBus 多 Page 裝置需填 Page；若有 Phase，也需確認專案是否支援。
+- ScaleFactor 需依 daemon 對 hwmon µW 的處理方式設定。
+- PowerState 需符合功率來源：CPU / DIMM VR 通常 On；PSU input / standby rail 通常 AlwaysOn。
+- MaxValue / threshold 應與 power budget、PSU rating、VR rating、thermal design power 對齊。
+```
+
+##### 12.7.8 啟動服務與 D-Bus 驗證
+
+```bash
+systemctl list-units '*sensor*' --no-pager
+systemctl list-units '*psu*' --no-pager
+systemctl list-units '*external*' --no-pager
+
+systemctl restart xyz.openbmc_project.HwmonPowerSensor.service
+journalctl -u xyz.openbmc_project.HwmonPowerSensor.service -b --no-pager | tail -100
+
+journalctl -b --no-pager | grep -Ei 'power|pout|pin|psu|external|sensor|pmbus'
+
+busctl tree /xyz/openbmc_project/sensors
+busctl tree /xyz/openbmc_project/sensors/power
+
+busctl get-property \
+  <service_name> \
+  /xyz/openbmc_project/sensors/power/CPU0_VCORE_POWER \
+  xyz.openbmc_project.Sensor.Value \
+  Value
+
+busctl call xyz.openbmc_project.ObjectMapper \
+  /xyz/openbmc_project/object_mapper \
+  xyz.openbmc_project.ObjectMapper GetObject \
+  sas \
+  /xyz/openbmc_project/sensors/power/CPU0_VCORE_POWER \
+  0
+```
+
+建議至少比對四層：
+
+```text
+PMBus raw / V × I inputs
+    ↔ hwmon sysfs power*_input 或 source sensors
+        ↔ D-Bus Sensor.Value
+            ↔ Redfish / IPMI / logs
+```
+
+##### 12.7.9 Redfish / IPMI / Event / Power Policy 驗證
+
+```bash
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/Sensors | jq
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/Sensors/CPU0_VCORE_POWER | jq
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Chassis/<chassis>/PowerSubsystem | jq
+
+ipmitool sensor | grep -Ei 'power|watt|psu'
+ipmitool sdr elist | grep -Ei 'power|watt|psu'
+```
+
+驗證重點：
+
+```text
+[ ] Redfish sensor 名稱與 D-Bus path 對應
+[ ] Reading / Value 與 D-Bus 一致
+[ ] ReadingUnits 為 W 或可清楚表示 Watt
+[ ] Warning / Critical threshold 顯示正確
+[ ] Status.Health / State 與 D-Bus availability、operational status 一致
+[ ] 若 power sensor 作為 power cap input，確認 consumer 讀取的是正確 sensor
+[ ] 若 power sensor 用於 PSU redundancy，確認 PSU removal / fault / AC loss 時數值與 state 一致
+[ ] 若 power sensor 用於 thermal policy，確認高負載時數值上升與 fan response 時序合理
+```
+
+Event 驗證：
+
+```bash
+busctl introspect <service_name> \
+  /xyz/openbmc_project/sensors/power/CPU0_VCORE_POWER
+
+journalctl -b --no-pager | grep -Ei 'CPU0_VCORE_POWER|threshold|critical|warning|power'
+
+curl -k -u root:<password> \
+  https://<bmc-ip>/redfish/v1/Systems/system/LogServices/EventLog/Entries | jq
+```
+
+##### 12.7.10 進階除錯與常見陷阱
+
+| 問題現象 | 可能方向 | 排查 / 處理方式 |
+| :--- | :--- | :--- |
+| `power*_input` 不存在 | device 不支援 `READ_POUT` / `READ_PIN`；driver 未宣告 power capability；kernel config 未啟用 | 查 datasheet、driver Kconfig、`dmesg`、PMBus func flags；必要時使用 V × I 路徑 |
+| `power*_input` 讀值為 0 | Host off、VR disabled、PSU standby、Page 錯、telemetry 未更新 | 確認 power state、enable signal、PMBus PAGE、手動讀 `READ_POUT` / `READ_PIN` |
+| D-Bus sensor 未出現 | Entity Manager JSON `Type` / `Bus` / `Address` / `Page` 不符合 daemon 預期 | 查 Entity Manager log、sensor daemon log、ObjectMapper subtree |
+| 讀值固定大 1,000,000 倍 | µW 被當成 W | 確認 `power*_input` 單位；必要時 `ScaleFactor = 0.000001` |
+| 讀值固定小 1,000,000 倍 | 已轉 W 後又除以 1,000,000 | 比對 sysfs、D-Bus、Redfish，移除重複 scaling |
+| 讀值固定大或小 1000 倍 | mW / W 或 µW / mW 換算錯誤 | 查 driver output、daemon conversion、JSON ScaleFactor |
+| 多 Page 功率全部相同 | driver 未正確切 Page、JSON Page 未生效、讀到同一 channel | 手動設定 PAGE 後讀 `READ_POUT`；查 driver page support |
+| 軟體 V × I 與 PMBus POUT 差距大 | 量測點不同、時間不同步、V/I sensor scaling 錯、PMBus 是 averaged power | 對齊 measurement point；比對 fixed load；確認 update interval |
+| PSU input power 與 output power 不符 | PSU efficiency、loading、AC/DC input 定義不同 | 分別命名 input/output，使用 PSU datasheet efficiency curve 檢查 |
+| board total power 加總過大 | double counting，例如 PSU output + VR output 重複計入 | 建立 power tree，標示每個 sensor 所在能量路徑 |
+| 功率為負數 | Current sensor 為負、bidirectional sensor offset、formula sign 錯 | 回查 Current Sensor 方向與 offset；修正 formula 或 sign |
+| Redfish 顯示功率但數值不變 | daemon poll 未更新、PowerState gating、sysfs cache、bmcweb cache | 直接 `cat power*_input`，再比對 D-Bus 與 Redfish |
+| Threshold 觸發但無事件 | threshold interface 未建立、logging policy 未接、alarm flag 未變化 | 查 D-Bus threshold properties、phosphor-logging、EventLog |
+| Power capping 行為異常 | consumer 使用錯 sensor 或單位錯 | 查 power cap service config、D-Bus path、Value 單位與上限設定 |
+
+##### 12.7.11 Power Sensor Porting 驗收 Checklist
+
+硬體設計階段：
+
+```text
+[ ] Power source 類型確認：PMBus 直接讀取 / 軟體 V × I / CPU telemetry / GPU telemetry / NVMe / 虛擬加總
+[ ] Power tree 中量測點確認：input、output、rail、domain、package、board total
+[ ] 若為 PMBus：I2C bus、mux channel、address、Page、Phase 確認
+[ ] READ_POUT / READ_PIN 支援狀態確認
+[ ] PMBus POUT / PIN scale、exponent、coefficient 或 calibration 來源確認
+[ ] 若為 V × I：對應 Voltage Sensor 與 Current Sensor 的量測點一致
+[ ] 功率範圍、TDP、PSU rating、VR rating、warning、critical 門檻確認
+[ ] input power / output power 命名規則確認，避免後續判讀混淆
+```
+
+Device Tree / Kernel：
+
+```text
+[ ] I2C bus node status = "okay"
+[ ] I2C mux channel 與 bus number 對照完成
+[ ] PMBus / VR / PSU / INA / HSC device node 加入，compatible 與 reg 正確
+[ ] 必要 kernel config 已啟用，如 PMBus、chip-specific driver、INA2xx、hwmon
+[ ] 開機後 dmesg 無 probe failure、timeout、unsupported command 相關錯誤
+[ ] /sys/class/hwmon/hwmonX/name 可對應到目標 device
+[ ] power*_input 存在，且單位已確認為 µW 或平台定義值
+[ ] power*_label 或 Page 對照表已建立
+[ ] 若使用 V × I，voltage / current 來源 sensor 均已驗證
+[ ] 使用外部功率計、PSU telemetry 或穩定負載比對，工程誤差在可接受範圍內
+```
+
+Entity Manager / Userspace：
+
+```text
+[ ] JSON 設定檔加入正確 layer，並已編入 image
+[ ] Name 命名符合平台 sensor naming rule，且清楚標示 input/output
+[ ] Type 與 daemon / sensor-info / schema 定義一致
+[ ] PMBus 架構：Bus、Address、Page、PowerState 設定正確
+[ ] V × I 架構：VoltageSensor、CurrentSensor、Formula 設定正確
+[ ] ScaleFactor 已依 sysfs 單位確認，不重複換算 µW / mW / W
+[ ] PollInterval 符合需求，常見建議 500～1000 ms
+[ ] PowerState 設定符合功率來源，例如 CPU VR 使用 On、PSU input 使用 AlwaysOn
+[ ] Thresholds 與 power budget、PSU rating、VR rating、thermal policy、power cap policy 一致
+```
+
+D-Bus / Redfish / IPMI / Policy：
+
+```text
+[ ] 對應 sensor service 啟動無錯誤
+[ ] ObjectMapper 可找到 /xyz/openbmc_project/sensors/power/<Name>
+[ ] busctl get-property 可讀取 Value，且單位以 W 檢查合理
+[ ] Warning / Critical threshold property 存在且數值正確
+[ ] Redfish Sensor 或 PowerSubsystem 依平台需求可看到該 power sensor
+[ ] IPMI SDR / sensor list 依平台需求可看到該 sensor
+[ ] 施加負載變化時，sysfs、D-Bus、Redfish 數值同步變化
+[ ] Threshold 觸發時，D-Bus alarm flag、phosphor-logging、SEL / EventLog 行為符合預期
+[ ] 若用於 power capping / thermal control / PSU redundancy，consumer 讀取 path 與單位均已確認
+[ ] 若為 board total power，已確認沒有重複計入同一能量路徑
+```
+
+##### 12.7.12 Power Sensor 資料表範本
+
+| Sensor Name | Source Type | Device | Bus / Addr | Page / Channel | Raw sysfs / Source | sysfs unit | ScaleFactor | D-Bus unit | PowerState | Threshold | 備註 |
+| --- | --- | --- | --- | --- | --- | --- | ---: | --- | --- | --- | --- |
+| CPU0_VCORE_POWER | PMBus VR | MP2971 | 8 / 0x40 | Page 0 | power1_input | µW | 1.0 或 0.000001 | W | On | [待填] | READ_POUT |
+| PSU0_INPUT_POWER | PMBus PSU | PSU0 | 4 / 0x58 | input | power1_input | µW | [待填] | W | AlwaysOn | [待填] | READ_PIN |
+| PSU0_OUTPUT_POWER | PMBus PSU | PSU0 | 4 / 0x58 | output | power2_input | µW | [待填] | W | AlwaysOn | [待填] | READ_POUT |
+| CPU0_VCORE_POWER_EST | V × I | ExternalSensor | N/A | Vcore | voltage × current | V × A | 1.0 | W | On | [待填] | software calculated |
+| BOARD_INPUT_POWER | HSC | ADM127x | [待填] | input | power1_input | µW | [待填] | W | AlwaysOn | [待填] | board inlet |
+
+##### 12.7.13 本節參考資料
+
+- Linux kernel hwmon sysfs interface：`power[1-*]_input` 為 instantaneous power use，power 類屬性單位為 microWatt；hwmon sysfs 使用 fixed-point single-value 檔案格式。
+- Linux kernel PMBus driver documentation：PMBus driver 支援 voltage、current、power、temperature 等 sensor，且 PMBus device 通常需明確建立，不依賴安全自動 probe。
+- Linux PMBus register definitions：`READ_POUT = 0x96`、`READ_PIN = 0x97`，另有 `POUT_OP_WARN_LIMIT = 0x6A` 與 `PIN_OP_WARN_LIMIT = 0x6B` 可作 threshold 設計參考。
+- OpenBMC dbus-sensors README：sensor daemon 可從 hwmon、D-Bus 或 direct driver access 讀取資料，並以 `/xyz/openbmc_project/sensors/<type>/<sensor_name>` 發佈 D-Bus sensor object。
+
 #### 12.8 Fan Tach Sensor
 #### 12.9 PSU Sensor
 #### 12.10 CPU / PECI Sensor
