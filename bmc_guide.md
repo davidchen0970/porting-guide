@@ -16,74 +16,91 @@
 1. Boot Flow 與 SoC 初始化
    1.1 BMC SoC 典型開機流程
    1.2 Boot Strap / Reset Strap 原理
-   1.3 SPI-NOR / SPI-NAND / eMMC 初始化流程差異
-   1.4 DDR 初始化
+   1.3 Boot Media：SPI-NOR / SPI-NAND / eMMC 初始化流程差異
+   1.4 DDR 初始化與 early boot failure 判讀
    1.5 Watchdog 在開機各階段的角色
    1.6 各 SoC 開機流程差異速查
    1.7 Boot Failure 分類與排查入口
-   1.8 當前平台 Boot Strap 設定與實際量測值
+   1.8 Bring-up 最小硬體通過門檻（Power / Reset / Clock / UART / Boot media）
+   1.9 當前平台 Boot Strap 設定與實際量測值
+   1.10 本章 Checklist 與 Log / 量測資料收集表
 
 2. Flash Partition 與儲存架構
    2.1 通用 Flash Layout 設計原則
-   2.2 A/B Slot 分割策略
-   2.3 Golden Image / Recovery Partition 設計
-   2.4 OverlayFS 與 Read-write RootFS 設計取捨
-   2.5 Partition Size 估算方法
-   2.6 Flash 寫入壽命與 Log 儲存對策
-   2.7 各 SoC 支援的 Flash 類型與最大容量
-   2.8 當前平台 Partition Table 與 U-Boot 環境變數
+   2.2 Bootloader / Kernel / DTB / RootFS / RW Data 分區關係
+   2.3 A/B Slot 分割策略
+   2.4 Golden Image / Recovery Partition 設計
+   2.5 OverlayFS 與 Read-write RootFS 設計取捨
+   2.6 Partition Size 估算方法
+   2.7 Flash 寫入壽命與 Log 儲存對策
+   2.8 各 SoC 支援的 Flash 類型與最大容量
    2.9 MTD / UBI / UBIFS / SquashFS / ext4 對照
-   2.10 /proc/mtd、fw_printenv、mtdparts 對照方式
+   2.10 /proc/mtd、fw_printenv、mtdparts、bootargs 對照方式
    2.11 Flash Erase Block / Page Size 對 Partition 對齊的影響
+   2.12 更新 / 回復流程與 Flash Layout 的關係
+   2.13 當前平台 Partition Table 與 U-Boot 環境變數
+   2.14 本章 Checklist 與 Flash Dump / 擦寫驗證表
 
 3. Pinmux / GPIO 通用設計模式
    3.1 Pinmux 基本概念
-   3.2 GPIO 屬性
-   3.3 GPIO Hog 與 Device Tree 固定配置
-   3.4 常見 GPIO 分類速查
-   3.5 GPIO 開機默認狀態設計原則
-   3.6 上電時序中 GPIO 的關鍵時序要求
-   3.7 各 SoC GPIO Bank 架構差異
-   3.8 當前平台 Pinmux Table 與關鍵 GPIO 清單
+   3.2 GPIO 屬性：方向、active high/low、pull-up/down、open-drain
+   3.3 GPIO Owner 管理：BMC / CPLD / BIOS / Host / Shared
+   3.4 GPIO Hog 與 Device Tree 固定配置
+   3.5 Reset / Power Enable / Presence / Fault / Interrupt 類 GPIO 分類
+   3.6 GPIO 開機默認狀態設計原則
+   3.7 上電時序中 GPIO 的關鍵時序要求
+   3.8 GPIO line name、libgpiod、debugfs 驗證方式
+   3.9 Device Tree GPIO consumer 寫法與常見錯誤
+   3.10 各 SoC GPIO Bank 架構差異
+   3.11 當前平台 Pinmux Table、GPIO Map 與 Owner Matrix
+   3.12 本章 Checklist 與 GPIO 實測表
 
 4. Reset / Clock / Power Domain
-   4.1 Reset 類型
-   4.2 Reset Source 判讀方式
-   4.3 Reset Domain 劃分
+   4.1 Reset 類型：POR / Cold / Warm / BMC-only / Host / Peripheral / Watchdog
+   4.2 Reset Source 判讀方式與 reset reason register
+   4.3 Reset Domain 劃分與 reset tree 畫法
    4.4 Clock Source 與 Clock Tree
    4.5 PLL / Clock Gate 對周邊 IP 的影響
-   4.6 Power Rail Dependency
-   4.7 低功耗狀態與 Wake Source
-   4.8 當前平台 Reset Tree / Clock Tree / Power Rail 對照表
+   4.6 Power Rail Dependency 與 power-good chain
+   4.7 Reset deassert timing、strap latch timing 與示波器量測點
+   4.8 低功耗狀態與 Wake Source
+   4.9 Driver probe fail 與 reset / clock / power 未 ready 的關係
+   4.10 當前平台 Reset Tree / Clock Tree / Power Rail 對照表
+   4.11 本章 Checklist 與 Power Sequence 量測表
 
 5. 周邊匯流排通用知識
    5.1 I2C / SMBus 匯流排原理
-   5.2 I2C Mux / Switch 拓樸設計
-   5.3 I2C Bus 速率選擇與負載考量
-   5.4 SPI 介面
-   5.5 UART 介面
-   5.6 ADC 原理
-   5.7 PWM / Tach 原理
-   5.8 PECI 介面
-   5.9 eSPI / LPC 介面
-   5.10 NC-SI / RGMII / RMII 網路介面
-   5.11 PCIe 基礎
-   5.12 USB Gadget 模式
-   5.13 各 SoC 周邊 IP 差異速查
-   5.14 當前平台 Bus Map 與 Device Tree 節點對應
+   5.2 I2C 7-bit / 8-bit address 表示法與常見誤判
+   5.3 I2C Mux / Switch 拓樸設計與 channel ownership
+   5.4 I2C Bus 速率選擇、pull-up、loading、clock stretching
+   5.5 I2C scan safety：哪些 device 不建議 i2cdetect / i2cdump
+   5.6 SPI 介面與 boot flash / data flash / peripheral device
+   5.7 UART 介面、console、debug header、baud rate
+   5.8 ADC 原理與分壓 / 參考電壓 / resolution
+   5.9 PWM / Tach 原理、PPR、polarity、fan stall
+   5.10 PECI 介面與 host power state dependency
+   5.11 eSPI / LPC 介面與 host sideband
+   5.12 NC-SI / RGMII / RMII 網路介面
+   5.13 PCIe 基礎與 endpoint / root complex / reset
+   5.14 USB Gadget 模式
+   5.15 各 SoC 周邊 IP 差異速查
+   5.16 當前平台 Bus Map、Mux Tree、Device Tree 節點對應
+   5.17 本章 Checklist 與 Bus Scan / Waveform / Driver 對照表
 
 6. CPLD / FPGA / Board Glue Logic
    6.1 BMC 與 CPLD 的常見分工
    6.2 Power Sequence 由 BMC 控還是 CPLD 控
-   6.3 Reset Tree 與 Reset Source 判讀
+   6.3 Reset Tree、Reset Source 與 CPLD latch bit
    6.4 CPLD Register Map 筆記方式
-   6.5 I2C / LPC / GPIO 連到 CPLD 的常見模式
-   6.6 CPLD Firmware Version 讀取方式
-   6.7 CPLD 更新流程與風險
-   6.8 Board ID / SKU ID / GPIO Strap 由 CPLD 提供的情境
-   6.9 Debug 注意事項
-   6.10 當前平台 CPLD Register Map 與關鍵 Bit 定義
-
+   6.5 Register bit 屬性：RO / RW / W1C / latch / self-clear
+   6.6 I2C / LPC / GPIO / SPI 連到 CPLD 的常見模式
+   6.7 Presence / Fault / Power Good / Strap / Board ID / SKU ID bit 設計
+   6.8 CPLD Firmware Version 讀取方式
+   6.9 CPLD 更新流程、rollback、power loss 風險
+   6.10 BMC / Host / CPLD ownership conflict 排查
+   6.11 Debug 注意事項與讀寫 register 安全規則
+   6.12 當前平台 CPLD Register Map 與關鍵 Bit 定義
+   6.13 本章 Checklist 與 CPLD Register Dump 表
 
 ## 第二部分：BSP、Kernel 與 Device Tree
 
@@ -98,23 +115,28 @@
    7.8 編譯產物對照表
    7.9 OpenBMC / AMI / Yocto BSP 目錄差異
    7.10 當前平台 Source Tree 地圖與常改檔案清單
+   7.11 本章 Checklist：Layer / Machine / Recipe / Image / Deploy 驗證
 
 8. Device Tree 通用寫法與排查
    8.1 Device Tree 基本結構
-   8.2 Compatible / Reg / Interrupts / Clocks / Resets 用法
-   8.3 Pinctrl 節點設計
-   8.4 GPIO Phandle 與 Active-Low / Active-High 寫法
-   8.5 I2C 裝置節點寫法
-   8.6 I2C Mux 節點寫法
-   8.7 SPI Flash Partition 節點寫法
-   8.8 Hwmon / Sensor 相關節點寫法
-   8.9 Chosen / Aliases / Memory 節點
-   8.10 Overlay / Include / Override 規則
-   8.11 常見錯誤
-   8.12 當前平台 DTS Include Tree 與重要節點索引
-   8.13 Binding 文件查找方式
-   8.14 dts / dtb / dtbo 轉換與反編譯
-   8.15 dtc warning 常見訊息整理
+   8.2 Binding 文件查找方式與 yaml schema 驗證
+   8.3 Compatible / Reg / Interrupts / Clocks / Resets 用法
+   8.4 Pinctrl 節點設計
+   8.5 GPIO Phandle 與 Active-Low / Active-High 寫法
+   8.6 I2C 裝置節點寫法
+   8.7 I2C Mux 節點寫法
+   8.8 SPI Flash Partition 節點寫法
+   8.9 Hwmon / IIO / Sensor 相關節點寫法
+   8.10 PWM / Tach / Fan 相關節點寫法
+   8.11 Reset / Clock / Regulator dependency 寫法
+   8.12 Chosen / Aliases / Memory 節點
+   8.13 Overlay / Include / Override 規則
+   8.14 Driver match 流程：compatible → driver table → probe
+   8.15 Probe Deferred 與 DTS dependency 排查
+   8.16 dts / dtb / dtbo 轉換與反編譯
+   8.17 dtc warning 常見訊息整理
+   8.18 當前平台 DTS Include Tree 與重要節點索引
+   8.19 本章 Checklist 與 DTS Review Sheet
 
 9. Kernel Driver 與核心服務
    9.1 I2C 子系統架構
@@ -123,24 +145,37 @@
    9.4 Watchdog 子系統架構
    9.5 網路子系統架構
    9.6 USB Gadget 架構
-   9.7 各平台核心驅動差異速查
+   9.7 HWMON / IIO / Input / MFD / Regulator 子系統速查
    9.8 Driver Probe 流程
-   9.9 Probe Deferred 常見原因
-   9.10 Module / Built-in Driver 差異
-   9.11 sysfs / debugfs / procfs 查詢入口
-
+   9.9 Resource 取得流程：clock / reset / regulator / gpio / irq / dma
+   9.10 Probe Deferred 常見原因
+   9.11 Module / Built-in Driver 差異
+   9.12 sysfs / debugfs / procfs 查詢入口
+   9.13 dmesg / dynamic debug / tracepoint 基本用法
+   9.14 各平台核心驅動差異速查
+   9.15 當前平台 Driver Probe Matrix 與 Kernel Config 對照表
+   9.16 本章 Checklist 與 Driver Debug Flow
 
 ## 第三部分：平台監控與控制
 
 10. I2C / PMBus 裝置驅動架構
     10.1 I2C Device Address 確認方法
-    10.2 常見 I2C 裝置類型與驅動
-    10.3 I2C Mux 在 Device Tree 中的描述方式
-    10.4 I2C Bus Recovery 實作
-    10.5 I2C Clock Stretching 問題排查
-    10.6 PMBus 通用命令集
-    10.7 各平台 I2C 除錯工具差異
-    10.8 當前平台 I2C 裝置清單與驅動載入狀態
+    10.2 7-bit / 8-bit address、read/write bit 與 datasheet 對照
+    10.3 常見 I2C 裝置類型與驅動：EEPROM / RTC / Mux / Sensor / PSU / VR / HSC
+    10.4 I2C Mux 在 Device Tree 中的描述方式
+    10.5 i2cdetect / i2cget / i2cset / i2cdump 使用風險
+    10.6 Runtime new_device / delete_device 與正式 DTS 的差異
+    10.7 Driver bind / unbind / modalias / uevent 排查
+    10.8 I2C Bus Recovery 實作
+    10.9 I2C Clock Stretching、NACK、arbitration lost 問題排查
+    10.10 PMBus 通用命令集
+    10.11 PMBus Linear11 / Linear16 / Direct format 與單位換算
+    10.12 PMBus Page / Phase / Rail 對 hwmon label 的影響
+    10.13 PMBus fault / STATUS_WORD / alarm bit 解讀
+    10.14 hwmon sysfs label、input、threshold、alarm 對照
+    10.15 各平台 I2C 除錯工具差異
+    10.16 當前平台 I2C 裝置清單、Mux Tree、Driver 載入狀態
+    10.17 本章 Checklist 與 I2C/PMBus Debug Sheet
 
 11. Sensor 抽象層
     11.1 感測器數據流
@@ -150,7 +185,15 @@
     11.5 Sensor Fail / Unavailable 狀態傳播
     11.6 Event Assert / Deassert 與 Debounce 機制
     11.7 OpenBMC / AMI 各家 Sensor 框架差異
-    11.8 當前平台 Sensor List 與 SDR 映射對照表
+    11.8 ADC / Temperature / Voltage / Current / Power Sensor Porting
+    11.9 Fan Tach / Fan PWM Sensor Porting
+    11.10 PSU Sensor Porting
+    11.11 CPU Sensor：Intel PECI / AMD APML
+    11.12 NVMe / GPU / External / Virtual Sensor
+    11.13 Presence / Intrusion / GPIO State Sensor
+    11.14 Redfish Association 與 Inventory 關聯
+    11.15 Sensor 共用除錯指令與附錄
+    11.16 當前平台 Sensor List 與 SDR / Redfish 映射對照表
 
 12. Fan Control
     12.1 PID 控制理論
@@ -160,8 +203,10 @@
     12.5 手動模式與自動模式切換邏輯
     12.6 PWM 與 Tach 的極性與脈衝數換算
     12.7 風扇故障與缺席偵測原理
-    12.8 各家風控框架差異
-    12.9 當前平台 Fan Zone 劃分與 PID 參數最終數值
+    12.8 phosphor-pid-control / phosphor-fan-control / custom daemon 差異
+    12.9 Failsafe trigger、recovery 與 event mapping
+    12.10 Thermal Tuning / Acoustic Tuning / Long Run 驗證
+    12.11 當前平台 Fan Zone 劃分與 PID 參數最終數值
 
 13. Power Control
     13.1 標準 x86 電源時序
@@ -171,8 +216,9 @@
     13.5 Graceful Shutdown 與 Force Off 實作
     13.6 Power Fault 偵測與保護
     13.7 PSU 備援與負載平衡概念
-    13.8 各 SoC 電源管理 IP 差異
-    13.9 當前平台完整 Power Sequence 時序量測記錄
+    13.8 Host Power State / Chassis State / Power Policy D-Bus 對應
+    13.9 各 SoC 電源管理 IP 差異
+    13.10 當前平台完整 Power Sequence 時序量測記錄
 
 14. Inventory / FRU / Asset 資料模型
     14.1 Inventory 資料來源
@@ -182,7 +228,8 @@
     14.5 多節點 / 多主機平台 Inventory 模型
     14.6 Hot-plug 裝置 Inventory 更新
     14.7 Entity Manager / Config JSON 類型整理
-    14.8 當前平台 Inventory Source Map
+    14.8 Association 設計：contained_by / cooled_by / powered_by / inventory
+    14.9 當前平台 Inventory Source Map
 
 15. Logging / Event / Telemetry
     15.1 Log 類型分類
@@ -192,9 +239,9 @@
     15.5 Log Persistence 策略
     15.6 Log 滿時處理策略
     15.7 遠端 Log 傳送
-    15.8 當前平台 Event Mapping Table
-    15.9 Log Bundle 標準內容
-
+    15.8 Telemetry / Metric / Sensor History 設計
+    15.9 當前平台 Event Mapping Table
+    15.10 Log Bundle 標準內容
 
 ## 第四部分：Host Communication
 
