@@ -68,6 +68,7 @@
 | 2026-07-07 |  0.24 | Copilot | 撰寫 Power Control Section |
 | 2026-07-08 |  0.25 | Copilot | 撰寫各類 Sensor 共用除錯指令 |
 | 2026-07-08 |  0.26 | Copilot | 撰寫 CH12 基本內容 |
+| 2026-07-08 |  0.27 | Copilot | 補寫 BBMASK 變數、使用情境、範例與排查流程 |
 
 ### 0.7 資料來源可信度分級
 
@@ -944,6 +945,97 @@ BMC porting 建議：
 | `IMAGE_FEATURES` | image feature | ssh-server、package-management 等 |
 | `EXTRA_IMAGE_FEATURES` | 額外 image feature | debug-tweaks 常見於開發版 |
 | `IMAGE_FSTYPES` | image 輸出格式 | `tar.bz2 ext4 wic ubi mtd` |
+| `BBMASK` | 讓 BitBake 忽略符合 pattern 的 `.bb` / `.bbappend` 檔案 | 排除衝突 recipe、暫停 vendor append、隔離不適用 layer metadata |
+
+
+##### BBMASK：遮蔽不想讓 BitBake 解析的 recipe / append
+
+`BBMASK` 是 BitBake / Yocto 的解析階段控制變數，用來讓 BitBake 忽略符合條件的 `.bb` 或 `.bbappend` 檔案。被 `BBMASK` 比對到的檔案不會被 parse，也不會成為 provider、dependency resolution 或 `bitbake-layers show-recipes` 的有效候選；效果接近「這些 metadata 對本次 build 不存在」。因此它適合用在「某些 recipe / append 目前不應參與解析」的場景，而不是用來取代 package 安裝、image 組成或 provider 選擇。
+
+常見使用情境：
+
+| 場景 | 建議用法 | 注意事項 |
+|---|---|---|
+| 暫時遮蔽 vendor layer 中會造成 parse error 的 recipe | 在 `local.conf` 或 distro / product conf 追加 `BBMASK` | 需留下原因與移除條件，避免長期隱藏問題 |
+| 同一套 build tree 支援多個平台，但某些平台不使用特定 recipe | 使用 machine / distro override 控制 `BBMASK:append:<machine>` | 需確認其他 machine 不受影響 |
+| 某個 `.bbappend` 已過期，對應新版 recipe 造成 patch 失敗 | 遮蔽該 `.bbappend`，或修正 append 檔名與 patch | 長期建議修 recipe / append，不建議只靠 mask |
+| 多個 layer 提供相同功能，想排除其中一支 recipe | 以完整路徑 pattern 遮蔽不想要的 recipe | 若只是選 provider，優先評估 `PREFERRED_PROVIDER` |
+| Bring-up 初期先剔除不穩定功能 | 暫時 mask sensor / fan / web / debug 相關 recipe 或 append | 需確認 image dependency 不會引用被遮蔽的 recipe |
+
+`BBMASK` 的值是 Python regular expression fragment，且比對對象是 recipe / append 檔案的完整路徑。寫法上應盡量使用足夠明確的 layer 路徑與目錄尾端 `/`，避免把名稱相近但不相關的檔案一起遮蔽。
+
+基本範例：
+
+```bitbake
+# 遮蔽整個目錄下的 recipe / append；目錄結尾保留 /
+BBMASK += "/meta-vendor/recipes-obsolete/"
+
+# 遮蔽特定 recipe
+BBMASK += "/meta-vendor/recipes-support/foo/foo_.*\.bb"
+
+# 遮蔽特定 .bbappend
+BBMASK += "/meta-vendor/recipes-kernel/linux/linux-aspeed_.*\.bbappend"
+
+# 遮蔽多個 pattern；每個 pattern 以空白分隔
+BBMASK += "/meta-vendor/recipes-debug/ /meta-vendor/recipes-test/"
+```
+
+針對 machine 或 distro 的寫法：
+
+```bitbake
+BBMASK:append:my-bmc-machine = " /meta-vendor/recipes-platform/legacy-power/"
+BBMASK:append:my-production-distro = " /meta-company/recipes-factory/"
+```
+
+驗證與排查指令：
+
+```bash
+bitbake-layers show-layers
+bitbake-layers show-recipes foo
+bitbake-layers show-appends | grep -A5 -B2 foo
+bitbake -e | grep '^BBMASK='
+bitbake -p
+```
+
+與其他機制的差異：
+
+| 機制 | 作用層級 | 適合用途 | 不適合用途 |
+|---|---|---|---|
+| `BBMASK` | parse 階段，遮蔽 `.bb` / `.bbappend` 檔案 | 讓 BitBake 完全不看某些 metadata | 細緻控制 package 是否進 image |
+| `PREFERRED_PROVIDER` / `PREFERRED_VERSION` | provider / version 選擇 | 多個 recipe 都可用時選其中一個 | vendor append 已造成 parse error 的情境 |
+| `IMAGE_INSTALL:remove` | image rootfs 組成 | 從 image 移除 package | recipe 本身 parse 失敗 |
+| `PACKAGE_EXCLUDE` | package install / rootfs 階段 | 避免特定 package 被安裝 | 遮蔽 `.bbappend` 或解決 provider 衝突 |
+| `COMPATIBLE_MACHINE` | recipe 適用 machine | recipe 自身聲明支援範圍 | 從外部臨時排除既有 recipe |
+| `SKIP_RECIPE` 或 `bb.parse.SkipRecipe` | recipe parse 邏輯 | recipe 內依條件主動跳過 | 從專案層遮蔽第三方 metadata 時通常不如 `BBMASK` 直接 |
+| `BB_DANGLINGAPPENDS_WARNONLY` | dangling append 行為 | 讓舊 append 找不到 recipe 時由 fatal 變 warning | 不建議用來掩蓋產品 build 的 layer 不一致 |
+
+常見問題與排查：
+
+| 現象 | 可能方向 | 建議檢查 |
+|---|---|---|
+| 設了 `BBMASK` 但 recipe 還在 | pattern 沒匹配完整路徑、缺少 `/`、regex escape 不正確 | `bitbake -e | grep '^BBMASK='`、`bitbake-layers show-recipes` |
+| 遮蔽後 build 出現 `Nothing PROVIDES` | 其他 recipe 仍 `DEPENDS` / `RDEPENDS` 該 recipe 或 virtual provider | `bitbake -g <target>`、檢查 `DEPENDS` / `RDEPENDS` / `PREFERRED_PROVIDER` |
+| 只想遮蔽 `.bbappend` 卻 recipe 也消失 | pattern 太寬 | 明確寫到 `.*\.bbappend` |
+| 某些 machine 正常，某些 machine 失敗 | override 沒掛對、`MACHINEOVERRIDES` 不符合預期 | `bitbake -e | grep '^OVERRIDES='`、檢查 machine conf |
+| 遮蔽目錄後仍有 append 套用 | append 位於另一個 layer 或另一個路徑 | `bitbake-layers show-appends` 查完整來源 |
+
+BMC / OpenBMC porting 建議：
+
+- `BBMASK` 適合當作 bring-up 或 layer integration 的隔離工具，例如先遮蔽不適用平台的 vendor recipe、過期 append、暫不支援的 debug / factory tool。
+- 若衝突來源是多個 provider，先評估 `PREFERRED_PROVIDER_virtual/<name>` 或 `PREFERRED_VERSION`；只有在不希望 BitBake 解析某些 `.bb` / `.bbappend` 時才使用 `BBMASK`。
+- 若只是 package 不想進 image，應透過 image recipe、packagegroup、`IMAGE_INSTALL:remove` 或 feature flag 管理，不建議用 `BBMASK`。
+- 每一條 `BBMASK` 都應附註 owner、原因、加入日期、預期移除條件。量產前建議審一次，確認沒有把安全更新、CVE 修補、必要 service 或平台 patch 保持在被遮蔽狀態。
+
+建議檢查清單：
+
+- [ ] `BBMASK` 放置位置明確：`local.conf`、distro conf、machine conf、layer conf 或 CI template。
+- [ ] pattern 以完整 layer 路徑為主，避免只用過短名稱，例如 `foo`。
+- [ ] 遮蔽目錄時保留 trailing slash，例如 `/recipes-obsolete/`。
+- [ ] 若只要遮蔽 append，pattern 明確匹配 `.bbappend`。
+- [ ] 執行 `bitbake -p` 確認 parse 通過。
+- [ ] 執行 `bitbake-layers show-recipes` / `show-appends` 確認效果符合預期。
+- [ ] 完整 image build 通過，且沒有新的 provider / dependency 問題。
+- [ ] 文件或 commit message 留下原因、風險與移除條件。
 
 ##### 安裝路徑變數
 
