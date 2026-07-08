@@ -67,6 +67,7 @@
 | 2026-07-07 |  0.23 | Copilot | 撰寫 Presence / Intrusion / GPIO State Sensor Sensor |
 | 2026-07-07 |  0.24 | Copilot | 撰寫 Power Control Section |
 | 2026-07-08 |  0.25 | Copilot | 撰寫各類 Sensor 共用除錯指令 |
+| 2026-07-08 |  0.26 | Copilot | 撰寫 CH12 基本內容 |
 
 ### 0.7 資料來源可信度分級
 
@@ -9638,11 +9639,217 @@ Entity Manager / Userspace：
 上述項目已補齊，暫無需回到資料蒐集階段。
 
 #### 12.12 NVMe Sensor
+
+NVMe sensor 用於監控 NVMe SSD 的溫度、健康狀態、SMART warning、slot inventory 與 firmware 資訊。BMC 可能透過 SMBus Basic Management Command、NVMe-MI over MCTP、host proxy 或 vendor daemon 取得資料。Porting 重點包含 drive slot mapping、presence、endpoint、timeout、inventory 與 Redfish / IPMI 對外路徑。
+
+| 檢查項目 | 說明 |
+| --- | --- |
+| Slot / Location | U.2、E1.S、M.2、EDSFF slot 編號與絲印需一致 |
+| Presence source | PCIe PRSNT#、CPLD、I2C ACK 或 MCTP endpoint |
+| Transport | SMBus、MCTP over SMBus、MCTP over PCIe VDM、host proxy |
+| Bus / Address / EID | 實際通訊路徑、mux channel 與 endpoint ID |
+| Timeout / PollRate | 避免單顆 drive timeout 阻塞整組 sensor |
+| Inventory | model、serial、firmware、capacity、location |
+| Event | insert/remove、over-temp、SMART warning、timeout |
+
+常用驗證：
+
+```bash
+i2cdetect -l
+i2cdetect -y <bus>
+systemctl status mctpd --no-pager 2>/dev/null || true
+busctl tree xyz.openbmc_project.MCTP 2>/dev/null || true
+systemctl list-units '*nvme*' --no-pager
+journalctl -u xyz.openbmc_project.nvmesensor.service -b --no-pager 2>/dev/null | tail -200
+busctl tree /xyz/openbmc_project/sensors | grep -i nvme
+busctl tree /xyz/openbmc_project/inventory | grep -Ei 'nvme|drive|ssd'
+```
+
+常見問題：D-Bus 有 inventory 但沒有 temperature，多半需回查 endpoint discovery、sensor daemon PACKAGECONFIG、Entity Manager config 與 association；熱插拔後若 object 沒消失，需檢查 presence signal 與 daemon state machine；host proxy 類 sensor 需處理 host reset 後 stale data。
+
 #### 12.13 GPU Sensor
+
+GPU / accelerator sensor 常見於 NVIDIA GPU、DPU、AI accelerator、PCIe switch 或 retimer。資料來源可能是 MCTP vendor defined message、I2C sideband、SMBPBI、host proxy 或 vendor daemon。常見 sensor 包含 temperature、power、energy、voltage、utilization、clock、PCIe link、error event 與 power limit。
+
+| 類別 | D-Bus / Redfish 方向 | 注意事項 |
+| --- | --- | --- |
+| Temperature | `temperature` | GPU core、memory、board、retimer sensor 需分清楚 |
+| Power | `power` | instantaneous、average、peak 定義需固定 |
+| Energy | `energy` | counter wrap、reset 後行為需定義 |
+| Voltage / Current | `voltage` / `current` | rail name 與 GPU domain 對齊 |
+| Utilization | `utilization` | GPU / memory / engine 類型需明確 |
+| Control | power cap / clock limit | 權限、persistency、host policy |
+
+常用驗證：
+
+```bash
+systemctl list-units '*gpu*' '*mctp*' --no-pager
+journalctl -u xyz.openbmc_project.nvidiagpusensor.service -b --no-pager 2>/dev/null | tail -200
+busctl tree /xyz/openbmc_project/sensors | grep -Ei 'gpu|accelerator|pcie'
+busctl tree /xyz/openbmc_project/inventory | grep -Ei 'gpu|accelerator|pcie'
+busctl introspect <service> <gpu-object-path>
+```
+
+常見問題包含 mW/W 或 µW/W 換算錯、GPU reset 後 sensor stale、MCTP endpoint recovery 不完整、Redfish association 缺失，以及 fan policy 因 required GPU temp unavailable 進入 failsafe。
+
 #### 12.14 External / Virtual Sensor
+
+External sensor 是由外部來源寫入 BMC D-Bus 的 sensor，例如 host OS、BIOS、另一顆 BMC 或 vendor daemon。Virtual sensor 則由既有 sensor 與公式計算，例如 total power、zone max temperature、average inlet temperature、redundant voting 或 power efficiency。
+
+External sensor 需定義：
+- Writer owner 與 D-Bus 權限。
+- `Timeout` 與 stale data 行為。
+- `MinValue` / `MaxValue` 與錯誤值過濾。
+- host off、host reset、writer daemon crash 後是否保留最後值、變 NaN、`Available=false` 或 `Functional=false`。
+
+Virtual sensor 設計原則：
+- input D-Bus path、單位與更新率要明確。
+- 先統一單位，避免 `µW + W` 或 `mV + V`。
+- total power 需避免 double counting。
+- 若參與 fan / power policy，需定義任一 input unavailable 時的行為。
+
+常用驗證：
+
+```bash
+systemctl status xyz.openbmc_project.externalsensor.service --no-pager 2>/dev/null || true
+journalctl -u xyz.openbmc_project.externalsensor.service -b --no-pager 2>/dev/null | tail -100
+systemctl status phosphor-virtual-sensor.service --no-pager 2>/dev/null || true
+journalctl -u phosphor-virtual-sensor.service -b --no-pager 2>/dev/null | tail -100
+busctl tree /xyz/openbmc_project/sensors | grep -Ei 'external|total|max|avg|virtual'
+```
+
 #### 12.15 Presence / Intrusion / GPIO State Sensor
+
+Presence、intrusion 與 GPIO state 類 sensor 多半是 Boolean 或 enum，而不是連續讀值。這類訊號會影響 inventory、hot-swap、LED、event log、Redfish chassis 狀態、IPMI discrete sensor 與維修流程，因此需區分 `Present`、`Functional`、`Available`、`Fault`、`Intrusion`。
+
+| 類型 | 來源 | 用途 | 注意事項 |
+| --- | --- | --- | --- |
+| FRU presence | GPIO、CPLD bit、EEPROM ACK、PMBus ACK | PSU、fan tray、riser、backplane 是否插入 | active level、debounce、hot-swap event |
+| Chassis intrusion | GPIO、PCH/SMBus、hwmon alarm | 機箱開蓋偵測 | Automatic / Manual rearm |
+| Fault state | GPIO、CPLD latch、PMBus STATUS_WORD | PSU fault、fan fault、VR fault | latch clear / W1C rule |
+| Board / SKU state | GPIO strap、ADC strap、CPLD register | board ID、SKU ID、revision | boot-time 與 runtime 可能不同 |
+
+常用驗證：
+
+```bash
+gpiodetect
+gpioinfo | grep -Ei 'present|intrusion|fault|psu|fan'
+gpioget $(gpiofind CHASSIS_INTRUSION_N)
+systemctl status xyz.openbmc_project.intrusionsensor.service --no-pager 2>/dev/null || true
+journalctl -u xyz.openbmc_project.intrusionsensor.service -b --no-pager 2>/dev/null | tail -100
+busctl tree /xyz/openbmc_project/inventory | grep -Ei 'psu|fan|chassis|riser|drive'
+ipmitool sdr elist | grep -Ei 'presence|intrusion|fault'
+```
+
 #### 12.16 Redfish Association
+
+Redfish 是否顯示 sensor，不只取決於 D-Bus 上是否存在 sensor object，也取決於 ObjectMapper association、inventory path、Chassis 關聯，以及 bmcweb 對該 sensor type 的路徑掃描策略。D-Bus 有值但 Redfish `N/A` 或缺項，常見方向是 association 缺失或 sensor 被掛到錯的 chassis。
+
+| Association | 用途 |
+| --- | --- |
+| `chassis` / `all_sensors` | 讓 Redfish Chassis 收到 sensor |
+| `inventory` / `sensors` | 讓 FRU / board / PSU / fan 與 sensor 關聯 |
+| `sensors` / `inventory` | event log / callout 回查 inventory |
+| `contained_by` / `containing` | 建立 chassis / board / module topology |
+
+常用檢查：
+
+```bash
+busctl introspect <service> <sensor-path> xyz.openbmc_project.Association.Definitions
+busctl get-property <service> <sensor-path> xyz.openbmc_project.Association.Definitions Associations
+journalctl -u bmcweb -b --no-pager | grep -Ei 'sensor|association|chassis|redfish' | tail -200
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Sensors
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Thermal
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Power
+```
+
 #### 12.17 Sensor 共用除錯指令與附錄
+
+建議依序檢查：hardware → kernel/sysfs → config → service → D-Bus → Redfish/IPMI → event/policy。
+
+版本與 baseline：
+
+```bash
+cat /etc/os-release
+cat /etc/timestamp 2>/dev/null || true
+uname -a
+cat /proc/cmdline
+systemctl --failed --no-pager
+```
+
+Kernel / sysfs：
+
+```bash
+for h in /sys/class/hwmon/hwmon*; do
+    echo "== $h =="
+    cat "$h/name" 2>/dev/null || true
+    ls "$h" | grep -E '^(in|temp|fan|pwm|curr|power|energy)[0-9]+' || true
+done
+find /sys/class/hwmon -maxdepth 2 -type f | grep -E '/(name|in[0-9]+_input|temp[0-9]+_input|fan[0-9]+_input|pwm[0-9]+|curr[0-9]+_input|power[0-9]+_input)$' | sort
+```
+
+Entity Manager / service：
+
+```bash
+ls -l /usr/share/entity-manager/configurations/ 2>/dev/null
+systemctl status xyz.openbmc_project.EntityManager.service --no-pager
+journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager | tail -200
+systemctl list-units '*sensor*' '*hwmon*' '*fan*' '*pid*' '*power*' --no-pager
+```
+
+D-Bus：
+
+```bash
+busctl tree /xyz/openbmc_project/sensors
+busctl introspect <service> <object-path>
+busctl get-property <service> <object-path> xyz.openbmc_project.Sensor.Value Value
+busctl get-property <service> <object-path> xyz.openbmc_project.Sensor.Value Unit
+busctl get-property <service> <object-path> xyz.openbmc_project.State.Decorator.Availability Available
+busctl get-property <service> <object-path> xyz.openbmc_project.State.Decorator.OperationalStatus Functional
+```
+
+Redfish / IPMI：
+
+```bash
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Sensors
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Thermal
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Power
+ipmitool sdr elist
+ipmitool sensor list
+ipmitool sel list
+```
+
+單位速查：
+
+| sysfs / raw | 常見單位 | D-Bus / Redfish 建議單位 | 換算 |
+| --- | --- | --- | --- |
+| `temp*_input` | milli-degree C | DegreesC | `/ 1000` |
+| `in*_input` | mV | Volts | `/ 1000 × ScaleFactor` |
+| `curr*_input` | mA | Amperes | `/ 1000` |
+| `power*_input` | µW | Watts | `/ 1000000` |
+| `fan*_input` | RPM | RPMS | 通常不換算 |
+| `pwm*` | 0–255 | Percent 或 raw | `raw / 255 × 100` |
+
+常見分層排查：
+
+| 現象 | 優先分層 | 第一輪檢查 |
+| --- | --- | --- |
+| D-Bus 沒 sensor | config / daemon / sysfs | Entity Manager log、sensor daemon log、sysfs 是否存在 |
+| sysfs 有值但 D-Bus 無值 | daemon mapping | daemon 是否支援該 hwmon name / label / index |
+| D-Bus 有值但 Redfish 無值 | association / bmcweb | ObjectMapper association、bmcweb log、Chassis path |
+| D-Bus 有值但 IPMI 無 SDR | ipmid mapping | `ipmitool sdr`、ipmid dbus-sdr log |
+| 數值差 1000 倍 | unit / scale | sysfs raw、ScaleFactor、D-Bus Unit、Redfish output |
+| fan 全速 | required sensor unavailable | fan control log、Available / Functional |
+
+##### 12.17.2 本章參考資料
+
+- OpenBMC docs - Sensor Architecture: https://github.com/openbmc/docs/blob/master/architecture/sensor-architecture.md
+- OpenBMC dbus-sensors README: https://github.com/openbmc/dbus-sensors
+- OpenBMC entity-manager README / docs: https://github.com/openbmc/entity-manager
+- OpenBMC phosphor-hwmon README: https://github.com/openbmc/phosphor-hwmon
+- OpenBMC phosphor-virtual-sensor README: https://github.com/openbmc/phosphor-virtual-sensor
+- Linux kernel hwmon sysfs interface: https://docs.kernel.org/hwmon/sysfs-interface.html
+- OpenBMC bmcweb Redfish sensor implementation: https://github.com/openbmc/bmcweb/blob/master/redfish-core/lib/sensors.hpp
 
 ### 13. Fan Control 與 Thermal Policy
 
