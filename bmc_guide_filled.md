@@ -69,6 +69,7 @@
 | 2026-07-08 |  0.25 | Copilot | 撰寫各類 Sensor 共用除錯指令 |
 | 2026-07-08 |  0.26 | Copilot | 撰寫 CH12 基本內容 |
 | 2026-07-08 |  0.27 | Copilot | 補寫 BBMASK 變數、使用情境、範例與排查流程 |
+| 2026-07-09 |  0.28 | Copilot | 補寫第 2 章 Flash Partition 與儲存架構、分區表、更新 rollback、log 收集與驗收 checklist |
 
 ### 0.7 資料來源可信度分級
 
@@ -372,24 +373,602 @@ Bring-up 驗收建議：
 
 ### 2. Flash Partition 與儲存架構
 
-設計原則：
+本章整理 BMC 韌體在 flash / eMMC 上的分區規劃、檔案系統選擇、更新策略、資料保存與排查方法。Flash layout 一旦進入量產，後續變更通常會牽涉既有資料保留、OTA 相容性、rollback policy、secure boot chain、工廠燒錄工具與維修流程，因此在 bring-up 初期就需要把 bootloader、kernel、DTB、readonly rootfs、writable data、persistent config、log、recovery / golden image 的邊界定義清楚。
 
-- bootloader、kernel、readonly rootfs、rw data、persistent config、log、recovery image 分區需分開評估。
-- A/B slot 適合需要不中斷更新與 rollback 的平台。
-- Golden image 應保持唯讀，更新流程不得覆寫，除非有明確安全流程。
-- read-only SquashFS + writable overlay 可降低 rootfs 被意外修改的風險；UBIFS 適合 raw NAND 上的可寫資料。
-- 分區需依 erase block / page size 對齊，避免寫入放大與邊界錯誤。
+OpenBMC 常見設計是將 root filesystem 做成唯讀映像，例如 SquashFS，並把需要可寫的 /etc、/var、/home 或平台資料放在 writable filesystem，再透過 OverlayFS 或 bind mount 呈現給 userspace。raw NAND / SPI-NAND 場景通常會加上 UBI 作為 wear leveling 與 volume 管理層，再於其上使用 UBIFS 或 ubiblock。eMMC 則屬於 block device，通常使用 GPT / ext4 / squashfs / dm-verity 等 block-device 架構，而不是 UBIFS。
 
-常見配置：
+#### 2.1 設計目標與分區原則
 
-| 類型                 | 適用場景               | 注意事項                              |
-| -------------------- | ---------------------- | ------------------------------------- |
-| SPI-NOR + static MTD | 小容量、簡單更新       | 容量有限，log 應節制                  |
-| SPI-NAND + UBI/UBIFS | raw NAND、大容量       | 需處理 bad block、VID header、LEB/PEB |
-| eMMC + ext4          | 大容量、block device   | 需規劃 wear、fsck、power loss         |
-| SquashFS + OverlayFS | 穩定 rootfs + 可寫設定 | overlay 空間需監控                    |
+Flash / storage layout 的設計目標不是只讓 image 能開機，而是要同時滿足下列需求：
 
-平台必填：`/proc/mtd`、`fw_printenv`、`mtdparts`、U-Boot bootargs、image manifest、rollback policy。
+| 目標 | 說明 | 常見設計手段 |
+| --- | --- | --- |
+| 可開機 | BootROM、SPL、U-Boot、kernel、DTB、rootfs offset 正確 | 固定 offset、DTS fixed-partitions、U-Boot mtdparts / bootargs 對齊 |
+| 可更新 | 支援 Redfish / Web / scp / TFTP / local update | image manifest、software manager、A/B slot、activation state |
+| 可回復 | 更新失敗可回到前一版或 golden image | boot attempt counter、boot priority、rollback policy、recovery partition |
+| 可保存 | 網路設定、使用者、SSH key、FRU cache、event log 不因更新消失 | rwfs、persistent volume、白名單搬移、factory reset policy |
+| 可控風險 | 降低任意寫入 rootfs、power loss、wear out 對系統的影響 | readonly rootfs、OverlayFS、UBI、fsync policy、log rotation |
+| 可追蹤 | 現場能判讀目前 running slot、image version、partition map | /proc/mtd、fw_printenv、manifest、os-release、journal |
+| 安全 | 支援 secure boot、image signature、anti-rollback、field mode | 簽章驗證、唯讀 golden image、rollback index、write protect |
+
+分區規劃建議：
+
+- BootROM 會讀取的區域需保持 SoC datasheet / BootROM 要求的 offset、header、alignment 與 media type。
+- bootloader 與 bootloader env 分開管理；env 應有 CRC / redundant env 或可恢復預設值。
+- kernel、DTB、rootfs 與 rw data 需明確切開，避免更新 rootfs 時碰到 persistent data。
+- readonly rootfs 建議使用 SquashFS / EROFS / dm-verity 類設計，將內容變更收斂到正式 image build。
+- writable data 需依資料重要性分層，不建議把大量 log、dump、temporary image 與永久設定放在同一小分區。
+- raw NAND / SPI-NAND 需要將 bad block、ECC、OOB、VID header offset、PEB / LEB size 納入規劃。
+- eMMC / SD / SSD 類 block device 需考量 partition table、fsck、journal、power loss、wear 與 discard / trim policy。
+- A/B slot 需要一套明確的「誰選 slot、誰標記成功、誰回退」機制，不能只把分區複製兩份。
+- Golden image / recovery image 若作為最後救援入口，應有 write protect 或更新權限控管。
+- 每次更動分區表、image type、U-Boot env、DTS fixed-partitions 或 update script，都要同步更新本章表格與測試紀錄。
+
+#### 2.2 Flash media 與檔案系統選型
+
+| 類型 | 常見容量 | Linux 視角 | 常見 filesystem / layout | 適用情境 | 主要風險 |
+| --- | ---: | --- | --- | --- | --- |
+| SPI-NOR | 16MB～128MB | MTD raw flash | static MTD + SquashFS + JFFS2 / overlay | 小容量、早期 bring-up、簡單 BMC | 容量有限、erase block 寫入放大、log 空間不足 |
+| SPI-NAND | 128MB～1GB+ | MTD raw flash | UBI + UBIFS / ubiblock + SquashFS | 需要較大容量且仍使用 raw flash | bad block、ECC、VID header、UBI attach 失敗 |
+| Parallel NAND | 依平台 | MTD raw flash | UBI + UBIFS | 舊平台或特定 SoC | bad block table、ECC policy、BootROM 支援 |
+| eMMC | 4GB+ | block device | GPT + ext4 / SquashFS / dm-verity | 大容量、需要更多 log / dump / container | partition table、fsck、突然斷電、eMMC boot partition 設定 |
+| Dual SPI-NOR | 2 顆 NOR | MTD raw flash | primary / alternate flash、A/B 或 golden | 需要硬體層備援 | flash mux、boot strap、U-Boot env 與 slot policy 複雜 |
+| SPI-NOR + eMMC | 混合 | MTD + block | NOR 放 bootloader，eMMC 放 rootfs / data | BootROM 僅支援 NOR，但需要大容量 | bootargs、root device、更新流程跨 media |
+
+檔案系統選型建議：
+
+| Filesystem / layer | 適用媒體 | 主要用途 | 優點 | 注意事項 |
+| --- | --- | --- | --- | --- |
+| SquashFS | MTD / block | readonly rootfs | 壓縮率高、內容固定、適合 image 更新 | 不能直接寫入；需搭 overlay 或重新產生 image |
+| JFFS2 | MTD raw flash | 小型 writable partition | 架構簡單、適合小 NOR | mount time 與 flash size 相關；大型 NAND 不建議優先選 |
+| UBI | MTD raw flash | volume / wear leveling / bad block 管理 | 對 raw NAND / SPI-NAND 友善 | 需正確設定 PEB、LEB、VID header、volumes |
+| UBIFS | UBI volume | writable data、/var、persistent config | 支援 journal / compression，適合 raw flash | 不適用 eMMC / block device |
+| ubiblock + SquashFS | UBI volume | readonly rootfs on raw flash | 讓 SquashFS 放在 UBI volume 內 | rootfs volume 更新與 bootcmd 需對齊 |
+| OverlayFS | 任意支援條件的 FS | readonly lower + writable upper | rootfs 可維持唯讀，變更落在 upper | upper/workdir 需同 filesystem，空間需監控 |
+| ext4 | block device | eMMC writable / data / rootfs | 成熟、工具完整 | 需處理 journal、fsck、power loss 與 wear |
+| tmpfs | RAM | /run、/tmp、暫存上傳 image | 不寫 flash | 受 RAM 限制，重開機即消失 |
+
+#### 2.3 常見 BMC Flash Layout 模式
+
+##### 2.3.1 SPI-NOR + static MTD
+
+適用於 SPI-NOR 容量有限、平台更新流程相對單純的情境。典型架構如下：
+
+```text
+0x00000000  u-boot          fixed, bootloader
+0x00100000  u-boot-env      fixed, boot variables
+0x00120000  kernel          Linux kernel / fitImage
+0x00720000  rofs            SquashFS readonly rootfs
+0x03A00000  rwfs            JFFS2 / writable overlay
+```
+
+Bring-up 重點：
+
+- DTS fixed-partitions、U-Boot mtdparts、kernel bootargs、image package 內的 partition name 必須一致。
+- /proc/mtd 中 partition name 需與 init script / update script 使用的名稱一致，例如 kernel、rofs、rwfs。
+- U-Boot env offset / size 不可與其他分區重疊；若有 redundant env，兩份 env 都要列入表格。
+- rwfs 若使用 JFFS2，需確認 erase block size、cleanmarker、mount time 與容量是否符合需求。
+- log 與 dump 優先放 tmpfs 或外部收集系統，避免小 NOR 上的 rwfs 被寫滿。
+
+##### 2.3.2 SPI-NAND / raw NAND + UBI / UBIFS
+
+適用於 raw flash 容量較大且需要 wear leveling 的平台。典型架構會將一段 MTD partition attach 成 UBI device，內含多個 UBI volume：
+
+```text
+MTD partitions:
+  mtd0: u-boot
+  mtd1: u-boot-env
+  mtd2: fit / kernel fallback
+  mtd3: ubi
+
+UBI volumes on mtd3:
+  kernel-a     static / dynamic volume, FIT or kernel
+  rofs-a       static volume, SquashFS via ubiblock
+  kernel-b     static / dynamic volume
+  rofs-b       static volume, SquashFS via ubiblock
+  rwfs         dynamic volume, UBIFS
+```
+
+Bring-up 重點：
+
+- 確認 BootROM 與 U-Boot 是否能處理 SPI-NAND 的 ECC、OOB 與 bad block policy。
+- 初次燒錄需使用適合 UBI 的工具與參數，例如 ubiformat / ubinize / flashcp 需依媒體類型選擇。
+- kernel bootargs 常見包含 ubi.mtd=、root=、rootfstype=ubifs 或 root=/dev/ubiblockX_Y。
+- UBI attach log 對排查很重要，需留意 PEB size、LEB size、VID header offset、bad PEB、volume table。
+- 不建議把 UBIFS 映像用一般 block 寫入方式直接 dd 到 raw NAND；需確認工具是否保留 UBI / ECC / bad block 語意。
+
+##### 2.3.3 eMMC + GPT / ext4 / SquashFS
+
+適用於需要大容量、較多 log / dump / factory data 的平台。eMMC 是 block device，底層 already 有 FTL，因此不使用 UBIFS。典型架構如下：
+
+```text
+/dev/mmcblk0boot0      optional bootloader area
+/dev/mmcblk0boot1      optional backup bootloader area
+/dev/mmcblk0p1         boot / EFI / FIT / kernel
+/dev/mmcblk0p2         rootfs-a
+/dev/mmcblk0p3         rootfs-b
+/dev/mmcblk0p4         rw-data
+/dev/mmcblk0p5         logs / dumps / factory, optional
+```
+
+Bring-up 重點：
+
+- Boot partition enable、boot bus width、RST_n、ext_csd 設定需符合 SoC BootROM。
+- kernel bootargs 應盡量使用 PARTUUID / UUID / label，避免 mmcblk 編號變動造成 rootfs 找錯。
+- ext4 需評估 journal mode、commit interval、fsck policy、systemd mount timeout 與突然斷電測試結果。
+- 若使用 dm-verity / signed rootfs，rootfs partition 應保持唯讀，persistent data 放獨立 partition。
+- eMMC health / lifetime estimate 若可讀，應納入量產診斷與現場 log。
+
+##### 2.3.4 A/B slot + rollback
+
+A/B slot 的核心是「新 image 先寫到非目前 running slot，下一次開機試跑新 slot，確認成功後才標記為穩定」。可套用於 MTD、UBI 或 eMMC，但所需 metadata 與 bootloader policy 需提早定義。
+
+| 項目 | 建議定義 |
+| --- | --- |
+| Slot 名稱 | A/B、primary/backup、image0/image1，需全文件一致 |
+| Slot 內容 | kernel、DTB、rootfs 是否都雙份；rwfs 是否共用 |
+| Boot selection | U-Boot env、CPLD register、bootloader metadata、software manager |
+| Trial boot | 新 slot 啟動前是否設定 bootcount / upgrade_available |
+| Success criteria | systemd target 到達、BMC service ready、network ready、版本暴露成功 |
+| Mark-good 時機 | 首次成功 boot 後由 userspace 或 update manager 寫回 env / metadata |
+| Rollback 條件 | kernel panic、rootfs mount 失敗、watchdog reset、mark-good timeout |
+| Persistent data | 更新與 rollback 期間是否共用，schema migration 如何處理 |
+| 安全政策 | anti-rollback index、簽章驗證、field mode、golden image 更新權限 |
+
+常見風險：
+
+- rootfs A/B 有做，但 kernel / DTB 仍只用單份，導致 rollback 不完整。
+- U-Boot env 更新中斷後無法判斷 active slot；建議評估 redundant env 或 metadata journal。
+- userspace 未完成 mark-good，但 watchdog timeout 太短，造成反覆回退。
+- rwfs 共用後，新版 service 寫入的設定與舊版 service 不相容；需有 migration / downgrade policy。
+
+##### 2.3.5 Golden / recovery image
+
+Golden image 用於主要 image 無法開機或無法更新時的救援入口。它可以位於另一顆 flash、同顆 flash 的保護分區，或由 U-Boot / BootROM recovery 模式載入。
+
+設計建議：
+
+- Golden image 預設唯讀，更新流程需有明確授權、簽章與維修程序。
+- Golden image 功能可精簡，但至少應具備網路、更新服務、基本 shell / serial、版本資訊與硬體識別能力。
+- 若 golden image 與 production image 共用 rwfs，需避免 rescue flow 寫壞 production 設定。
+- 需定義啟動條件：strap、GPIO、CPLD register、bootcount failed、手動指令、watchdog rollback。
+- 需定義退出條件：成功重新刷寫 production image 後是否自動切回 primary。
+
+#### 2.4 分區表與平台必填資料
+
+Bring-up 前至少填完下表，並在每次更動 image layout / U-Boot env / DTS / update service 後更新。
+
+| 項目 | 目前平台值 | 資料來源 | 責任窗口 | 狀態 |
+| --- | --- | --- | --- | --- |
+| Boot media 類型 | [待填] | schematic / BOM / SoC strap | HW / BMC | [待確認] |
+| Flash / eMMC 型號 | [待填] | BOM / jedec id / ext_csd | HW | [待確認] |
+| 容量 | [待填] | datasheet / kernel log | HW / BMC | [待確認] |
+| erase block / page size | [待填] | datasheet / mtdinfo | BMC | [待確認] |
+| ECC / OOB policy | [待填] | SoC BSP / NAND datasheet | BMC / HW | [待確認] |
+| U-Boot env offset / size | [待填] | U-Boot config / fw_env.config | BMC | [待確認] |
+| Redundant env | [待填] | U-Boot config | BMC | [待確認] |
+| Partition source | DTS / mtdparts / GPT / UBI volume [待填] | DTS / bootargs / build artifacts | BMC | [待確認] |
+| Update image type | static.mtd.tar / ubi.mtd.tar / wic / custom [待填] | tmp/deploy/images | BMC | [待確認] |
+| A/B slot | 有 / 無 [待填] | update design | BMC / PM | [待確認] |
+| Golden / recovery image | 有 / 無 [待填] | schematic / image layout | BMC / HW | [待確認] |
+| Persistent data policy | rwfs / overlay / whitelist [待填] | init script / service config | BMC | [待確認] |
+| Factory reset scope | [待填] | product policy | BMC / PM / Security | [待確認] |
+| Secure boot / signature | [待填] | security design | Security / BMC | [待確認] |
+| Rollback policy | [待填] | update design | BMC / QA | [待確認] |
+
+分區明細範本：
+
+| 名稱 | Device / Volume | Offset | Size | Type | FS | Mount point | 更新時是否覆寫 | 保存策略 | 備註 |
+| --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- |
+| u-boot | mtd0 | [待填] | [待填] | raw | none | N/A | 預設否 | golden / factory tool | BootROM 讀取路徑 |
+| u-boot-env | mtd1 | [待填] | [待填] | raw | env | N/A | 依流程 | redundant env [待填] | fw_env.config 需對齊 |
+| kernel-a | mtd2 / ubi volume / p1 | [待填] | [待填] | raw / UBI / block | FIT / Image | N/A | 是 | A slot | [待填] |
+| rofs-a | mtd3 / ubi volume / p2 | [待填] | [待填] | raw / UBI / block | SquashFS | / lower | 是 | A slot | [待填] |
+| kernel-b | [待填] | [待填] | [待填] | [待填] | [待填] | N/A | 是 | B slot | [待填] |
+| rofs-b | [待填] | [待填] | [待填] | [待填] | SquashFS | / lower | 是 | B slot | [待填] |
+| rwfs | [待填] | [待填] | [待填] | raw / UBI / block | JFFS2 / UBIFS / ext4 | /var、/etc overlay | 否 | 保存 | 需監控容量 |
+| logs / dumps | [待填] | [待填] | [待填] | block / UBI | ext4 / UBIFS | /var/log / dumps | 視政策 | 可清除 | 避免擠壓設定空間 |
+| recovery | [待填] | [待填] | [待填] | [待填] | [待填] | rescue root | 預設否 | write protect | [待填] |
+
+#### 2.5 Device Tree、U-Boot 與 kernel bootargs 對齊
+
+Flash layout 可能同時出現在 DTS、U-Boot env、Yocto image recipe、initramfs script、update service 與文件中。排查時需先確認「哪一份資料是現在 running image 實際使用的來源」。
+
+常見來源：
+
+| 來源 | 檔案 / 指令 | 作用 |
+| --- | --- | --- |
+| Device Tree fixed-partitions | arch/.../dts/*.dts | kernel 產生 /proc/mtd partition |
+| U-Boot mtdparts | printenv mtdparts / bootargs | bootloader 與 kernel partition 傳遞 |
+| U-Boot env config | fw_env.config | Linux userspace 讀寫 env offset |
+| Yocto image layout | image recipe、machine conf、wks、ubinize cfg | 產出 update tar / flash image |
+| Initramfs / preinit | obmc init scripts、preinit-mounts | 掛載 rofs / rwfs / overlay |
+| Update service | phosphor-bmc-code-mgmt / platform updater | 擷取 tar、驗證 manifest、寫入分區 |
+
+##### 2.5.1 DTS fixed-partitions 範本
+
+```dts
+&fmc {
+    status = "okay";
+
+    flash@0 {
+        status = "okay";
+        m25p,fast-read;
+        label = "bmc";
+
+        partitions {
+            compatible = "fixed-partitions";
+            #address-cells = <1>;
+            #size-cells = <1>;
+
+            uboot@0 {
+                label = "u-boot";
+                reg = <0x00000000 0x00100000>;
+                read-only;
+            };
+
+            uboot_env@100000 {
+                label = "u-boot-env";
+                reg = <0x00100000 0x00020000>;
+            };
+
+            kernel@120000 {
+                label = "kernel";
+                reg = <0x00120000 0x00600000>;
+            };
+
+            rofs@720000 {
+                label = "rofs";
+                reg = <0x00720000 0x03200000>;
+            };
+
+            rwfs@3920000 {
+                label = "rwfs";
+                reg = <0x03920000 0x006e0000>;
+            };
+        };
+    };
+};
+```
+
+檢查重點：
+
+- reg offset / size 需與 erase block 對齊。
+- label 需與 /proc/mtd、update script、init script 使用名稱一致。
+- bootloader / golden 分區若不可被 OS 更新，DTS 可加 read-only，但仍需確認 mtdchar / update tool 是否可能繞過。
+- SPI-NOR 4-byte address mode、dual/quad mode、clock frequency 需與 flash 型號確認。
+
+##### 2.5.2 U-Boot env / bootargs 需保存的資訊
+
+```text
+printenv
+printenv bootcmd
+printenv bootargs
+printenv mtdparts
+printenv bootcount
+printenv upgrade_available
+printenv obmc_bootpart
+printenv bootargs_a
+printenv bootargs_b
+```
+
+fw_env.config 範本：
+
+```text
+# device       offset      env-size    sector-size
+/dev/mtd1      0x0000      0x10000     0x10000
+# redundant env 範例：
+# /dev/mtd2    0x0000      0x10000     0x10000
+```
+
+檢查重點：
+
+- fw_env.config 的 device / offset / env-size / sector-size 必須對齊 U-Boot build config。
+- 若 env 放在 raw NOR 固定 offset，更新 rootfs 不應覆寫 env。
+- A/B slot 需要保存 active slot、boot priority、boot retry 與 mark-good 相關變數。
+- 若 secure boot 啟用，U-Boot env 可寫性、script source、bootcmd 變更權限都要納入安全評估。
+
+#### 2.6 Build 與 image 產出檢查
+
+OpenBMC 常見輸出會在 `tmp/deploy/images/<machine>/` 內產生不同 image type。不同 layout 可能對應 `.static.mtd.tar`、`.ubi.mtd.tar`、`.wic`、`.ext4`、`.squashfs` 或平台客製 tar。實際以 machine / distro / image recipe 為準。
+
+常用檢查：
+
+```sh
+# build 端：確認 image type 與輸出
+bitbake -e obmc-phosphor-image | grep '^IMAGE_FSTYPES='
+bitbake -e obmc-phosphor-image | grep -E '^(MACHINE|DISTRO|FLASH_SIZE|IMAGE_ROOTFS_SIZE)='
+ls -lh tmp/deploy/images/${MACHINE}/
+
+# 檢查 tar 內容與 manifest
+tar tf tmp/deploy/images/${MACHINE}/*.mtd.tar | sort
+tar xfO tmp/deploy/images/${MACHINE}/*.mtd.tar MANIFEST
+
+# 檢查 rootfs 大小與 deploy symlink
+ls -lh tmp/deploy/images/${MACHINE}/*{squashfs,ubi,wic,ext4,mtd.tar} 2>/dev/null
+```
+
+建置端需保存：
+
+| 資料 | 範例指令 | 用途 |
+| --- | --- | --- |
+| image manifest | tar xfO image.tar MANIFEST | 驗證 version、purpose、MachineName、KeyType |
+| image type | bitbake -e image \\| grep IMAGE_FSTYPES | 確認 static / UBI / wic |
+| partition config | grep / inspect DTS、ubinize cfg、wks | 確認 layout source |
+| U-Boot config | grep CONFIG_ENV_、CONFIG_BOOTCOUNT | 確認 env 與 A/B policy |
+| kernel config | grep MTD、UBI、UBIFS、OVERLAY_FS | 確認 filesystem 支援 |
+| deploy checksum | sha256sum image | 現場比對 |
+
+#### 2.7 Target 端檢查指令與 log 收集
+
+Bring-up / 更新 / 現場排查時，建議一次收集下列資訊，避免只看到單一 layer 的現象。
+
+##### 2.7.1 基本分區與掛載狀態
+
+```sh
+# MTD / UBI / block device
+cat /proc/mtd
+cat /proc/partitions
+ls -l /dev/mtd* /dev/ubi* /dev/mmcblk* 2>/dev/null
+
+# mount 與空間
+findmnt -R /
+mount
+cat /proc/mounts
+df -h
+df -i
+
+# filesystem type
+blkid 2>/dev/null
+lsblk -f 2>/dev/null
+```
+
+##### 2.7.2 Kernel log
+
+```sh
+# flash / partition / filesystem 相關 log
+dmesg | grep -Ei 'mtd|spi-nor|spi.*nand|nand|ubi|ubifs|jffs2|squashfs|overlay|mmc|ext4|verity'
+
+# rootfs mount 失敗時，需保存完整 dmesg
+dmesg -T > /tmp/dmesg-storage.txt
+journalctl -b > /tmp/journal-storage.txt
+```
+
+應留意的 log pattern：
+
+| Log pattern | 可能方向 | 後續檢查 |
+| --- | --- | --- |
+| `mtd: partition ... extends beyond the end` | DTS / mtdparts size 超出 flash | 核對 flash size、partition offset |
+| `spi-nor ... unrecognized JEDEC id` | flash 型號或 SPI wiring / mode 問題 | JEDEC ID、DTS compatible、SPI clock |
+| `UBI error: bad VID header offset` | ubinize / kernel UBI 參數不一致 | VID header、min_io_size、sub-page |
+| `UBI: attaching mtdX` 後失敗 | bad block、ECC、volume table 問題 | mtdinfo、ubiformat、flash dump |
+| `UBIFS error` | UBIFS metadata 或 mount 參數問題 | ubinfo、journal、power loss 歷史 |
+| `SQUASHFS error` | rofs 損壞或讀取錯誤 | image checksum、flash readback |
+| `overlayfs: upper fs does not support xattr` | upper filesystem 不符合 OverlayFS 需求 | rwfs filesystem、mount option |
+| `VFS: Cannot open root device` | root= / rootfstype / initramfs 錯 | bootargs、initramfs、partition name |
+| `EXT4-fs warning/error` | eMMC / ext4 / power loss 問題 | fsck、eMMC health、journal policy |
+
+##### 2.7.3 UBI / UBIFS 檢查
+
+```sh
+# 需要 mtd-utils / ubi-utils
+mtdinfo -a 2>/dev/null
+ubinfo -a 2>/dev/null
+cat /sys/class/ubi/ubi*/mtd_num 2>/dev/null
+cat /sys/class/ubi/ubi*/volumes_count 2>/dev/null
+cat /sys/class/ubi/ubi*_*/* 2>/dev/null | head
+```
+
+重點欄位：
+
+| 欄位 | 說明 |
+| --- | --- |
+| PEB size | Physical eraseblock size，需與 flash / kernel 偵測一致 |
+| LEB size | Logical eraseblock size，建 image 時 mkfs.ubifs / ubinize 需對齊 |
+| VID header offset | UBI metadata 位置，SPI-NAND 常見差異點 |
+| Min I/O size | page / subpage 相關，影響 ubinize 參數 |
+| Bad PEB count | NAND bad block 數量，需確認是否在規格內 |
+| Volume type | static / dynamic，rofs / kernel / rwfs 需求不同 |
+| Corrupted count | 若非 0，需要保存 log 與 flash dump 進一步分析 |
+
+##### 2.7.4 U-Boot env 與 slot 狀態
+
+```sh
+fw_printenv 2>/tmp/fw_printenv.err | sort
+cat /tmp/fw_printenv.err
+
+# 常見 slot / bootcount 欄位，依平台命名調整
+fw_printenv bootcount upgrade_available bootlimit 2>/dev/null
+fw_printenv obmc_bootpart openbmconce bootargs mtdparts 2>/dev/null
+```
+
+若 fw_printenv 失敗，先檢查：
+
+```sh
+cat /etc/fw_env.config
+cat /proc/mtd
+hexdump -C /dev/mtdX | head
+```
+
+常見方向：
+
+- fw_env.config 指到錯誤 mtd partition。
+- env size / sector size 與 U-Boot build config 不一致。
+- env CRC 不符，U-Boot 使用預設值但 Linux userspace 讀不到有效 env。
+- read-only DTS 或 flash write protect 導致 fw_setenv 無法更新 slot metadata。
+
+##### 2.7.5 OpenBMC software update 狀態
+
+```sh
+busctl tree xyz.openbmc_project.Software.BMC.Updater 2>/dev/null
+busctl tree xyz.openbmc_project.Software.Version 2>/dev/null
+busctl tree xyz.openbmc_project.Software.Activation 2>/dev/null
+
+# 依平台 service 名稱調整
+systemctl status phosphor-bmc-code-mgmt.service --no-pager 2>/dev/null
+journalctl -u phosphor-bmc-code-mgmt.service -b --no-pager 2>/dev/null | tail -200
+journalctl -b --no-pager | grep -Ei 'software|activation|updater|image|manifest|version|flash|mtd|ubi' | tail -300
+```
+
+Redfish 檢查：
+
+```sh
+curl -k -u <user>:<password> https://<bmc>/redfish/v1/UpdateService
+curl -k -u <user>:<password> https://<bmc>/redfish/v1/UpdateService/FirmwareInventory
+curl -k -u <user>:<password> https://<bmc>/redfish/v1/TaskService/Tasks
+```
+
+#### 2.8 更新流程與 rollback 驗證
+
+更新流程建議拆成「上傳、驗證、寫入、切換、重開機、mark-good、清理」幾段，各段都應有 log 與失敗回復策略。
+
+| 階段 | 檢查項目 | 需要保存的 log / 狀態 |
+| --- | --- | --- |
+| 上傳 | image 是否完整、空間是否足夠 | /tmp/images、df -h、bmcweb log |
+| 驗證 | manifest、MachineName、purpose、signature | MANIFEST、journal、activation object |
+| 寫入 | 目標 slot、partition / volume、進度 | activation progress、dmesg、updater journal |
+| 切換 | U-Boot env / boot metadata 更新 | fw_printenv before/after、slot metadata |
+| 重開機 | 是否從新 slot 開機 | UART log、bootargs、/proc/cmdline |
+| mark-good | 成功條件是否達成 | systemd ready、software active / functional association |
+| rollback | 失敗時是否回到前一 slot | bootcount、watchdog reset reason、previous slot boot log |
+| 清理 | 非 running image 是否可刪除 | software inventory、flash free space |
+
+最小驗證矩陣：
+
+| 測試 | 預期結果 | 備註 |
+| --- | --- | --- |
+| 同版更新 | 可完成 activation，重開後版本一致 | 驗證基本流程 |
+| 升版更新 | 新 slot 開機並標記 functional | 保存 before / after manifest |
+| 降版更新 | 依 policy 允許或拒絕 | 若有 anti-rollback 需明確記錄 |
+| 更新中斷電 | 不應造成雙 slot 都不可開機 | AC loss timing 需記錄 |
+| 寫入中 BMC reset | 可回到舊版或繼續處理 | 觀察 update metadata |
+| 新 image kernel panic | bootloader 回退到舊 slot | 需驗證 bootcount / watchdog |
+| 新 image userspace fail | 未 mark-good 時回退或停留救援 | 需定義 timeout |
+| rwfs 滿載 | update 應拒絕或清楚報錯 | df -h / journal |
+| factory reset | 只清指定資料，不破壞 image | 驗證保留清單 |
+| golden boot | 可進救援 image 並重新刷寫 | 測試手動 / 自動入口 |
+
+#### 2.9 Persistent data、log 與 factory reset
+
+BMC 上需要持久保存的資料類型差異很大，不建議全部放入同一個「可寫 rootfs」後不加管理。
+
+| 資料類型 | 常見路徑 | 是否應保留於更新 | Factory reset 是否清除 | 備註 |
+| --- | --- | --- | --- | --- |
+| Network config | /etc/systemd/network、NetworkManager / systemd-networkd state | 是 | 視產品需求 | 現場管理連線依賴此資料 |
+| User / password | /etc/passwd、/etc/shadow、使用者資料庫 | 是 | 通常清除或回預設 | 需符合安全政策 |
+| SSH host key | /etc/ssh/ssh_host_* | 是 | 視安全政策 | 清除後 client 會看到 host key 變更 |
+| TLS certificate | /etc/ssl、/var/lib | 是 | 視產品需求 | 需避免私鑰外洩 |
+| FRU cache | /var/lib、Entity Manager cache | 通常是 | 視來源 | 若可由 EEPROM 重建，可清除 |
+| SEL / event log | /var/log、phosphor-logging | 視產品需求 | 通常可清除 | 需定義容量與輪替 |
+| Crash dump | /var/lib/systemd/coredump、/var/dump | 視需求 | 可清除 | 避免佔滿 rwfs |
+| Firmware staging | /tmp/images、/var/tmp | 否 | 可清除 | 優先放 tmpfs 或 staging partition |
+| Factory data | /var/lib/factory、VPD backup | 是 | 通常不可清除 | 建議獨立分區或保護機制 |
+| Calibration data | /var/lib/platform/calibration | 是 | 通常不可清除 | sensor / fan / power policy 可能使用 |
+
+建議：
+
+- 對每個保存資料建立 owner、路徑、格式版本、migration policy 與 reset policy。
+- rwfs 空間需設定監控與 log rotation，避免 event log 或 dump 佔滿導致 service 寫入失敗。
+- Factory reset 不應等同於 erase all flash；需明確列出可清與不可清資料。
+- 若支援 downgrade，需定義新舊版本設定檔相容性；必要時保留版本戳記與 migration log。
+
+#### 2.10 常見問題與排查入口
+
+| 現象 | 可能方向 | 第一輪檢查 |
+| --- | --- | --- |
+| /proc/mtd 分區名稱不對 | DTS fixed-partitions 未更新，或 bootargs mtdparts 覆蓋 | dmesg、/proc/cmdline、DTB 反編譯 |
+| U-Boot 能讀 flash，但 kernel 找不到 rootfs | bootargs root= / ubi.mtd / rootfstype 不對 | printenv bootargs、dmesg、/proc/mtd |
+| 更新後仍開舊版 | slot metadata 未切換、mark-good / priority 未更新 | fw_printenv、software association、UART boot log |
+| 更新後無法開機 | kernel / DTB / rofs slot 不一致 | dump active slot offset、比對 manifest |
+| rwfs 掛載失敗 | JFFS2 / UBIFS / ext4 metadata 問題 | dmesg filesystem log、mtdinfo / fsck |
+| OverlayFS 沒套上 | initramfs / preinit mount 順序錯、upper 不支援 xattr | findmnt、journal、dmesg overlayfs |
+| fw_printenv 讀不到 | fw_env.config 錯或 env CRC 壞 | /etc/fw_env.config、U-Boot printenv |
+| UBI attach 失敗 | ubinize 參數、VID header、bad block、ECC 不一致 | dmesg UBI、ubinfo、mtdinfo |
+| SquashFS error | rofs 寫入不完整、flash read error、offset 錯 | sha256、mtd readback、dmesg |
+| eMMC rootfs 偶發 read-only | ext4 journal / eMMC health / power loss | dmesg ext4/mmc、fsck、ext_csd |
+| update tar 被拒絕 | MANIFEST MachineName / purpose / signature 不符 | updater journal、tar xfO MANIFEST |
+| factory reset 後不可登入 | reset scope 清掉必要帳號或網路設定 | reset script、保留清單、journal |
+
+#### 2.11 Bring-up 建議流程
+
+1. 確認 hardware：flash 型號、容量、供電、WP / HOLD、strap、eMMC EXT_CSD。
+2. 確認 early boot：BootROM 可讀 media，U-Boot 可讀 kernel / DTB / rootfs。
+3. 對齊 partition source：DTS、U-Boot mtdparts、Yocto image layout、update script。
+4. 確認 kernel driver：SPI-NOR / NAND / eMMC、MTD、UBI、UBIFS、SquashFS、OverlayFS、ext4 config。
+5. boot 一次乾淨 image，保存 UART、dmesg、/proc/mtd、/proc/cmdline、findmnt、df。
+6. 驗證 rwfs / overlay：建立檔案、重開機後確認保留，factory reset 後確認清除範圍。
+7. 驗證更新：同版、升版、失敗回復、斷電、watchdog、rollback。
+8. 驗證 golden / recovery：手動入口、自動入口、重新刷寫 production image。
+9. 長測：AC cycle、BMC reboot、update loop、rwfs fill、log rotation、power loss。
+10. 文件收斂：更新本章分區表、log、版本、owner 與已知限制。
+
+#### 2.12 當前平台 Flash / Storage 實測表
+
+| 項目 | 指令 / 來源 | 實測值 | 備註 |
+| --- | --- | --- | --- |
+| BMC image version | cat /etc/os-release | [待填] | VERSION_ID / BUILD_ID |
+| Kernel version | uname -a | [待填] | 需對應 DTS commit |
+| Bootargs | cat /proc/cmdline | [待填] | root= / ubi.mtd / mtdparts |
+| Partition table | cat /proc/mtd | [待填] | 保存完整輸出 |
+| Mount tree | findmnt -R / | [待填] | rofs / rwfs / overlay |
+| Disk usage | df -h; df -i | [待填] | rwfs inode 也需看 |
+| U-Boot env | fw_printenv | [待填] | 保存 before / after update |
+| UBI info | ubinfo -a | [待填] | UBI 平台必填 |
+| eMMC info | mmc extcsd read / sysfs | [待填] | eMMC 平台必填 |
+| Update inventory | busctl tree / software objects | [待填] | active / functional association |
+| Redfish UpdateService | curl UpdateService | [待填] | 若平台支援 Redfish |
+| Golden image entry | strap / env / GPIO / CPLD | [待填] | 手動與自動入口 |
+| Factory reset result | reset 後 diff | [待填] | 確認保留清單 |
+
+建議保存 log 套件：
+
+```sh
+mkdir -p /tmp/storage-debug
+cat /etc/os-release > /tmp/storage-debug/os-release.txt
+uname -a > /tmp/storage-debug/uname.txt
+cat /proc/cmdline > /tmp/storage-debug/proc-cmdline.txt
+cat /proc/mtd > /tmp/storage-debug/proc-mtd.txt 2>&1
+cat /proc/partitions > /tmp/storage-debug/proc-partitions.txt
+findmnt -R / > /tmp/storage-debug/findmnt.txt
+mount > /tmp/storage-debug/mount.txt
+df -h > /tmp/storage-debug/df-h.txt
+df -i > /tmp/storage-debug/df-i.txt
+fw_printenv > /tmp/storage-debug/fw_printenv.txt 2>&1
+mtdinfo -a > /tmp/storage-debug/mtdinfo.txt 2>&1
+ubinfo -a > /tmp/storage-debug/ubinfo.txt 2>&1
+blkid > /tmp/storage-debug/blkid.txt 2>&1
+lsblk -f > /tmp/storage-debug/lsblk-f.txt 2>&1
+dmesg -T > /tmp/storage-debug/dmesg.txt
+journalctl -b --no-pager > /tmp/storage-debug/journal.txt
+tar czf /tmp/storage-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp storage-debug
+```
+
+#### 2.13 驗收 Checklist
+
+- [ ] Boot media 型號、容量、erase block / page size 已記錄。
+- [ ] BootROM、U-Boot、kernel、userspace 對同一份 layout 的理解一致。
+- [ ] DTS fixed-partitions / U-Boot mtdparts / Yocto image layout / update script 未互相矛盾。
+- [ ] /proc/mtd 或 /proc/partitions 與設計表一致。
+- [ ] rootfs 掛載型態符合設計：SquashFS / UBIFS / ext4 / overlay。
+- [ ] rwfs 可寫、重開機保留，且空間與 inode 有監控方式。
+- [ ] fw_printenv / fw_setenv 可正常讀寫，且 env offset / size 正確。
+- [ ] software update 可完成同版與升版測試。
+- [ ] A/B slot 可切換、mark-good、rollback，並保存相關 log。
+- [ ] 更新中斷電 / BMC reset / watchdog reset 不會讓系統進入不可回復狀態。
+- [ ] Golden / recovery image 可啟動並可重新刷寫 production image。
+- [ ] Factory reset 清除範圍與保留範圍已驗證。
+- [ ] 安全設定包含 image signature、secure boot、anti-rollback、field mode 或其不啟用理由。
+- [ ] 量產燒錄工具、維修流程與本章分區表一致。
+
+#### 2.15 本章參考資料
+
+- Linux kernel documentation - UBI File System: https://www.kernel.org/doc/html/latest/filesystems/ubifs.html
+- Linux MTD project - UBIFS FAQ and HOWTO: http://linux-mtd.infradead.org/faq/ubifs.html
+- Linux kernel documentation - Overlay Filesystem: https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html
+- OpenBMC docs - Flash Layout and Filesystem Documentation: https://github.com/openbmc/docs/blob/master/architecture/code-update/flash-layout.md
+- OpenBMC docs - Code Update: https://github.com/openbmc/docs/blob/master/architecture/code-update/code-update.md
+- U-Boot documentation - Environment variables and boot flow: https://docs.u-boot.org/
+- Yocto Project Reference Manual - Images and filesystem types: https://docs.yoctoproject.org/ref-manual/
 
 ### 3. Pinmux / GPIO 通用設計模式
 
