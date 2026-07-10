@@ -1,6 +1,5 @@
-# BMC 通用 Porting 技術參考手冊 - 拆分索引
+# BMC 通用 Porting 技術參考
 
-此資料夾由 `bmc_guide_filled.md` 依「部分」建立資料夾，並依主章節拆分為 Markdown 檔。
 
 ## 檔案結構
 
@@ -65,8 +64,8 @@
 
 ### 第八部分：工廠與生產
 
-- [32. Manufacturing / Factory](05_第八部分_工廠與生產/32_Manufacturing_Factory.md)
-- [33. Calibration / Board Data / Provisioning](05_第八部分_工廠與生產/33_Calibration_Board_Data_Provisioning.md)
+- [32. Manufacturing / Factory](08_第八部分_工廠與生產/32_Manufacturing_Factory.md)
+- [33. Calibration / Board Data / Provisioning](08_第八部分_工廠與生產/33_Calibration_Board_Data_Provisioning.md)
 
 ### 第九部分：平台差異筆記本
 
