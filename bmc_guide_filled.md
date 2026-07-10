@@ -81,6 +81,7 @@
 | 2026-07-10 |  0.37 | Copilot | 撰寫第 16 章 Logging / Event / Telemetry |
 | 2026-07-10 |  0.38 | Copilot | 撰寫第 20 章 MCTP / PLDM / SPDM |
 | 2026-07-10 |  0.39 | Copilot | 撰寫第 9 章 Kernel Driver 與核心服務 |
+| 2026-07-10 |  0.40 | Copilot | 重寫第 10 章為 I2C / PMBus Framework |
 
 ### 0.7 資料來源可信度分級
 
@@ -7252,90 +7253,6 @@ DT 在 BMC bring-up 中主要回答下列問題：
 <tr><td>Storage</td><td>MTD fixed-partitions、flash compatible、SPI mode</td><td>更新策略、software inventory state</td><td>/proc/mtd、dmesg mtd/ubi</td></tr>
 <tr><td>GPIO / Pinmux</td><td>gpio-line-names、pinctrl state、consumer GPIO polarity</td><td>按鈕長按策略、LED pattern policy</td><td>gpioinfo、pinctrl debugfs</td></tr>
 <tr><td>OpenBMC userspace</td><td>提供 kernel device 與 line name 基礎</td><td>Entity Manager probe rule、sensor scale / threshold、thermal policy</td><td>busctl、journalctl、systemctl</td></tr>
-<tr>
-<td>  
-2026-07-10
-</td>
-<td>  
-0.34
-</td>
-<td>  
-Copilot
-</td>
-<td>  
-撰寫第 8 章 Device Tree 通用寫法與排查，補齊 binding、DTS/DTSI/DTB、pinctrl/GPIO、I2C/SPI/flash、console、network、sensor controller、reserved memory、dtbs_check、target log 收集、回查結果與驗收 checklist
-</td>
-</tr>
-<tr>
-<td>  
-2026-07-10
-</td>
-<td>  
-0.35
-</td>
-<td>  
-Copilot
-</td>
-<td>  
-撰寫第 10 章 I2C / PMBus 裝置驅動架構，補齊 I2C 拓樸、Device Tree、Linux i2c sysfs、hwmon、PMBus page/phase/format/status、Entity Manager / dbus-sensors、Redfish / IPMI 對映、fault snapshot、log 收集、回查結果與驗收 checklist
-</td>
-</tr>
-<tr>
-<td>  
-2026-07-10
-</td>
-<td>  
-0.36
-</td>
-<td>  
-Copilot
-</td>
-<td>  
-撰寫第 15 章 Inventory / FRU / Asset 資料模型，補齊資料權威端、OpenBMC inventory D-Bus object、FRU EEPROM / IPMI FRU 欄位、Entity Manager Probe、Presence / Functional、association、Redfish / IPMI 對映、製造 provisioning、資料保存、log 收集、回查結果與驗收 checklist
-</td>
-</tr>
-<tr>
-<td>  
-2026-07-10
-</td>
-<td>  
-0.37
-</td>
-<td>  
-Copilot
-</td>
-<td>  
-撰寫第 16 章 Logging / Event / Telemetry，補齊 phosphor-logging、systemd journal、D-Bus event log、SEL、Redfish EventLog / EventService、TelemetryService / MetricReport、remote syslog、安全 audit、core dump、容量策略、log 收集、回查結果與驗收 checklist；原 Presence / Intrusion / GPIO State Sensor 順延為第 17 章
-</td>
-</tr>
-<tr>
-<td>  
-2026-07-10
-</td>
-<td>  
-0.38
-</td>
-<td>  
-Copilot
-</td>
-<td>  
-撰寫第 20 章 MCTP / PLDM / SPDM，補齊 transport binding、EID / discovery / route、OpenBMC mctpd / pldmd、PLDM types / PDR / FRU / BIOS / firmware update、SPDM attestation / certificate / measurement / policy、log 收集、回查結果與驗收 checklist
-</td>
-</tr>
-<tr>
-<td>  
-2026-07-10
-</td>
-<td>  
-0.39
-</td>
-<td>  
-Copilot
-</td>
-<td>  
-撰寫第 9 章 Kernel Driver 與核心服務，補齊 Linux driver model、probe flow、bus match、deferred probe、kernel config、sysfs / debugfs / hwmon / IIO / GPIO / MTD / watchdog / netdev、OpenBMC service 銜接、dynamic debug / ftrace、panic / oops、log 收集、回查結果與驗收 checklist
-</td>
-</tr>
 </table>
 
 建議分工原則：
@@ -8431,7 +8348,19 @@ tar czf /tmp/kernel-driver-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp kernel-dr
 <tr><td>OpenBMC consumer</td><td>busctl / journal</td><td>[待填]</td><td>D-Bus object 對照</td></tr>
 </table>
 
-#### 9.15 驗收 Checklist
+#### 9.15 回查結果
+
+本章已回查前後文並補齊下列銜接點：
+
+- 第 4 章 Reset / Clock / Power Domain 已描述 dependency，本章補上 probe、deferred probe 與 resource provider 排查。
+- 第 5 章周邊匯流排已描述各 bus，本章補上 platform / I2C / SPI / PCI / MDIO driver match 與 sysfs 對照。
+- 第 8 章 Device Tree 已描述 DTS，本章補上 DT node 如何進入 bus match / probe / subsystem interface。
+- 第 10 章 I2C / PMBus 會依本章的 I2C driver、hwmon、deferred probe 方法進一步展開。
+- 第 12 章 Sensor 抽象層會使用本章的 hwmon / IIO / GPIO interface 轉成 D-Bus sensor。
+- 第 16 章 Logging / Event / Telemetry 可引用本章 panic、oops、driver log 與 kernel-driver-debug 套件。
+- 第 27～28 章 Debug Methodology / Toolkit 可引用本章的 dynamic debug、ftrace、debugfs 與 log package。
+
+#### 9.16 驗收 Checklist
 
 -  Kernel config、driver built-in / module、Yocto recipe 與 image package 已確認。
 -  DTS node 與 driver binding、compatible、resource、interrupt、clock、reset、GPIO、supply 一致。
@@ -8457,106 +8386,159 @@ tar czf /tmp/kernel-driver-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp kernel-dr
 - Linux kernel documentation - ftrace: [https://docs.kernel.org/trace/ftrace.html](https://docs.kernel.org/trace/ftrace.html)
 
 
-### 10. I2C / PMBus 裝置驅動架構
+### 10. I2C / PMBus Framework
 
-本章整理 BMC 平台中 I2C / SMBus / PMBus 裝置的硬體拓樸、Device Tree、Linux driver、hwmon/sysfs、OpenBMC `dbus-sensors`、Entity Manager、Redfish / IPMI 對映、fault handling 與 debug 方法。I2C 在 BMC 中不是單一 bus，而是常由 SoC I2C controller、I2C mux、GPIO expander、CPLD bridge、hot-swap 板卡、FRU EEPROM、PSU / VR / HSC PMBus 裝置串成多層拓樸。PMBus 則是在 SMBus / I2C 之上的電源管理命令集，用於讀取 voltage、current、power、temperature、fan、status word、fault bit、manufacturer data 等資訊。
+本章獨立整理 BMC 平台中的 Linux I2C / SMBus / PMBus framework。Sensor 章節會討論各類 sensor 如何從 hwmon / dbus-sensors 進入 D-Bus、Redfish 與 IPMI；本章則聚焦在 sensor 之前的 bus framework：I2C adapter 如何建立、client device 如何被 instantiate、I2C mux 如何形成 adapter tree、PMBus driver 如何綁定、PMBus sensor 如何映射到 hwmon 與 OpenBMC，以及 PMBus debug 時應先收哪些資料。
 
-Linux I2C 裝置不像 PCI / USB 一樣可由硬體自行枚舉，kernel 需要透過 Device Tree、ACPI、board data 或 userspace new_device 等方式明確建立裝置；BMC embedded 平台通常以 Device Tree 與 OpenBMC Entity Manager / dbus-sensors 共同描述固定與動態裝置。PMBus driver 也不會安全地自動探測所有裝置，因為沒有共同且一定安全的識別 register，通常需要明確指定 driver 與 address。這些限制會直接影響 bring-up 策略、bus scan 方法、hot-plug 設計與現場排查。
+Linux kernel 的 I2C/SMBus 文件將 I2C subsystem 拆成 protocol、device instantiate、bus driver、mux/complex topology、sysfs、driver writing、fault injection 等主題；BMC 平台若未先建立這層框架，後續 sensor、FRU、PSU、VR、CPLD、GPIO expander、fan controller 章節會混在一起排查。PMBus 則是跑在 SMBus/I2C 之上的 power-management protocol，Linux PMBus driver 會透過 hwmon 暴露 voltage、current、power、temperature 等資料，但 PMBus command 標準化不代表每顆裝置都支援同一組命令，因此 driver 選型與 debug 需要特別保守。
 
-#### 10.1 I2C / SMBus / PMBus 分層模型
+#### 10.1 Linux I2C Architecture
 
-建議先把 I2C 類裝置分成五層理解：
+Linux I2C framework 的核心物件可以簡化為三個：`i2c_adapter`、`i2c_client`、`i2c_driver`。Adapter 代表一條可執行 I2C transaction 的 bus；client 代表 bus 上某個 address 的 device；driver 則是支援某類 client 的 kernel driver。
 
 ```text
-硬體拓樸
-  SoC I2C controller / mux / expander / target device / pull-up rail
+SoC I2C controller / mux child bus
     ↓
-Kernel 裝置模型
-  i2c_adapter / i2c_client / driver / hwmon / gpiochip / eeprom / regmap
+i2c_adapter
     ↓
-sysfs / hwmon / debugfs
-  /sys/bus/i2c/devices、/sys/class/hwmon、/sys/kernel/debug
+Device Tree child node / new_device / board info
     ↓
-OpenBMC userspace
-  Entity Manager、dbus-sensors、psusensor、hwmontempsensor、fru-device
+i2c_client：bus + 7-bit address + device type
     ↓
-對外介面與 policy
-  D-Bus、Redfish、IPMI SDR、SEL / EventLog、Fan / Power policy
+i2c_driver match / probe
+    ↓
+hwmon / gpiochip / nvmem / regmap / misc / custom sysfs
+    ↓
+OpenBMC daemon / D-Bus / Redfish / IPMI
 ```
 
-| 層級 | 主要資料 | 常見問題 | 第一輪檢查 |
-|------|----------|----------|------------|
-| 硬體拓樸 | bus、mux channel、address、pull-up、rail、reset、INT | 無 ACK、clock stretch、bus stuck、address conflict | schematic、scope、LA、`i2cdetect` |
-| Kernel | Device Tree node、`i2c_client`、driver binding、kernel config | driver 不 probe、錯 driver、deferred probe | `dmesg`、`/sys/bus/i2c/devices`、`lsmod` |
-| `hwmon` / `sysfs` | `in*_input`、`curr*_input`、`power*_input`、`temp*_input`、`fault` / `status` | 數值比例錯、channel 缺失、label 錯 | `/sys/class/hwmon`、`sensors`、driver docs |
-| OpenBMC | Entity Manager config、D-Bus sensor object、`availability`、`functional` | D-Bus object 缺失、service fail、threshold 錯 | `busctl`、`journalctl`、`systemctl` |
-| 對外介面 | Redfish Sensor / Power / Thermal、IPMI SDR、event log | Web / Redfish 不顯示、IPMI sensor type 錯、事件反覆 | `curl`、`ipmitool`、`journal`、SEL |
+<table>
+<tr><th>Linux 物件</th><th>代表什麼</th><th>BMC 常見例子</th><th>排查入口</th></tr>
+<tr><td>`i2c_adapter`</td><td>一條 root bus 或 mux child bus</td><td>BMC I2C5、PCA9548 channel 0</td><td>`i2cdetect -l`、`/sys/bus/i2c/devices/i2c-*`</td></tr>
+<tr><td>`i2c_client`</td><td>某條 adapter 上的 7-bit address device</td><td>`5-0048` TMP75、`20-0058` PSU PMBus</td><td>`/sys/bus/i2c/devices/<bus>-00<addr>`</td></tr>
+<tr><td>`i2c_driver`</td><td>支援某類 client 的 driver</td><td>`tmp75`、`pmbus`、`pca953x`、`at24`</td><td>`/sys/bus/i2c/drivers`、driver symlink</td></tr>
+<tr><td>`i2c_mux`</td><td>在 parent bus 下建立 child adapters</td><td>`pca954x`、GPIO mux、CPLD mux</td><td>adapter tree、`i2cdetect -l`、mux driver log</td></tr>
+<tr><td>hwmon</td><td>硬體監控標準 sysfs 介面</td><td>PSU power、VR voltage、temperature</td><td>`/sys/class/hwmon/hwmonX`</td></tr>
+</table>
 
-#### 10.2 BMC 常見 I2C / PMBus 裝置類型
+Linux I2C device 不像 PCI / USB 會由硬體自行完整枚舉。對 embedded / BMC 平台，kernel 通常需要透過 Device Tree child node、ACPI、board data 或 debug 用的 `new_device` 明確建立 client。這代表「bus 掃得到 ACK」不等於「driver 已經 probe」，也不等於「OpenBMC sensor 會出現」。
 
-| 類型 | 常見裝置 | Kernel 子系統 | OpenBMC 對應 | 注意事項 |
-|------|----------|---------------|---------------|----------|
-| FRU EEPROM | 24C02 / 24C64 / M24256 | `at24` / `nvmem` | `fru-device`、Entity Manager Probe | address width、page size、write protect、FRU format |
-| Temperature sensor | LM75、TMP75、EMC141x、TMP451 | `hwmon` | `hwmontempsensor` | local / remote channel、offset、fault handling |
-| Voltage / Current / Power monitor | INA2xx、INA233、ADM1275、LM25066 | `hwmon` / `pmbus` | `psusensor`、`dbus-sensors` | shunt resistor、calibration、linear/direct format |
-| PMBus PSU | CRPS、DPS、PFE、vendor PSU | `pmbus` / vendor driver | `psusensor`、power inventory | page、`MFR_*`、presence、AC lost、fault clear |
-| PMBus VR / regulator | IR / MPS / TI multiphase VR | `pmbus` / vendor driver | voltage / current / power / temp sensors | page / phase、`VOUT` mode、`STATUS_WORD`、rail naming |
-| GPIO expander | PCA9555、PCA9539、TCA64xx | `gpiochip` / `irqchip` | presence、LED、power state | reset default、INT、line name、polarity |
-| I2C mux | PCA954x、GPIO mux、CPLD mux | `i2c-mux` | bus topology 基礎 | logical bus number、idle disconnect、mux select owner |
-| CPLD / FPGA | board glue、fault latch、power sequence | `i2c` client / `regmap` / custom | platform daemon、power control | register map、W1C、latch clear、firmware version |
-| Fan / thermal controller | EMC2305、MAX31790、NCT7802 | `hwmon` / `PWM` | `fansensor`、thermal policy | PWM polarity、tach divisor、fan presence gating |
+基本檢查：
 
-#### 10.3 拓樸設計：bus、mux、channel、address
+```bash
+# 列出 logical I2C adapters
+i2cdetect -l
 
-I2C 拓樸文件至少要記錄 physical bus、mux path、logical bus、device address、device type、driver、power domain 與 owner。尤其有 I2C mux 時，Linux 看到的是 logical bus number；這個 number 可能受到 probe 順序影響，因此測試表不能只寫 `i2c-12`，還要寫 physical path。
+# 列出 I2C bus / client / mux child adapters
+ls -l /sys/bus/i2c/devices
+find /sys/bus/i2c/devices -maxdepth 2 -type l -o -type d | sort
 
-拓樸範本：
+# 查看 client 綁定的 driver
+readlink /sys/bus/i2c/devices/<bus>-00<addr>/driver 2>/dev/null
+cat /sys/bus/i2c/devices/<bus>-00<addr>/name 2>/dev/null
 
-| Physical path | Linux bus | Mux path | Address | Device | Driver | Power domain | Owner | 狀態 |
-|---------------|-----------|----------|---------|--------|--------|--------------|-------|------|
-| BMC I2C5 | **[待填]** | none | `0x50` | baseboard FRU EEPROM | `at24` / `fru-device` | `3V3_AUX` | BMC | **[待確認]** |
-| BMC I2C6 → PCA9548 ch0 | **[待填]** | `0x70/ch0` | `0x58` | PSU0 PMBus | `pmbus` / vendor | PSU standby | BMC / PSU | **[待確認]** |
-| BMC I2C6 → PCA9548 ch1 | **[待填]** | `0x70/ch1` | `0x58` | PSU1 PMBus | `pmbus` / vendor | PSU standby | BMC / PSU | **[待確認]** |
-| BMC I2C7 | **[待填]** | none | `0x20` | GPIO expander | `pca953x` | `3V3_AUX` | BMC | **[待確認]** |
+# 查看 kernel log
+dmesg | grep -Ei 'i2c|smbus|pmbus|hwmon|mux|nack|timeout|arbitration|stuck'
+```
 
-Bring-up 注意事項：
+#### 10.2 Adapter：root adapter、mux child adapter 與 bus number
 
-- 同一 bus segment 上不可有 address conflict；mux 不同 channel 上可以重複 address，但文件需清楚標示 path。
-- I2C pull-up 電源域要跟裝置 power state 對齊；host-dependent rail off 時，BMC 可能讀不到該 segment。
-- I2C mux 若設定 idle disconnect，service 讀值時需允許 mux channel 切換時間。
-- 若同一 bus 由 BMC、Host、CPLD 多方存取，需明確 bus owner、arbitration 與 host power state dependency。
-- Hot-plug 裝置需有 presence source、debounce、scan/retry 策略與不存在時的 sensor availability policy。
+`i2c_adapter` 是 Linux 送出 I2C transfer 的入口。Root adapter 通常對應 SoC I2C controller；mux child adapter 則是 I2C mux framework 在 parent adapter 底下建立的 logical bus。
 
-#### 10.4 Device Tree：I2C controller、child device、mux
+<table>
+<tr><th>Adapter 類型</th><th>來源</th><th>Linux 表示</th><th>注意事項</th></tr>
+<tr><td>Root adapter</td><td>SoC I2C controller driver</td><td>`i2c-0`、`i2c-5`</td><td>需要 pinctrl、clock、reset、bus-frequency</td></tr>
+<tr><td>Mux child adapter</td><td>PCA954x / GPIO mux / CPLD mux</td><td>`i2c-20` 這類 logical bus</td><td>bus number 可能受 probe order 影響</td></tr>
+<tr><td>Arbitrated adapter</td><td>multi-master / external master arbitration</td><td>child adapter</td><td>需要 arbitration policy</td></tr>
+<tr><td>Gate adapter</td><td>存取前需開 gate</td><td>child adapter</td><td>select / deselect timing 會影響 timeout</td></tr>
+</table>
 
-固定存在且 kernel driver 需要管理的 I2C device，建議在 DTS 中描述。動態板卡、SKU-dependent device 或 FRU 探測後才知道的 sensor，則可由 Entity Manager configuration 描述，再由 dbus-sensors 建立 D-Bus sensor。
+Adapter debug 重點：
 
-I2C controller 與 child node 範本：
+- `i2cdetect -l` 顯示的是 logical adapter，不一定等同 schematic 上的 physical bus。
+- 若 adapter 是 mux 後的 channel，文件需記錄 parent bus、mux address、channel id。
+- 不建議在 OpenBMC JSON 或腳本中只寫死 bus number；若不得不寫，需驗證重開機、driver probe order 改變、kernel 更新後是否穩定。
+- Adapter name、device path、mux path 比純 bus number 更適合做長期對照。
+- Bus frequency 需符合最慢 device 與 signal integrity；PMBus / PSU / hot-plug bus 不一定適合跑 fast mode。
+
+拓樸表範本：
+
+<table>
+<tr><th>Physical bus</th><th>Linux adapter</th><th>Mux path</th><th>Bus frequency</th><th>Power domain</th><th>Owner</th><th>狀態</th></tr>
+<tr><td>BMC I2C5</td><td>[待填]</td><td>none</td><td>[待填]</td><td>3V3_AUX</td><td>BMC</td><td>[待確認]</td></tr>
+<tr><td>BMC I2C6 → PCA9548 ch0</td><td>[待填]</td><td>0x70/ch0</td><td>[待填]</td><td>PSU standby</td><td>BMC/PSU</td><td>[待確認]</td></tr>
+<tr><td>BMC I2C6 → PCA9548 ch1</td><td>[待填]</td><td>0x70/ch1</td><td>[待填]</td><td>PSU standby</td><td>BMC/PSU</td><td>[待確認]</td></tr>
+</table>
+
+#### 10.3 Client Device：建立方式、address、driver binding
+
+`i2c_client` 是「某條 adapter 上某個 7-bit address 的 device」。BMC 常見 client 包含 EEPROM、temperature sensor、GPIO expander、I2C mux、PMBus PSU / VR / HSC、CPLD / FPGA、fan controller。
+
+常見建立方式：
+
+<table>
+<tr><th>方式</th><th>用途</th><th>優點</th><th>限制</th></tr>
+<tr><td>Device Tree child node</td><td>固定存在的 embedded device</td><td>正式、可描述 GPIO / IRQ / supply</td><td>不適合純動態熱插拔資訊</td></tr>
+<tr><td>`new_device`</td><td>bring-up / debug 暫時建立 client</td><td>快速驗證 driver 是否可綁定</td><td>不應作為正式產品路徑</td></tr>
+<tr><td>driver detect</td><td>少數 legacy driver 掃描 address</td><td>自動化</td><td>PMBus / EEPROM / CPLD 不建議隨意偵測</td></tr>
+<tr><td>platform daemon</td><td>依 FRU / presence / SKU 動態建立</td><td>可支援可插拔與 SKU 差異</td><td>需處理 race、remove、service restart</td></tr>
+</table>
+
+DTS 範本：
 
 ```dts
 &i2c5 {
     status = "okay";
     bus-frequency = <100000>;
 
+    temperature-sensor@48 {
+        compatible = "ti,tmp75";
+        reg = <0x48>;
+    };
+
     eeprom@50 {
         compatible = "atmel,24c64";
         reg = <0x50>;
         pagesize = <32>;
     };
-
-    temperature-sensor@48 {
-        compatible = "ti,tmp75";
-        reg = <0x48>;
-    };
 };
 ```
 
-I2C mux 範本：
+重要規則：
+
+- I2C address 使用 7-bit address；若 datasheet 寫 0x90 / 0x91，通常 DTS / `new_device` 要填 0x48。
+- 同一 bus segment 上不可有 address conflict；mux 不同 channel 可重複 address。
+- `compatible` / driver name / modalias 需和 kernel driver 支援表對上。
+- `i2cdetect` 掃到 ACK 只表示有 device 回應，不表示 driver 正確或資料可安全讀取。
+- `UU` 表示 address 已被 kernel driver 佔用，不是錯誤。
+
+Debug 用 `new_device`：
+
+```bash
+# 範例：在 i2c-5 0x48 暫時建立 tmp75 client
+echo tmp75 0x48 > /sys/bus/i2c/devices/i2c-5/new_device
+
+# 移除 debug client
+echo 0x48 > /sys/bus/i2c/devices/i2c-5/delete_device
+```
+
+#### 10.4 Mux：I2C adapter tree 與複雜拓樸
+
+BMC 平台常用 PCA9548 / PCA9546 / GPIO mux / CPLD mux 將多個相同 address 的裝置隔離到不同 channel，例如 PSU0 / PSU1 都是 0x58。Linux I2C mux framework 會把每個 mux channel 表示成一個 child adapter。Kernel 文件也指出複雜 I2C topology 可能用於避免 address collision、處理外部 master arbitration、或透過 gate 隔離 bus noise；Linux 會以 adapter tree 表達這些拓樸。
+
+```text
+root adapter i2c-6
+  └── mux@70 pca9548
+        ├── channel 0 → child adapter i2c-20 → psu0@58
+        ├── channel 1 → child adapter i2c-21 → psu1@58
+        └── channel 2 → child adapter i2c-22 → riser@50
+```
+
+DTS 範本：
 
 ```dts
 &i2c6 {
     status = "okay";
-    bus-frequency = <100000>;
 
     i2c-mux@70 {
         compatible = "nxp,pca9548";
@@ -8590,110 +8572,111 @@ I2C mux 範本：
 };
 ```
 
-DTS 檢查重點：
+Mux debug 重點：
 
-- I2C device `reg` 是 7-bit address，例如 datasheet 顯示 0x90/0x91 時，DTS 通常填 0x48。
-- `bus-frequency` 需符合 bus segment 上最慢裝置與 signal integrity 量測結果。
-- Mux channel child node 需有 `#address-cells = <1>; #size-cells = <0>;`，並用 `reg = <channel>` 表示 channel。
-- 若裝置有 ALERT / INT / reset / enable pin，需在 DTS 或平台設定中補齊 active level 與 dependency。
-- PMBus generic `compatible = "pmbus";` 可用於部分通用裝置，但 vendor-specific driver 常能提供較完整的 page、phase、format、fault support。
+- 先確認 parent adapter 可用，再確認 mux client 是否 probe，再確認 child adapter 是否建立。
+- 若 child adapter 不存在，後面的 PSU / sensor driver 不會 probe。
+- `i2c-mux-idle-disconnect` 可降低 channel 互相干擾，但會增加 select / deselect 行為，需要看裝置是否能接受。
+- Multi-level mux 需保存完整 path，不要只寫最後 bus number。
+- 若 mux select 需要 I2C transfer，需注意 locking、nested transfer、timeout 與 deadlock 風險。
 
-#### 10.5 Linux I2C 裝置模型與 sysfs 對照
-
-Linux I2C 主要由 `i2c_adapter`、`i2c_client` 與 `i2c_driver` 組成。BMC target 上常用 `/sys/bus/i2c/devices` 觀察 bus 與 device：
-
-```text
-/sys/bus/i2c/devices/
-  i2c-0        logical I2C bus
-  i2c-1        logical I2C bus
-  1-0048       bus 1, address 0x48 device
-  6-0070       bus 6, address 0x70 mux
-  i2c-20       mux channel logical bus
-  20-0058      mux 後 PSU0 at 0x58
-```
-
-常用指令：
+Mux 檢查：
 
 ```bash
-# 列出 logical I2C bus 與 adapter name
 i2cdetect -l
-
-# 查看 I2C sysfs 拓樸
-ls -l /sys/bus/i2c/devices
-find /sys/bus/i2c/devices -maxdepth 2 -type l -o -type d | sort
-
-# 指定 bus 掃描，請先確認該 bus 可以安全掃描
-i2cdetect -y <bus>
-
-# 查看某 device 綁定的 driver
-readlink /sys/bus/i2c/devices/<bus>-00<addr>/driver 2>/dev/null
-cat /sys/bus/i2c/devices/<bus>-00<addr>/name 2>/dev/null
+ls -l /sys/bus/i2c/devices | grep -E 'i2c-|0070|0071'
+dmesg | grep -Ei 'i2c.*mux|pca954|pca954x|mux'
 ```
 
-`i2cdetect` 使用提醒：
+#### 10.5 PMBus Driver Framework
 
-- 不建議在未確認前對 PMBus、EEPROM、CPLD、host-owned bus 執行 aggressive scan。
-- 量產 log 收集可優先用 `i2cdetect -l`、sysfs topology、已知 safe register read，避免任意 probing。
-- `UU` 表示該 address 已被 kernel driver 佔用，不代表錯誤；代表該 address 已有 i2c_client / driver。
-- Bus number 是 logical number；請搭配 mux path 與 adapter name 判讀。
-
-#### 10.6 Driver binding、new_device 與動態建立裝置
-
-Bring-up 初期常需要先確認某顆 I2C device 是否能被 driver 綁定。若該 device 尚未寫進 DTS，可用 `new_device` 暫時建立 i2c_client；正式版本仍建議回到 DTS 或 Entity Manager / platform service 描述。
-
-```bash
-# 範例：在 i2c-5 的 0x48 建立 tmp75 device
-echo tmp75 0x48 > /sys/bus/i2c/devices/i2c-5/new_device
-
-# 移除該 device
-echo 0x48 > /sys/bus/i2c/devices/i2c-5/delete_device
-```
-
-使用限制：
-
-- `new_device` 是 bring-up / debug 工具，不應取代正式平台描述。
-- driver 名稱需對應 kernel driver 的 i2c_device_id；不是 DTS compatible 字串一定可直接使用。
-- 若 device 需要 GPIO、interrupt、supply、calibration data，單純 `new_device` 可能不足。
-- 不可在已由 DTS 或 service 建立的 address 重複建立 device。
-
-#### 10.7 hwmon sysfs 與 OpenBMC Sensor 資料流
-
-許多 I2C / PMBus driver 會把讀值匯出到 `/sys/class/hwmon/hwmonX/`。OpenBMC `dbus-sensors` 會讀取 hwmon、D-Bus 或 direct driver access，並建立 `xyz.openbmc_project.Sensor` 相關 D-Bus object。
-
-典型資料流：
+PMBus 是用於 power converter / PSU / VR / HSC 的 power-management protocol，通常跑在 SMBus / I2C 上。Linux PMBus driver 位於 hwmon subsystem 下，常見架構為 PMBus core、generic PMBus driver、device-specific PMBus driver。Kernel PMBus 文件說明 generic PMBus driver 支援電壓、電流、功率、溫度等 hwmon 監控資料，但 PMBus device 不會被 PMBus driver 安全地自動探測，通常需要明確建立 device；PMBus core 文件也提醒：PMBus command 雖標準化，但沒有每顆裝置都必需支援的命令，且 unsupported command 的反應可能從錯誤、回 0xff/0xffff、設 status bit 到 bus hang 都可能發生。
 
 ```text
-I2C / PMBus hardware
+I2C client：bus + address + driver name
     ↓
-Linux i2c driver / pmbus driver
+pmbus generic driver 或 vendor-specific driver
     ↓
-/sys/class/hwmon/hwmonX/*_input / *_label / *_alarm / *_fault
+pmbus_core：page / command / format / status / hwmon registration
     ↓
-Entity Manager configuration
+/sys/class/hwmon/hwmonX
     ↓
-dbus-sensors daemon：hwmontempsensor / psusensor / fansensor 等
-    ↓
-/xyz/openbmc_project/sensors/<type>/<name>
-    ↓
-Redfish / IPMI SDR / Fan policy / Event log
+OpenBMC psusensor / dbus-sensors
 ```
 
-常見 hwmon 屬性：
+PMBus driver 類型：
 
-| 屬性 | 含義 | 單位慣例 | 常見來源 |
-|------|------|----------|----------|
-| `temp*_input` | 溫度 | milli-degree Celsius | LM75、PMBus `TEMP` |
-| `in*_input` | 電壓 | millivolt | INA、PMBus `VIN` / `VOUT` |
-| `curr*_input` | 電流 | milliampere | INA、PMBus `IIN` / `IOUT` |
-| `power*_input` | 功率 | microwatt | PMBus `PIN` / `POUT` |
-| `fan*_input` | 轉速 | RPM | fan controller、PMBus fan |
-| `*_label` | channel 名稱 | 字串 | driver 或 config |
-| `*_alarm` / `*_fault` | 告警 / fault | `0` / `1` | driver status mapping |
+<table>
+<tr><th>Driver 類型</th><th>用途</th><th>優點</th><th>風險</th></tr>
+<tr><td>generic `pmbus`</td><td>標準 PMBus command 足夠時</td><td>導入快</td><td>page / format / status / quirk 可能不足</td></tr>
+<tr><td>vendor-specific driver</td><td>晶片已有 upstream driver，例如 adm1275、ltc2978、ina233、ir35221</td><td>支援較完整</td><td>需確認 kernel 版本與 device ID</td></tr>
+<tr><td>custom driver</td><td>需要 MFR command、特殊 coefficient、初始化、fault mapping</td><td>可正確處理平台需求</td><td>需維護與 upstream 對齊</td></tr>
+<tr><td>userspace direct I2C</td><td>短期 debug 或 vendor tool</td><td>快速驗證 register</td><td>不宜與 kernel driver 同時存取同 address</td></tr>
+</table>
 
-檢查指令：
+PMBus 必填資料：
+
+<table>
+<tr><th>項目</th><th>內容</th><th>來源</th></tr>
+<tr><td>Device type</td><td>PSU / VR / HSC / power monitor</td><td>schematic、BOM</td></tr>
+<tr><td>Bus path</td><td>root bus、mux address、channel</td><td>DTS、i2cdetect -l</td></tr>
+<tr><td>Address</td><td>7-bit PMBus address</td><td>schematic、strap、datasheet</td></tr>
+<tr><td>Driver</td><td>generic pmbus 或 chip-specific</td><td>kernel docs、driver source</td></tr>
+<tr><td>Pages</td><td>rail / output channel 數量</td><td>datasheet、driver info</td></tr>
+<tr><td>Format</td><td>LINEAR11 / LINEAR16 / DIRECT / VOUT_MODE</td><td>datasheet、driver implementation</td></tr>
+<tr><td>Status command</td><td>STATUS_WORD、STATUS_VOUT、STATUS_IOUT 等</td><td>PMBus spec、datasheet</td></tr>
+<tr><td>Fault clear</td><td>CLEAR_FAULTS 是否允許、何時清</td><td>power policy、vendor guide</td></tr>
+</table>
+
+#### 10.6 PMBus Sensor Mapping
+
+PMBus driver probe 後，資料通常出現在 hwmon。OpenBMC 再透過 psusensor / dbus-sensors / Entity Manager config，把 hwmon channel 轉成 D-Bus sensor、Redfish Power / Thermal / Sensor 與 IPMI SDR。
+
+```text
+PMBus command
+  READ_VIN / READ_VOUT / READ_IIN / READ_IOUT / READ_PIN / READ_POUT / READ_TEMPERATURE_*
+    ↓
+PMBus driver / pmbus_core
+    ↓
+hwmon sysfs
+  in*_input、curr*_input、power*_input、temp*_input、fan*_input、*_label、*_alarm、*_fault
+    ↓
+OpenBMC sensor daemon
+    ↓
+D-Bus sensor path
+  /xyz/openbmc_project/sensors/voltage/...
+  /xyz/openbmc_project/sensors/current/...
+  /xyz/openbmc_project/sensors/power/...
+  /xyz/openbmc_project/sensors/temperature/...
+    ↓
+Redfish / IPMI / EventLog / Telemetry
+```
+
+常見 hwmon 對映：
+
+<table>
+<tr><th>PMBus command</th><th>hwmon 類型</th><th>OpenBMC sensor type</th><th>常見 Redfish 位置</th><th>注意事項</th></tr>
+<tr><td>READ_VIN</td><td>`in*_input`</td><td>voltage</td><td>PowerSupply / Sensor</td><td>input voltage，不是 output rail</td></tr>
+<tr><td>READ_VOUT</td><td>`in*_input`</td><td>voltage</td><td>Voltage sensor / rail</td><td>需依 page 對應 rail</td></tr>
+<tr><td>READ_IIN</td><td>`curr*_input`</td><td>current</td><td>PowerSupply input</td><td>input current</td></tr>
+<tr><td>READ_IOUT</td><td>`curr*_input`</td><td>current</td><td>Rail / PSU output</td><td>page / phase 需分清楚</td></tr>
+<tr><td>READ_PIN</td><td>`power*_input`</td><td>power</td><td>PowerSupply input power</td><td>單位通常為 microwatt</td></tr>
+<tr><td>READ_POUT</td><td>`power*_input`</td><td>power</td><td>PSU output / rail power</td><td>不可和 PIN 混用</td></tr>
+<tr><td>READ_TEMPERATURE_*</td><td>`temp*_input`</td><td>temperature</td><td>Thermal / Sensor</td><td>需知道 sensor 位置</td></tr>
+<tr><td>READ_FAN_SPEED_*</td><td>`fan*_input`</td><td>fan_tach</td><td>Thermal / Fan</td><td>不是每顆 PMBus 裝置支援</td></tr>
+</table>
+
+Mapping 注意事項：
+
+- 不要依賴 `hwmonX` 固定；要用 `name`、`label`、device path、bus/address 或 Entity Manager config 對映。
+- Page 代表 rail / output channel；phase 代表多相 VR 的 phase。總電流和 phase 電流需分清楚。
+- Input power、output power、rail power、system power 是不同語意，不應用同一 sensor name。
+- Sensor threshold 要依平台 power spec 設定，不能只沿用 reference board。
+- PSU absent 或 PMBus timeout 時，sensor 應標 unavailable / functional false，而不是用 0 當作正常讀值。
+
+Hwmon dump：
 
 ```bash
-find /sys/class/hwmon -maxdepth 2 -type f -print | sort
 for h in /sys/class/hwmon/hwmon*; do
     echo "==== $h"
     cat "$h/name" 2>/dev/null
@@ -8701,307 +8684,188 @@ for h in /sys/class/hwmon/hwmon*; do
 done
 ```
 
-#### 10.8 PMBus 基本資料：page、phase、format、status
+#### 10.7 PMBus Debug
 
-PMBus 裝置常見於 PSU、VR、HSC、power module。Porting 時需分清楚 command、page、phase、data format 與 status register。
+PMBus debug 需分層，不建議一開始就用 `i2cget` 任意讀寫 command。部分 PMBus 裝置對 unsupported command 反應不一致，可能設 fault bit 或造成 bus hang。第一輪應優先使用 kernel driver 已暴露的 hwmon、driver log、PMBus status snapshot 與 vendor guide 中明確安全的 read command。
 
-| 項目 | 說明 | Bring-up 注意事項 |
-|------|------|------------------|
-| `PAGE` | 多 output rail / channel 的選擇 | PSU / VR 不同 rail 可能在不同 page；D-Bus sensor name 需對應 rail |
-| `PHASE` | 多相 VR 的 phase 選擇 | 總電流與 phase 電流需分清楚，避免重複計算 |
-| `LINEAR11` / `LINEAR16` | PMBus 常見數值格式 | 需確認 driver 是否正確解析 exponent / mantissa |
-| `DIRECT` | 由 m/b/R 係數轉換 raw 值 | 需使用 vendor datasheet 係數 |
-| `VOUT_MODE` | VOUT 讀值格式與 exponent | 不同 page 可能不同，需保存讀值 |
-| `STATUS_WORD` | 總狀態 word | 只是入口，還要讀 `STATUS_VOUT` / `STATUS_IOUT` / `STATUS_INPUT` / `STATUS_TEMPERATURE` 等細項 |
-| `CLEAR_FAULTS` | 清除 latched fault | 不可在未保存 fault snapshot 前清掉現場證據 |
-| `MFR_* command` | 廠商自定義資訊 | 常用於 serial、model、revision、vendor fault extension |
+Debug 順序：
 
-PMBus bring-up 建議順序：
+1. 確認 physical：power domain、presence、pull-up、SDA/SCL waveform、mux channel。
+2. 確認 I2C：adapter 存在、address ACK、沒有 address conflict、沒有 bus stuck。
+3. 確認 client：DTS / new_device / driver binding 是否建立。
+4. 確認 PMBus driver：generic 或 vendor-specific 是否 probe，hwmon 是否出現。
+5. 確認 sensor mapping：hwmon channel、label、page、unit、scale。
+6. 確認 status：STATUS_WORD、STATUS_*、MFR_STATUS snapshot。
+7. 確認 OpenBMC：D-Bus sensor、availability、functional、threshold、event。
+8. 最後才看 raw PMBus command 與 vendor-specific register。
 
-1. 確認 presence 與 power domain：PSU / VR 是否真的上電且允許 BMC sideband 讀取。
-2. 確認 I2C address 與 mux path：同一 PSU slot 常可能相同 address 但不同 mux channel。
-3. 用安全讀取命令確認通訊，例如 driver 已支援的 sysfs / hwmon 讀值，而非隨意掃描所有 command。
-4. 確認 page 數、rail 名稱、VOUT mode、讀值 format、status command 支援度。
-5. 建立 hwmon channel → OpenBMC sensor name → Redfish / IPMI 對照。
-6. 做 fault injection 或模擬 AC lost / PSU pull-out，確認 availability、functional、event policy。
-
-#### 10.9 PMBus driver 選型：generic、vendor-specific、custom
-
-| driver 型態 | 適用情境 | 優點 | 風險 |
-|-------------|----------|------|------|
-| generic `pmbus` | 裝置符合標準 command，且只需基本 telemetry | 導入快、維護成本低 | page / format / status 支援可能不足 |
-| kernel 既有 vendor driver | kernel 已支援該晶片或相容系列 | 較完整支援 device-specific 行為 | 需確認 kernel 版本與 `compatible` / id table |
-| 新 vendor driver | 需要特殊 page、direct format、`MFR` command、fault mapping | 可把轉換與 quirk 放在 kernel 層 | 需提交與長期維護 driver |
-| userspace direct I2C | 暫時 debug 或 vendor tool | 可快速驗證 register | 不宜長期與 kernel driver 同時存取同一 address |
-
-判斷要不要寫新 driver：
-
-- generic pmbus 無法正確解析 VOUT / current / power。
-- 需要使用 vendor-specific MFR command 才能取得 fault 或 serial / model。
-- 裝置對 unsupported command 反應不安全，generic auto-detect 造成 bus error 或 fault bit。
-- 需要 page / phase / rail label 固定映射，避免 userspace 用錯 channel。
-- 需要在 probe 時寫入 device-specific 初始化設定。
-
-#### 10.10 Entity Manager 與 dbus-sensors 整合
-
-OpenBMC 常用 Entity Manager 描述硬體 Entity 與其 Exposes 設定，再由 dbus-sensors 類 daemon 消費這些 D-Bus configuration，建立 sensor object。這樣可讓 sensor 設定依 FRU、presence、SKU、Probe result 動態調整。
-
-簡化 JSON 範本：
-
-```json
-{
-  "Name": "Example PSU0",
-  "Probe": "TRUE",
-  "Type": "Board",
-  "Exposes": [
-    {
-      "Name": "psu0_input_voltage",
-      "Type": "PSUSensor",
-      "Bus": 20,
-      "Address": "0x58",
-      "Labels": ["v_in"],
-      "PowerState": "Always",
-      "Thresholds": [
-        {
-          "Direction": "less than",
-          "Name": "lower critical",
-          "Severity": 1,
-          "Value": 10000
-        }
-      ]
-    }
-  ]
-}
-```
-
-整合注意事項：
-
-- `Bus` 若是 mux 後 logical bus，需確認每次 boot 是否穩定；若會變動，需用更穩定的 probe / template 方法。
-- `Address` 要使用 7-bit address 字串或 schema 要求格式。
-- `PowerState` 需與硬體 domain 對齊，避免 host off 或 PSU absent 時持續報錯。
-- `Labels` / channel name 需和 hwmon label 或 psusensor 期待一致。
-- Threshold 不要只從 reference board 複製，需依平台電源規格與 sensor 精度調整。
-- Sensor `Available` 與 `Functional` 應反映裝置 presence、read failure、fault 狀態，而不是只顯示最後一次讀值。
-
-#### 10.11 Redfish / IPMI / SEL 對映
-
-I2C / PMBus sensor 最終常會暴露到 Redfish、IPMI SDR、WebUI 與 SEL / EventLog。對映錯誤時，硬體與 kernel 都可能正常，但使用者看到的欄位不對。
-
-| 來源 | 中介資料 | 對外呈現 | 檢查重點 |
-|------|----------|----------|----------|
-| `hwmon` temp | D-Bus temperature sensor | Redfish Thermal / Sensor、IPMI temperature SDR | 單位、threshold、association |
-| PMBus `VIN` / `VOUT` | D-Bus voltage sensor | Redfish Power / Sensor、IPMI voltage SDR | rail name、scale、warning / critical |
-| PMBus `IIN` / `IOUT` | D-Bus current sensor | Redfish Power、IPMI current SDR | input vs output、page 對應 |
-| PMBus `PIN` / `POUT` | D-Bus power sensor | Redfish PowerControl / PowerSupply | PSU input/output power 差異 |
-| Fault bit | logging / operational status | SEL / EventLog / Redfish Health | latched fault clear policy |
-| Presence | inventory present property | Redfish Position / Status | hot-plug debounce、availability gating |
-
-排查指令：
+常用指令：
 
 ```bash
-# D-Bus sensors
-busctl tree xyz.openbmc_project.HwmonTempSensor 2>/dev/null
+# I2C topology
+i2cdetect -l
+ls -l /sys/bus/i2c/devices
+
+# PMBus / hwmon
+dmesg | grep -Ei 'pmbus|hwmon|psu|vr|ina|adm|ltc|ir|isl|mps|tps|timeout|nack'
+find /sys/class/hwmon -maxdepth 3 -type f -print | sort
+
+# driver binding
+readlink /sys/bus/i2c/devices/<bus>-00<addr>/driver 2>/dev/null
+cat /sys/bus/i2c/devices/<bus>-00<addr>/name 2>/dev/null
+
+# OpenBMC
 busctl tree xyz.openbmc_project.PSUSensor 2>/dev/null
 busctl tree xyz.openbmc_project.ObjectMapper | grep -i sensors
-
-# Redfish sensor / thermal / power，依平台調整 URI
-curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis
-curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Sensors
-curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Power
-curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Thermal
-
-# IPMI sensor
-ipmitool sensor list
-ipmitool sdr elist
-ipmitool sel list
+journalctl -u xyz.openbmc_project.PSUSensor.service -b --no-pager 2>/dev/null
+journalctl -b --no-pager | grep -Ei 'pmbus|psu|sensor|timeout|unavailable|functional'
 ```
 
-#### 10.12 Fault、timeout、bus stuck 與 retry policy
+若需要 raw PMBus 讀取，建議建立 approved command list：
 
-I2C / PMBus 失敗不應一律當作 sensor critical threshold。需要區分裝置不存在、bus timeout、PMBus fault、讀值超界、host power off、PSU absent 與 driver bug。
+<table>
+<tr><th>Command</th><th>用途</th><th>是否安全讀取</th><th>備註</th></tr>
+<tr><td>STATUS_WORD</td><td>總 fault 狀態</td><td>[待填]</td><td>先保存再 clear</td></tr>
+<tr><td>STATUS_INPUT</td><td>input fault</td><td>[待填]</td><td>PSU AC lost / UV / OV</td></tr>
+<tr><td>STATUS_VOUT</td><td>output voltage fault</td><td>[待填]</td><td>page dependent</td></tr>
+<tr><td>STATUS_IOUT</td><td>output current fault</td><td>[待填]</td><td>page / phase dependent</td></tr>
+<tr><td>STATUS_TEMPERATURE</td><td>temperature fault</td><td>[待填]</td><td>需對應 temp sensor</td></tr>
+<tr><td>READ_VIN / VOUT</td><td>voltage telemetry</td><td>[待填]</td><td>format 需確認</td></tr>
+<tr><td>READ_IIN / IOUT</td><td>current telemetry</td><td>[待填]</td><td>scale / shunt / coefficient</td></tr>
+<tr><td>READ_PIN / POUT</td><td>power telemetry</td><td>[待填]</td><td>input / output 不可混用</td></tr>
+<tr><td>CLEAR_FAULTS</td><td>清除 latched fault</td><td>需審核</td><td>清除前需保存 snapshot</td></tr>
+</table>
 
-| 狀態 | 建議語意 | D-Bus / event 建議 | 備註 |
-|------|----------|--------------------|------|
-| 裝置未插入 | `Present=false` | Sensor unavailable 或移除 association | 不應報 threshold critical |
-| 裝置插入但讀不到 | `Available=false` 或 `Functional=false` | 可記錄通訊 fault | 需 retry 與 debounce |
-| PMBus `STATUS` fault | `Functional=false` 或 event | 保存 `STATUS_*` snapshot | 清 fault 前先保存資訊 |
-| 讀值超界 | Threshold asserted | Warning / Critical event | 需使用實際 sensor value |
-| Host power off | PowerState gating | 依設計不讀或標 unavailable | 避免反覆報錯 |
-| Bus stuck low | bus fault | 記錄 bus recovery / reset | 需看 SDA/SCL waveform |
+#### 10.8 Device Tree 與 OpenBMC config 邊界
 
-Bus stuck 排查：
+I2C / PMBus framework 容易把 DTS、Entity Manager JSON、dbus-sensors config 混在一起。建議分工如下：
 
-```bash
-# kernel log
-dmesg | grep -Ei 'i2c|smbus|pmbus|timeout|arbitration|stuck|recovery|nack'
+<table>
+<tr><th>資料</th><th>建議放置位置</th><th>原因</th></tr>
+<tr><td>SoC I2C controller enable</td><td>DTS</td><td>硬體 controller 與 pinmux</td></tr>
+<tr><td>I2C mux / fixed child devices</td><td>DTS</td><td>kernel 需建立 adapter / client</td></tr>
+<tr><td>GPIO reset / interrupt / supply</td><td>DTS</td><td>driver probe dependency</td></tr>
+<tr><td>PSU / VR sensor name</td><td>Entity Manager / dbus-sensors config</td><td>產品命名與 Redfish / IPMI policy</td></tr>
+<tr><td>Sensor threshold</td><td>Entity Manager / policy config</td><td>依平台規格變動</td></tr>
+<tr><td>Presence gating</td><td>Inventory / Entity Manager / platform daemon</td><td>依 slot / hot-plug / power state</td></tr>
+<tr><td>PMBus quirk / format</td><td>kernel vendor driver</td><td>屬於 device-specific 行為</td></tr>
+</table>
 
-# 查看 adapter 與 device
-ls -l /sys/bus/i2c/devices
-cat /sys/bus/i2c/devices/i2c-<bus>/name 2>/dev/null
-
-# service log
-journalctl -b --no-pager | grep -Ei 'i2c|pmbus|sensor|psu|timeout|unavailable|functional'
-```
-
-硬體方向：
-
-- SDA / SCL 是否被某顆 device 拉低。
-- Pull-up 電阻與電源域是否正確。
-- Mux reset / enable 是否正確。
-- Hot-plug 過程是否造成 transient short 或 bus capacitance 過高。
-- Clock stretching 是否超出 controller / driver timeout。
-- 多 master / Host sideband 是否同時存取同一 bus。
-
-#### 10.13 PMBus fault snapshot 與 clear fault 流程
-
-PMBus fault 常有 latched 行為。若立即 `CLEAR_FAULTS`，現場資訊可能消失。建議建立「先保存、再判讀、最後依政策清除」的流程。
-
-建議保存項目：
-
-
-| 資料 | 來源 | 用途 |
-|------|------|------|
-| `STATUS_WORD` | PMBus standard | 總 fault 入口 |
-| `STATUS_VOUT` / `STATUS_IOUT` / `STATUS_INPUT` / `STATUS_TEMPERATURE` | PMBus standard | 判斷 fault 類型 |
-| `READ_VIN` / `READ_VOUT` / `READ_IIN` / `READ_IOUT` / `READ_PIN` / `READ_POUT` | PMBus telemetry | 事件當下讀值 |
-| `MFR_STATUS` / `MFR_FAULT_LOG` | vendor command | 廠商擴充 fault |
-| PSU presence / AC good / power good | GPIO / CPLD / PMBus | 區分拔除、AC lost、內部 fault |
-
-清除策略建議：
-
-- 若 fault 影響安全或保固證據，預設不要自動清除，需維修流程決定。
-- 若是已知 transient 且會造成後續讀值 blocked，可在保存 snapshot 後清除。
-- 清除後需重新讀 status，確認 fault 是否仍存在。
-- 若 clear fault 需要 PSU / VR 特定 sequence，需依 vendor datasheet 實施。
-
-#### 10.14 Target 端 log 收集套件
+#### 10.9 Target 端 I2C / PMBus Framework log 收集
 
 ```bash
-mkdir -p /tmp/i2c-pmbus-debug
-cat /etc/os-release > /tmp/i2c-pmbus-debug/os-release.txt
-uname -a > /tmp/i2c-pmbus-debug/uname.txt
-cat /proc/cmdline > /tmp/i2c-pmbus-debug/proc-cmdline.txt
+mkdir -p /tmp/i2c-pmbus-framework-debug
+cat /etc/os-release > /tmp/i2c-pmbus-framework-debug/os-release.txt
+uname -a > /tmp/i2c-pmbus-framework-debug/uname.txt
+cat /proc/cmdline > /tmp/i2c-pmbus-framework-debug/proc-cmdline.txt
+zcat /proc/config.gz > /tmp/i2c-pmbus-framework-debug/proc-config.txt 2>&1
 
-dmesg -T > /tmp/i2c-pmbus-debug/dmesg.txt
-journalctl -b --no-pager > /tmp/i2c-pmbus-debug/journal.txt
-systemctl --failed > /tmp/i2c-pmbus-debug/systemctl-failed.txt 2>&1
+dmesg -T > /tmp/i2c-pmbus-framework-debug/dmesg.txt
+journalctl -b --no-pager > /tmp/i2c-pmbus-framework-debug/journal.txt
+systemctl --failed > /tmp/i2c-pmbus-framework-debug/systemctl-failed.txt 2>&1
 
-# I2C topology
-i2cdetect -l > /tmp/i2c-pmbus-debug/i2cdetect-l.txt 2>&1
-ls -l /sys/bus/i2c/devices > /tmp/i2c-pmbus-debug/sys-bus-i2c-devices.txt 2>&1
-find /sys/bus/i2c/devices -maxdepth 3 -type f -print > /tmp/i2c-pmbus-debug/i2c-files.txt 2>&1
+# I2C adapter / client / mux topology
+i2cdetect -l > /tmp/i2c-pmbus-framework-debug/i2cdetect-l.txt 2>&1
+ls -l /sys/bus/i2c/devices > /tmp/i2c-pmbus-framework-debug/sys-bus-i2c-devices.txt 2>&1
+find /sys/bus/i2c/devices -maxdepth 3 -print > /tmp/i2c-pmbus-framework-debug/i2c-tree.txt 2>&1
+find /sys/bus/i2c/drivers -maxdepth 2 -print > /tmp/i2c-pmbus-framework-debug/i2c-drivers.txt 2>&1
 
-# hwmon
-find /sys/class/hwmon -maxdepth 3 -type f -print > /tmp/i2c-pmbus-debug/hwmon-files.txt 2>&1
+# hwmon / PMBus
+find /sys/class/hwmon -maxdepth 3 -type f -print > /tmp/i2c-pmbus-framework-debug/hwmon-files.txt 2>&1
 for h in /sys/class/hwmon/hwmon*; do
     b=$(basename "$h")
-    mkdir -p "/tmp/i2c-pmbus-debug/$b"
-    cp -a "$h"/* "/tmp/i2c-pmbus-debug/$b/" 2>/dev/null || true
+    mkdir -p "/tmp/i2c-pmbus-framework-debug/$b"
+    cp -a "$h"/* "/tmp/i2c-pmbus-framework-debug/$b/" 2>/dev/null || true
 done
 
-# GPIO / presence / mux line
-command -v gpiodetect >/dev/null 2>&1 && gpiodetect > /tmp/i2c-pmbus-debug/gpiodetect.txt 2>&1
-command -v gpioinfo >/dev/null 2>&1 && gpioinfo > /tmp/i2c-pmbus-debug/gpioinfo.txt 2>&1
+# OpenBMC sensors
+busctl tree xyz.openbmc_project.ObjectMapper > /tmp/i2c-pmbus-framework-debug/objectmapper.txt 2>&1
+busctl tree xyz.openbmc_project.PSUSensor > /tmp/i2c-pmbus-framework-debug/psusensor-tree.txt 2>&1 || true
+busctl tree xyz.openbmc_project.HwmonTempSensor > /tmp/i2c-pmbus-framework-debug/hwmontempsensor-tree.txt 2>&1 || true
+journalctl -u xyz.openbmc_project.PSUSensor.service -b --no-pager > /tmp/i2c-pmbus-framework-debug/psusensor-journal.txt 2>&1 || true
+journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager > /tmp/i2c-pmbus-framework-debug/entity-manager-journal.txt 2>&1 || true
 
-# D-Bus / OpenBMC services
-busctl tree xyz.openbmc_project.ObjectMapper > /tmp/i2c-pmbus-debug/dbus-objectmapper.txt 2>&1
-busctl tree xyz.openbmc_project.EntityManager > /tmp/i2c-pmbus-debug/dbus-entity-manager.txt 2>&1
-busctl tree xyz.openbmc_project.PSUSensor > /tmp/i2c-pmbus-debug/dbus-psusensor.txt 2>&1
-busctl tree xyz.openbmc_project.HwmonTempSensor > /tmp/i2c-pmbus-debug/dbus-hwmontempsensor.txt 2>&1
-journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager > /tmp/i2c-pmbus-debug/entity-manager-journal.txt 2>&1
-journalctl -u xyz.openbmc_project.PSUSensor.service -b --no-pager > /tmp/i2c-pmbus-debug/psusensor-journal.txt 2>&1
-journalctl -u xyz.openbmc_project.HwmonTempSensor.service -b --no-pager > /tmp/i2c-pmbus-debug/hwmontempsensor-journal.txt 2>&1
-
-tar czf /tmp/i2c-pmbus-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp i2c-pmbus-debug
+tar czf /tmp/i2c-pmbus-framework-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp i2c-pmbus-framework-debug
 ```
 
-#### 10.15 常見問題與排查入口
+#### 10.10 常見問題與排查入口
 
-| 現象 | 可能方向 | 第一輪檢查 |
-|------|----------|------------|
-| `i2cdetect -l` 看不到 bus | controller disabled、pinctrl / clock / reset 未 ready、kernel config 缺 | DTS、`dmesg`、`clk_summary`、`devices_deferred` |
-| bus 存在但 device 無 ACK | address / mux / power / reset / pull-up 問題 | schematic、scope、`i2cdetect`、mux sysfs |
-| `UU` 顯示在 address 上 | driver 已綁定該 address | `/sys/bus/i2c/devices/*/driver`、`hwmon` |
-| driver 未綁定 | DTS `compatible` / id table 不符、module 未載入 | `dmesg`、`modprobe`、kernel config |
-| `hwmon` 有值但 D-Bus sensor 沒有 | Entity Manager config 不匹配、daemon 未啟動、label 不符 | `journal`、`busctl`、config JSON |
-| D-Bus 有 sensor 但 Redfish 不顯示 | association / inventory / chassis path 不完整 | ObjectMapper、bmcweb journal、Redfish URI |
-| PMBus voltage 數值比例錯 | linear/direct format、`VOUT_MODE`、scale factor 錯 | driver docs、raw register、datasheet |
-| PSU 拔除後持續報 critical | presence gating 缺失，讀 failure 被當 threshold | presence GPIO、PowerState、sensor availability |
-| bus 偶發 timeout | clock stretching、bus capacitance、hot-plug、multi-master 衝突 | `dmesg`、LA waveform、bus speed 降低測試 |
-| fault 清掉後無法分析 | 未保存 `STATUS` / `MFR` fault snapshot | 調整 fault handling 流程 |
-| 同一 PSU slot 名稱錯亂 | mux channel / logical bus number / Entity Manager template 錯 | i2c topology、Probe source、`busctl` config object |
-| 更新後 sensor 順序改變 | hwmon index 動態變化、依 `hwmonX` 寫死 | 用 name / label / device path 匹配 |
+<table>
+<tr><th>現象</th><th>可能方向</th><th>第一輪檢查</th></tr>
+<tr><td>`i2cdetect -l` 沒有 root bus</td><td>DTS controller disabled、pinctrl / clock / reset / kernel config</td><td>DTS、dmesg、clk_summary、devices_deferred</td></tr>
+<tr><td>Mux 後 child bus 不存在</td><td>mux client 未 probe、compatible 錯、parent bus fail</td><td>dmesg、/sys/bus/i2c/devices、mux address ACK</td></tr>
+<tr><td>Address 掃不到 ACK</td><td>7-bit address 錯、power off、reset asserted、mux channel 錯、bus stuck</td><td>schematic、scope、i2cdetect、presence</td></tr>
+<tr><td>Address 顯示 `UU`</td><td>kernel driver 已佔用</td><td>driver symlink、hwmon output</td></tr>
+<tr><td>PMBus driver 不 probe</td><td>client 未建立、driver name 不符、generic 不適用、kernel config 缺</td><td>DTS / new_device、dmesg、/proc/config.gz</td></tr>
+<tr><td>hwmon 有值但 OpenBMC 沒 sensor</td><td>Entity Manager config、label、PowerState、service 問題</td><td>journal、busctl、config JSON</td></tr>
+<tr><td>PMBus 數值比例錯</td><td>LINEAR / DIRECT / VOUT_MODE、coefficient、shunt resistor 錯</td><td>driver docs、raw register、datasheet</td></tr>
+<tr><td>PSU absent 時報 critical</td><td>presence gating 缺、read failure 被當超界</td><td>presence GPIO、Availability、Functional</td></tr>
+<tr><td>Bus 偶發 timeout</td><td>clock stretching、bus capacitance、hot-plug、multi-master</td><td>LA waveform、dmesg、bus speed 降低測試</td></tr>
+<tr><td>Clear fault 後無法分析</td><td>未保存 STATUS snapshot</td><td>調整 debug / event flow</td></tr>
+</table>
 
-#### 10.16 Bring-up 建議流程
+#### 10.11 Bring-up 建議流程
 
-- 收集 schematic：BMC I2C controller、mux、channel、address、pull-up、power domain、reset、INT、presence。
-- 建立 I2C topology 表，不只寫 Linux bus number，也寫 physical path 與 mux path。
-- 用 scope / LA 確認 SDA/SCL pull-up、bus frequency、ACK、clock stretching 與 hot-plug waveform。
-- 在 DTS 啟用固定存在的 I2C controller / device / mux，完成 dtbs_check 與 running DTB 驗證。
-- 先確認 `/sys/bus/i2c/devices`、`i2cdetect -l`、driver binding，再看 hwmon。
-- 對 PMBus 裝置確認 driver 選型、page、phase、format、status、clear fault policy。
-- 核對 hwmon channel 與實際 rail / PSU / fan 名稱，避免 label 或 page 對錯。
-- 補 Entity Manager / dbus-sensors config，確認 D-Bus sensor object、threshold、availability、functional。
-- 驗證 Redfish / IPMI / SEL 顯示與硬體狀態一致。
-- 做異常測試：PSU pull-out、AC lost、VR fault、bus stuck、mux reset、sensor read timeout、BMC reboot、host power transition。
-- 保存 i2c-pmbus-debug log、scope / LA waveform、PMBus fault snapshot 與版本資訊。
+- 先建立 physical I2C topology：root adapter、mux、channel、address、pull-up、power domain、owner。
+- 在 DTS 啟用 root adapter 與固定 mux，確認 `i2cdetect -l` 有 root bus 與 mux child adapters。
+- 逐一建立 client device，確認 7-bit address、driver binding 與 sysfs device path。
+- 對 PMBus 裝置先選 driver：generic、vendor-specific 或 custom。
+- 確認 PMBus page、phase、format、status command 與 fault clear policy。
+- 驗證 hwmon channel，建立 PMBus command → hwmon file → OpenBMC sensor name 對照表。
+- 補 Entity Manager / dbus-sensors config，確認 D-Bus、Redfish、IPMI 呈現一致。
+- 做 PSU absent、AC lost、VR fault、bus stuck、mux reset、service restart、BMC reboot 測試。
+- 保存 i2c-pmbus-framework-debug、scope / LA waveform、PMBus status snapshot 與版本資訊。
 
-#### 10.17 當前平台 I2C / PMBus 實測表
+#### 10.12 當前平台 I2C / PMBus Framework 實測表
 
-| 項目 | 指令 / 來源 | 實測值 | 備註 |
-|------|-------------|--------|------|
-| I2C controller 清單 | `i2cdetect -l` / DTS | [待填] | physical bus 與 logical bus 對照 |
-| I2C mux 清單 | DTS / `/sys/bus/i2c/devices` | [待填] | address、channel、idle policy |
-| FRU EEPROM | `fru-device` / i2c sysfs | [待填] | address、page size、FRU parse |
-| Temperature sensors | `/sys/class/hwmon` / D-Bus | [待填] | local / remote channel |
-| PSU PMBus | `hwmon` / `psusensor` | [待填] | page、VIN/VOUT/IIN/IOUT/PIN/POUT |
-| VR PMBus | `hwmon` / raw register | [待填] | page、phase、`VOUT_MODE` |
-| GPIO expander | `gpioinfo` / DTS | [待填] | line name、INT、reset default |
-| CPLD I2C register | platform tool | [待填] | version、fault latch、clear rule |
-| hwmon channel mapping | `/sys/class/hwmon` | [待填] | sensor name 與 rail 對照 |
-| D-Bus sensor tree | `busctl tree` | [待填] | Value / threshold / availability |
-| Redfish mapping | `curl` Redfish URI | [待填] | Power / Thermal / Sensor |
-| IPMI SDR mapping | `ipmitool sdr elist` | [待填] | sensor type / number |
-| Fault handling | fault injection | [待填] | STATUS snapshot 與 clear flow |
-| Bus recovery | timeout / stuck test | [待填] | recovery 成功條件 |
+<table>
+<tr><th>項目</th><th>來源 / 指令</th><th>實測值</th><th>備註</th></tr>
+<tr><td>I2C root adapters</td><td>i2cdetect -l / DTS</td><td>[待填]</td><td>physical bus 對照</td></tr>
+<tr><td>I2C mux tree</td><td>/sys/bus/i2c/devices</td><td>[待填]</td><td>parent / child adapter</td></tr>
+<tr><td>PMBus clients</td><td>/sys/bus/i2c/devices</td><td>[待填]</td><td>bus-address-driver</td></tr>
+<tr><td>PMBus driver type</td><td>driver symlink / kernel config</td><td>[待填]</td><td>generic / vendor / custom</td></tr>
+<tr><td>PMBus pages</td><td>datasheet / driver / debug</td><td>[待填]</td><td>rail mapping</td></tr>
+<tr><td>PMBus format</td><td>datasheet / driver</td><td>[待填]</td><td>LINEAR / DIRECT / VOUT_MODE</td></tr>
+<tr><td>hwmon mapping</td><td>/sys/class/hwmon</td><td>[待填]</td><td>input/output/rail</td></tr>
+<tr><td>D-Bus mapping</td><td>busctl tree sensors</td><td>[待填]</td><td>sensor path</td></tr>
+<tr><td>Redfish / IPMI mapping</td><td>curl / ipmitool</td><td>[待填]</td><td>Power / Sensor / SDR</td></tr>
+<tr><td>Fault snapshot</td><td>STATUS_WORD / STATUS_*</td><td>[待填]</td><td>clear 前保存</td></tr>
+<tr><td>Bus recovery</td><td>timeout / stuck test</td><td>[待填]</td><td>recovery policy</td></tr>
+</table>
 
-#### 10.18 回查結果
+#### 10.13 回查結果
 
-本章已回查前後文並補齊下列銜接點：
+本章已依「I2C / PMBus Framework」角度回查並補齊下列銜接點：
 
-- 第 5 章已建立周邊匯流排通用知識，本章補上 I2C / SMBus / PMBus 深入拓樸、driver、hwmon、OpenBMC 連動與 fault handling。
-- 第 8 章已說明 Device Tree，本章補上 I2C controller、mux、child device、PMBus 節點在實機 porting 中的檢查重點。
-- 第 11 章 OpenBMC 常用 Project 與服務速查將說明 Entity Manager、dbus-sensors、ObjectMapper，本章先補 I2C / PMBus sensor 的資料流與排查指令。
-- 第 12 章 Sensor 抽象層與後續 Voltage / Current / Power / PSU Sensor 章節會使用本章的 bus、driver、hwmon、D-Bus 對照方式。
-- 第 16 章 Power Control 與 PSU / VR fault 需引用本章的 PMBus STATUS snapshot、clear fault policy 與 power domain gating。
+- 第 5 章已有周邊匯流排通用知識，本章把 I2C adapter / client / mux / PMBus driver framework 獨立整理，供後續 sensor 章節引用。
+- 第 8 章 Device Tree 已說明 I2C / mux 節點寫法，本章補上 DTS 進入 Linux I2C framework 後的 adapter / client / driver 對照。
+- 第 9 章 Kernel Driver 已說明 driver model 與 deferred probe，本章補上 I2C-specific bus model、PMBus driver 與 hwmon mapping。
+- 第 12 章 Sensor 抽象層與後續 Voltage / Current / Power / PSU Sensor 可引用本章的 PMBus sensor mapping，而不需要在每個 sensor 章節重複 bus framework。
+- 第 15 章 Inventory / FRU / Asset 可引用本章處理 FRU EEPROM / PSU PMBus path 與 bus topology。
+- 第 16 章 Logging / Event / Telemetry 可引用本章 PMBus fault snapshot 與 bus timeout event policy。
 
-#### 10.19 驗收 Checklist
+#### 10.14 驗收 Checklist
 
--  I2C physical topology、mux path、logical bus、address、power domain、owner 已建立表格。
--  所有固定 I2C device 已在 DTS 或平台設定中描述，且不與動態 discovery 衝突。
--  I2C address 已確認為 7-bit address，未把 8-bit address 填入 DTS / config。
--  `i2cdetect -l`、`/sys/bus/i2c/devices` 與設計拓樸一致。
--  I2C mux channel 與 logical bus number 已記錄，重開機後行為已確認。
--  Bus speed、pull-up、waveform、clock stretching、hot-plug 行為已量測。
--  PMBus driver 選型已確認：generic、vendor-specific 或 custom driver。
--  PMBus page、phase、VOUT_MODE、linear/direct format、status command 已驗證。
--  hwmon channel 與實際 rail / PSU / fan / thermal 裝置對照正確。
--  Entity Manager / dbus-sensors config 已建立，D-Bus sensor object 正常出現。
--  Sensor `Available`、`Functional`、threshold 與 presence / power state gating 一致。
--  Redfish、IPMI SDR、SEL / EventLog 顯示與 D-Bus / hardware 狀態一致。
--  PMBus fault snapshot 會在 clear fault 前保存。
--  PSU pull-out、AC lost、VR fault、bus timeout、mux reset、BMC reboot 已完成測試。
--  i2c-pmbus-debug log、dmesg、journal、hwmon dump、busctl tree、waveform 已保存。
+-  I2C root adapter、mux child adapter、physical path、logical bus number 已建立對照。
+-  Client device 的 7-bit address、driver、power domain、presence source 已確認。
+-  I2C mux parent / child adapter tree 與 schematic 一致。
+-  不依賴不穩定的 bus number，或已驗證 bus number 在重開機 / 更新後穩定。
+-  PMBus driver 選型已確認：generic、vendor-specific 或 custom。
+-  PMBus page、phase、LINEAR / DIRECT / VOUT_MODE、status command 已驗證。
+-  hwmon channel 與 PMBus command / rail / PSU slot 對映正確。
+-  OpenBMC D-Bus sensor、Redfish、IPMI SDR 與 hwmon 對映一致。
+-  PSU absent、PMBus timeout、bus stuck 不會被誤判為一般 threshold critical。
+-  CLEAR_FAULTS 前會保存 STATUS_WORD / STATUS_* / MFR fault snapshot。
+-  i2c-pmbus-framework-debug、waveform、PMBus status、service journal 已保存。
 
-#### 10.20 本章參考資料
+#### 10.15 本章參考資料
 
-- Linux kernel documentation - How to instantiate I2C devices: [https://docs.kernel.org/i2c/instantiating-devices.html](https://docs.kernel.org/i2c/instantiating-devices.html)
-- Linux kernel I2C sysfs documentation: [https://github.com/torvalds/linux/blob/master/Documentation/i2c/i2c-sysfs.rst](https://github.com/torvalds/linux/blob/master/Documentation/i2c/i2c-sysfs.rst)
-- Linux kernel Hardware Monitoring documentation: [https://www.kernel.org/doc/html/latest/hwmon/index.html](https://www.kernel.org/doc/html/latest/hwmon/index.html)
-- Linux kernel PMBus driver documentation: [https://docs.kernel.org/hwmon/pmbus.html](https://docs.kernel.org/hwmon/pmbus.html)
-- Linux kernel PMBus core documentation: [https://mjmwired.net/kernel/Documentation/hwmon/pmbus-core.rst](https://mjmwired.net/kernel/Documentation/hwmon/pmbus-core.rst)
-- OpenBMC dbus-sensors README: [https://github.com/openbmc/dbus-sensors/blob/master/README.md](https://github.com/openbmc/dbus-sensors/blob/master/README.md)
-- OpenBMC entity-manager README: [https://github.com/openbmc/entity-manager/blob/master/README.md](https://github.com/openbmc/entity-manager/blob/master/README.md)
+- Linux kernel documentation - I2C/SMBus Subsystem: [https://www.kernel.org/doc/html/latest/i2c/index.html](https://www.kernel.org/doc/html/latest/i2c/index.html)
+- Linux kernel documentation - I2C muxes and complex topologies: [https://www.kernel.org/doc/html/v5.14/i2c/i2c-topology.html](https://www.kernel.org/doc/html/v5.14/i2c/i2c-topology.html)
+- Linux kernel source - I2C mux framework: [https://github.com/torvalds/linux/blob/master/drivers/i2c/i2c-mux.c](https://github.com/torvalds/linux/blob/master/drivers/i2c/i2c-mux.c)
+- Linux kernel documentation - PMBus driver: [https://docs.kernel.org/hwmon/pmbus.html](https://docs.kernel.org/hwmon/pmbus.html)
+- Linux kernel documentation - PMBus core driver and internal API: [https://docs.kernel.org/hwmon/pmbus-core.html](https://docs.kernel.org/hwmon/pmbus-core.html)
+- Linux kernel documentation - Hardware Monitoring: [https://www.kernel.org/doc/html/latest/hwmon/index.html](https://www.kernel.org/doc/html/latest/hwmon/index.html)
 
 
 ### 11. OpenBMC 常用 Project 與服務速查
