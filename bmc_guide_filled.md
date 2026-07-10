@@ -75,7 +75,11 @@
 | 2026-07-10 |  0.31 | Copilot | 重寫第 2 章 Flash Partition 與儲存架構，補齊 MTD / UBI / MBR / GPT、檔案系統、映像格式、更新 rollback 與 log 收集 |
 | 2026-07-10 |  0.32 | Copilot | 撰寫第 5 章周邊匯流排通用知識，補強 bus map、DTS/kernel/OpenBMC 對齊、I2C/SPI/UART/PECI/eSPI/NC-SI/MCTP/PLDM/SPDM、log 收集、回查結果與驗收 checklist |
 | 2026-07-10 |  0.33 | Copilot | 撰寫第 6 章 CPLD / FPGA / Board Glue Logic，補強 register map、power sequence、reset mux、fault latch、WP / flash mux、update / recovery、OpenBMC 整合、log 收集、回查結果與驗收 checklist |
-| 2026-07-10 |  0.35 | Copilot | 撰寫第 15 章 Inventory / FRU / Asset 資料模型 |
+| 2026-07-10 |  0.34 | Copilot | 撰寫第 8 章 Device Tree 通用寫法與排查 |
+| 2026-07-10 |  0.35 | Copilot | 撰寫第 10 章 I2C / PMBus 裝置驅動架構 |
+| 2026-07-10 |  0.36 | Copilot | 撰寫第 15 章 Inventory / FRU / Asset 資料模型 |
+| 2026-07-10 |  0.37 | Copilot | 撰寫第 16 章 Logging / Event / Telemetry |
+
 ### 0.7 資料來源可信度分級
 
 - A：官方標準、Linux kernel 文件、Yocto 文件、SoC datasheet、board schematic。
@@ -16094,7 +16098,516 @@ FRU EEPROM 實測表：
 - DMTF Redfish Schema Index: [https://redfish.dmtf.org/schemas/v1/](https://redfish.dmtf.org/schemas/v1/)
 
 
-### 16. Presence / Intrusion / GPIO State Sensor
+### 16. Logging / Event / Telemetry
+
+本章整理 BMC 平台中的 Logging、Event、SEL、Redfish EventLog、Redfish EventService、Telemetry、MetricReport、audit / security log、crash dump、remote syslog 與現場 log package 設計。Logging / Event / Telemetry 是 bring-up、長測、量產、RMA 與現場維修時最重要的事後分析基礎。若 log 設計不完整，即使硬體或軟體有正確偵測到 fault，也可能在 Redfish、IPMI、journal、SEL、遠端監控平台看到不同結果，造成維修判讀困難。
+
+本章先定義 log 與 event 的分層，再說明 OpenBMC `phosphor-logging`、systemd-journal、D-Bus logging entry、Redfish EventLog / LogService、IPMI SEL、Redfish EventService subscription、TelemetryService / MetricReport、remote syslog、容量與保存策略、事件去重與 rate limit、時間同步、log 收集與驗收方式。
+
+#### 16.1 基本分層與資料流
+
+Logging / Event / Telemetry 建議分成下列層級：
+
+```text
+硬體 / 韌體 / service 狀態
+  sensor threshold、PMBus fault、CPLD latch、watchdog、update error、security event
+    ↓
+局部觀測資料
+  kernel dmesg、systemd journal、driver sysfs、D-Bus properties、raw status register
+    ↓
+標準事件物件
+  OpenBMC logging entry、SEL record、Redfish EventLog Entry、audit event
+    ↓
+外部通知 / 長期收集
+  Redfish EventService、remote syslog、telemetry metric report、external monitoring
+    ↓
+現場分析 / RMA
+  debug package、timeline、callout、root cause record、維修動作
+```
+
+<table>
+<tr><th>類型</th><th>用途</th><th>粒度</th><th>保存週期</th><th>典型消費者</th></tr>
+<tr><td>systemd journal</td><td>service log、structured metadata、debug trace</td><td>高</td><td>依 storage policy</td><td>FW / QA / field debug</td></tr>
+<tr><td>kernel log / dmesg</td><td>kernel driver、probe、panic、hardware error</td><td>中～高</td><td>當次 boot 為主</td><td>BSP / driver debug</td></tr>
+<tr><td>OpenBMC event log</td><td>標準化事件 object</td><td>中</td><td>持久保存或輪替</td><td>bmcweb、ipmid、field service</td></tr>
+<tr><td>IPMI SEL</td><td>legacy event log</td><td>中</td><td>容量有限</td><td>ipmitool、host management</td></tr>
+<tr><td>Redfish EventLog</td><td>RESTful LogService entries</td><td>中</td><td>依產品政策</td><td>Redfish client、WebUI</td></tr>
+<tr><td>Redfish EventService</td><td>事件主動推送</td><td>event-level</td><td>外部接收端保存</td><td>NMS、monitoring system</td></tr>
+<tr><td>Telemetry / MetricReport</td><td>週期或條件式 metric 聚合</td><td>metric-level</td><td>本地或遠端</td><td>容量規劃、趨勢分析</td></tr>
+<tr><td>Audit / security log</td><td>登入、權限、設定變更、更新、憑證</td><td>高價值事件</td><td>通常需較長保存</td><td>資安 / compliance</td></tr>
+<tr><td>crash dump / core dump</td><td>服務崩潰與 kernel panic 分析</td><td>高</td><td>受容量限制</td><td>FW debug</td></tr>
+</table>
+
+設計原則：
+
+- Journal 是詳細原始資料；EventLog / SEL 是對外可讀事件；Telemetry 是可統計 metric。三者不應互相取代。
+- 一個 hardware fault 可能同時產生 journal、D-Bus logging entry、Redfish EventLog 與 SEL，但欄位與時間戳需能互相對照。
+- 不要把連續 sensor sample 全部寫成 event；只有 threshold transition、availability 變化、fault latch、policy change 才適合作為 event。
+- Debug log 預設不應無限制寫入 rwfs，需有容量、輪替、遠端轉存與清除政策。
+
+#### 16.2 OpenBMC phosphor-logging 與 D-Bus logging entry
+
+OpenBMC 常用 `phosphor-logging` 作為 event 與 journal logging 的基礎。它提供 structured logging API，將程式 log 寫入 systemd journal；同時由 `phosphor-log-manager` 管理 D-Bus event log objects。OpenBMC event log 常見路徑為：
+
+```text
+/xyz/openbmc_project/logging/entry/<id>
+```
+
+常見 interface：
+
+<table>
+<tr><th>Interface</th><th>用途</th><th>檢查重點</th></tr>
+<tr><td>xyz.openbmc_project.Logging.Entry</td><td>事件主要資料，例如 Message、Severity、Timestamp、Resolved、AdditionalData</td><td>Severity 是否正確，AdditionalData 是否足以排查</td></tr>
+<tr><td>xyz.openbmc_project.Association.Definitions</td><td>事件與 inventory / callout 的關聯</td><td>Redfish / 維修指引依賴此資料</td></tr>
+<tr><td>xyz.openbmc_project.Object.Delete</td><td>刪除單筆事件</td><td>需受權限與 audit 控管</td></tr>
+<tr><td>xyz.openbmc_project.Software.Version</td><td>事件發生時的軟體版本</td><td>現場比對版本與 RMA 很重要</td></tr>
+</table>
+
+檢查指令：
+
+```bash
+busctl tree xyz.openbmc_project.Logging
+busctl introspect xyz.openbmc_project.Logging /xyz/openbmc_project/logging/entry/1
+busctl get-property xyz.openbmc_project.Logging /xyz/openbmc_project/logging/entry/1 xyz.openbmc_project.Logging.Entry Message
+journalctl -u xyz.openbmc_project.Logging.service -b --no-pager
+```
+
+事件建立建議欄位：
+
+<table>
+<tr><th>欄位</th><th>建議內容</th><th>原因</th></tr>
+<tr><td>Message / MessageId</td><td>可穩定對映 registry 的事件名稱</td><td>便於 Redfish / SEL / 翻譯 / 自動處理</td></tr>
+<tr><td>Severity</td><td>Informational / Warning / Critical</td><td>外部監控與告警分級依賴此欄位</td></tr>
+<tr><td>Timestamp</td><td>UTC 或明確時區時間</td><td>需能與 host log、scope waveform 對齊</td></tr>
+<tr><td>AdditionalData</td><td>sensor path、threshold、raw value、register、bus、slot、version</td><td>避免只看到「fault」但無法定位</td></tr>
+<tr><td>Callout / Inventory association</td><td>疑似元件 inventory path</td><td>維修與 Redfish Health 對映</td></tr>
+<tr><td>Resolved</td><td>事件是否已修復或解除</td><td>避免舊 fault 長期影響 health</td></tr>
+<tr><td>Software version</td><td>BMC image / service version</td><td>比對已知問題與修復版本</td></tr>
+</table>
+
+#### 16.3 Journal、kernel log 與 service log
+
+Journal 與 kernel log 是最細的軟體觀測資料。Bring-up 與 field debug 時，建議每個事件同時保存 event log 與 journal window。
+
+常用指令：
+
+```bash
+# 當次 boot 全部 journal
+journalctl -b --no-pager
+
+# 上一次 boot journal
+journalctl -b -1 --no-pager
+
+# 指定 service
+journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager
+journalctl -u xyz.openbmc_project.Logging.service -b --no-pager
+journalctl -u xyz.openbmc_project.State.Host.service -b --no-pager
+
+# kernel log
+dmesg -T
+journalctl -k -b --no-pager
+
+# 依關鍵字過濾
+journalctl -b --no-pager | grep -Ei 'error|fail|fault|critical|timeout|watchdog|pmbus|sensor|logging|event|sel'
+```
+
+保存策略：
+
+- 開發版可拉高 journal verbosity；量產版需避免 debug log 過量寫入 flash。
+- 若使用 persistent journal，需明確設定最大容量與輪替策略。
+- 若只使用 volatile journal，故障重開後可能失去上一輪關鍵 log；建議對 watchdog / panic / update failure 類事件有額外保存策略。
+- Service restart loop 需有 rate limit，避免 journal 被單一錯誤洗掉。
+
+#### 16.4 SEL、Redfish EventLog 與 LogService
+
+IPMI SEL 與 Redfish EventLog 都是對外事件紀錄，但欄位與語意不同。SEL 容量通常較小，欄位也較固定；Redfish EventLog 可以承載 MessageId、MessageArgs、Severity、Created、Resolved、Links 等較完整資料。
+
+<table>
+<tr><th>項目</th><th>IPMI SEL</th><th>Redfish EventLog</th><th>OpenBMC D-Bus event</th></tr>
+<tr><td>主要用途</td><td>legacy management 工具</td><td>RESTful 管理與自動化</td><td>BMC 內部共同事件物件</td></tr>
+<tr><td>事件識別</td><td>sensor number / event type / offset</td><td>MessageId / Registry / EntryType</td><td>Message / AdditionalData</td></tr>
+<tr><td>容量</td><td>通常有限</td><td>依產品設計</td><td>依 phosphor-logging 與 storage policy</td></tr>
+<tr><td>清除方式</td><td>IPMI clear SEL</td><td>LogService.ClearLog</td><td>D-Bus Delete / DeleteAll</td></tr>
+<tr><td>關聯資訊</td><td>有限</td><td>Links / OriginOfCondition</td><td>Association / callout</td></tr>
+</table>
+
+檢查指令：
+
+```bash
+# IPMI
+ipmitool sel info
+ipmitool sel list
+ipmitool sel elist
+ipmitool sel get <id>
+
+# Redfish EventLog
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Systems/system/LogServices/EventLog/Entries
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Managers/bmc/LogServices
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis
+
+# D-Bus logging
+busctl tree xyz.openbmc_project.Logging
+```
+
+設計重點：
+
+- 同一事件若同步轉成 SEL 與 Redfish EventLog，需避免重複計數或 severity 不一致。
+- Clear SEL / ClearLog 是否也清 D-Bus logging entry，需要依產品政策明確定義。
+- EventLog 滿時策略需記錄：循環覆寫、拒絕新增、刪最舊、遠端轉存後清除。
+- Redfish EventLog 的 MessageId 應可對應 message registry，避免外部工具只能解析自由文字。
+
+#### 16.5 Redfish EventService 與事件推送
+
+Redfish EventService 用於讓外部監控系統訂閱事件，BMC 在事件發生時以 HTTPS POST 傳送到 listener。這適合資料中心監控、事件集中化與即時告警，但需要網路、TLS、retry、queue、權限與訂閱生命週期管理。
+
+典型流程：
+
+```text
+Redfish client 建立 subscription
+    POST /redfish/v1/EventService/Subscriptions
+        Destination = https://listener/event
+        EventFormatType = Event 或 MetricReport
+        RegistryPrefixes / ResourceTypes / Context 等篩選條件
+    ↓
+BMC 保存 subscription
+    ↓
+事件產生：sensor threshold、log entry、state change、security event
+    ↓
+BMC 對 listener 送出 HTTPS POST
+    ↓
+listener 回應 2xx，或 BMC 依 retry policy 重送 / queue / drop
+```
+
+檢查項目：
+
+<table>
+<tr><th>項目</th><th>檢查內容</th><th>風險</th></tr>
+<tr><td>Destination</td><td>URL、DNS、路由、TLS 憑證</td><td>BMC 建立訂閱成功但實際送不到</td></tr>
+<tr><td>EventFormatType</td><td>Event / MetricReport</td><td>Telemetry subscription 與 event subscription 混用</td></tr>
+<tr><td>Filter</td><td>RegistryPrefixes、ResourceTypes、OriginResources</td><td>收到過多或收不到預期事件</td></tr>
+<tr><td>Retry</td><td>重送次數、間隔、queue size</td><td>listener down 時塞滿 BMC storage / memory</td></tr>
+<tr><td>Security</td><td>HTTPS、憑證、帳號權限、secret handling</td><td>事件外洩或無法驗證 receiver</td></tr>
+<tr><td>Audit</td><td>建立 / 刪除 subscription 是否有記錄</td><td>無法追蹤誰修改告警路徑</td></tr>
+</table>
+
+測試指令：
+
+```bash
+# 查 EventService
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/EventService
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/EventService/Subscriptions
+
+# 建立測試 subscription，body 需依平台支援欄位調整
+curl -k -u root:0penBmc -H 'Content-Type: application/json' \
+  -X POST https://<bmc>/redfish/v1/EventService/Subscriptions \
+  -d '{"Destination":"https://<listener>/redfish-events","EventFormatType":"Event","Context":"test-subscription"}'
+```
+
+#### 16.6 Telemetry、Metric、MetricReport
+
+Telemetry 著重於「持續或週期性 metric 收集」，例如 CPU power、PSU input power、fan speed、temperature、network throughput、memory usage、boot time、service restart count。它和 event 的差異是：event 描述狀態轉換或異常；telemetry 描述時間序列或聚合資料。
+
+Redfish TelemetryService 的常見能力包含：
+
+- 查詢 metric metadata，例如 metric definition、metric property。
+- 建立 MetricReportDefinition，定義一組 metric 如何聚合。
+- 產生 MetricReport，本地保存或遠端推送。
+- 搭配 EventService 用 `EventFormatType=MetricReport` 將 metric report 送往 listener。
+
+Telemetry 設計範圍：
+
+<table>
+<tr><th>Metric 類型</th><th>來源</th><th>用途</th><th>注意事項</th></tr>
+<tr><td>Temperature</td><td>D-Bus sensors / hwmon</td><td>熱設計、長測趨勢</td><td>sample rate 不宜過高</td></tr>
+<tr><td>Voltage / Current / Power</td><td>PMBus / ADC / D-Bus sensors</td><td>功耗分析、PSU loading</td><td>需標示 input/output 與 rail</td></tr>
+<tr><td>Fan RPM / PWM</td><td>fan daemon / hwmon</td><td>thermal policy 驗證</td><td>需和 fan profile 對齊</td></tr>
+<tr><td>BMC resource</td><td>/proc、systemd、cgroup</td><td>memory leak、CPU loading</td><td>避免 telemetry 本身造成負載</td></tr>
+<tr><td>Boot time</td><td>systemd-analyze、journal timestamp</td><td>效能 baseline</td><td>需分 AC boot / warm reboot / service ready</td></tr>
+<tr><td>Event count</td><td>logging entry / SEL / journal</td><td>error rate、flapping 偵測</td><td>需做去重與時間窗</td></tr>
+</table>
+
+Telemetry 設計建議：
+
+- 對外 metric name、unit、scale、sampling interval 需穩定。
+- 長測資料應優先遠端收集；BMC 本地只保留短期或必要摘要。
+- Telemetry 不應寫滿 rwfs；需限制報告數量、檔案大小與保留時間。
+- Sensor unavailable 時需用明確狀態表示，不要使用 0 取代未知值。
+- MetricReport 的時間戳需與 EventLog、journal 使用同一時間基準。
+
+#### 16.7 事件分類、Severity 與去重
+
+事件分類需讓 FW、QA、field service、NOC 看到相同語意。建議建立平台事件分類表：
+
+<table>
+<tr><th>分類</th><th>例子</th><th>Severity 建議</th><th>是否需要 SEL</th><th>是否需要推送</th></tr>
+<tr><td>Hardware fault</td><td>VR fault、PSU fault、fan fail、ECC threshold</td><td>Warning / Critical</td><td>是</td><td>是</td></tr>
+<tr><td>Sensor threshold</td><td>溫度 / 電壓 / 電流超界</td><td>Warning / Critical</td><td>依平台</td><td>是</td></tr>
+<tr><td>Availability</td><td>sensor unavailable、PMBus timeout</td><td>Warning</td><td>依平台</td><td>視持續時間</td></tr>
+<tr><td>Inventory change</td><td>PSU / fan / drive 插拔</td><td>Informational / Warning</td><td>依平台</td><td>可選</td></tr>
+<tr><td>Firmware update</td><td>update start / success / fail / rollback</td><td>Info / Warning / Critical</td><td>是</td><td>是</td></tr>
+<tr><td>Power state</td><td>power on/off/cycle、watchdog reset</td><td>Info / Warning</td><td>依平台</td><td>可選</td></tr>
+<tr><td>Security</td><td>login fail、password change、cert change、secure boot fail</td><td>Warning / Critical</td><td>依政策</td><td>是</td></tr>
+<tr><td>Debug / trace</td><td>service retry、temporary timeout</td><td>Debug / Info</td><td>否</td><td>否</td></tr>
+</table>
+
+去重與 rate limit：
+
+- Threshold assert / deassert 應成對記錄，避免每次 polling 都新增一筆。
+- 同一 fault bit 若維持 asserted，只應在首次 asserted、狀態變化、超過時間窗時記錄。
+- 通訊 timeout 類事件建議用連續失敗 N 次才上報，恢復時記錄 recover。
+- Hot-plug 抖動需 debounce，避免插拔瞬間產生大量 SEL。
+- Service restart loop 需限制 event 量，並保留第一筆與摘要。
+
+#### 16.8 Time sync、timestamp 與跨系統時間線
+
+事件分析需要把 BMC journal、Redfish EventLog、SEL、Host log、scope waveform、CPLD latch time 對齊。若時間不準，會大幅增加排查成本。
+
+時間設計重點：
+
+- BMC boot 早期尚未 NTP sync 前的事件，需要標示未同步或保存 monotonic timestamp。
+- SEL / EventLog / journal 建議都能對應到 UTC 或明確時區。
+- Redfish `Created` / `EventTimestamp` 應符合資料中心監控工具期待格式。
+- RTC / NTP / PTP / host time sync 的權威端需明確。
+- AC loss 後若 RTC 沒電，時間會回到預設值；log 收集需同時保存 uptime / boot id。
+
+指令：
+
+```bash
+timedatectl status
+timedatectl timesync-status 2>/dev/null || true
+journalctl --list-boots
+cat /proc/uptime
+cat /etc/os-release
+```
+
+#### 16.9 Remote syslog 與外部收集
+
+Remote syslog 可用於集中收集 BMC log，降低本地 flash 寫入與現場 log 遺失風險。設計時需確認 protocol、TLS、server reachable、queue、rate limit 與安全政策。
+
+<table>
+<tr><th>項目</th><th>建議記錄</th><th>注意事項</th></tr>
+<tr><td>Protocol</td><td>UDP / TCP / TLS</td><td>UDP 可能遺失；TLS 需憑證管理</td></tr>
+<tr><td>Server</td><td>FQDN / IP / port</td><td>DNS、route、management VLAN</td></tr>
+<tr><td>Filter</td><td>facility、severity、service</td><td>避免 debug log 全量外送</td></tr>
+<tr><td>Queue</td><td>網路斷線時如何暫存</td><td>不可無限制佔用 rwfs</td></tr>
+<tr><td>Security</td><td>CA、client cert、auth</td><td>避免 log 外洩或被偽造 server 接收</td></tr>
+<tr><td>Audit</td><td>remote syslog config change</td><td>需記錄誰修改 server</td></tr>
+</table>
+
+檢查指令依平台而定，常見方向：
+
+```bash
+systemctl status rsyslog --no-pager 2>/dev/null || true
+systemctl status phosphor-rsyslog-conf --no-pager 2>/dev/null || true
+journalctl -u rsyslog -b --no-pager 2>/dev/null || true
+journalctl -u xyz.openbmc_project.Syslog.Config.service -b --no-pager 2>/dev/null || true
+```
+
+#### 16.10 Log 容量、輪替與清除政策
+
+Log 設計必須有容量上限與清除策略。若沒有上限，event storm 或 service spam 可能填滿 rwfs，進一步造成設定無法寫入、update 失敗或 service crash。
+
+<table>
+<tr><th>資料</th><th>常見路徑 / 來源</th><th>容量策略</th><th>清除策略</th></tr>
+<tr><td>systemd journal</td><td>/var/log/journal 或 volatile</td><td>SystemMaxUse / RuntimeMaxUse</td><td>journalctl --vacuum-size / time</td></tr>
+<tr><td>phosphor logging entries</td><td>D-Bus / persistent store</td><td>max entries / max size</td><td>Delete / DeleteAll / ClearLog</td></tr>
+<tr><td>SEL</td><td>IPMI SEL store</td><td>固定筆數</td><td>ipmitool sel clear</td></tr>
+<tr><td>Redfish EventLog</td><td>LogService entries</td><td>依 backend</td><td>LogService.ClearLog</td></tr>
+<tr><td>core dump</td><td>/var/lib/systemd/coredump</td><td>限制單檔與總量</td><td>coredumpctl cleanup / tmpfiles</td></tr>
+<tr><td>debug package</td><td>/tmp 或 /var/tmp</td><td>上傳前暫存</td><td>重開機清除或明確刪除</td></tr>
+<tr><td>telemetry reports</td><td>Redfish / local file / remote</td><td>保留最近 N 份 / 時間窗</td><td>輪替 / 遠端轉存</td></tr>
+</table>
+
+驗證項目：
+
+- event storm 時不會填滿 rwfs。
+- log 滿時策略符合產品需求：覆寫最舊、拒絕新增、告警、遠端轉存。
+- 清除 LogService / SEL / D-Bus logging entry 需要適當權限，且清除動作本身應有 audit log。
+- Factory reset 是否清 event log / audit log / telemetry data 需明確定義。
+- RMA log package 不應依賴已被清除的 volatile log。
+
+#### 16.11 Security / Audit log
+
+Security log 應涵蓋登入、登出、認證失敗、使用者 / 權限變更、密碼變更、憑證匯入、TLS 設定、SSH key、Redfish subscription、firmware update、secure boot、factory reset、remote syslog 設定變更等。
+
+建議欄位：
+
+<table>
+<tr><th>欄位</th><th>內容</th><th>注意事項</th></tr>
+<tr><td>Actor</td><td>使用者、service account、host、local console</td><td>避免記錄密碼或 token</td></tr>
+<tr><td>Action</td><td>登入、設定變更、更新、清 log、建立 subscription</td><td>需使用穩定事件名稱</td></tr>
+<tr><td>Target</td><td>被修改的 resource / object path / Redfish URI</td><td>便於審計</td></tr>
+<tr><td>Result</td><td>success / failure / denied</td><td>失敗原因需足以排查但不洩漏秘密</td></tr>
+<tr><td>Source</td><td>remote IP、session、interface</td><td>需考慮隱私與法規</td></tr>
+<tr><td>Timestamp</td><td>UTC time / boot id</td><td>需能與其他 log 對齊</td></tr>
+</table>
+
+#### 16.12 Crash dump、core dump 與 watchdog 事件
+
+Service crash、kernel panic、watchdog reset 需要保存最小可用證據：版本、上一輪 journal、core dump、reset reason、watchdog source、service status 與 event log。
+
+指令：
+
+```bash
+coredumpctl list 2>/dev/null || true
+coredumpctl info <PID> 2>/dev/null || true
+systemctl --failed
+journalctl -b -1 --no-pager > /tmp/journal-previous.txt 2>&1
+journalctl -k -b -1 --no-pager > /tmp/kernel-previous.txt 2>&1
+```
+
+watchdog event 建議欄位：
+
+- watchdog source：SoC、systemd、CPLD、external supervisor。
+- reset target：BMC-only、host-only、full board。
+- last heartbeat service / timestamp。
+- reset reason register。
+- previous boot journal 是否可讀。
+- 是否伴隨 power fault / thermal fault / update flow。
+
+#### 16.13 Logging / Event / Telemetry 實作對照表
+
+<table>
+<tr><th>事件來源</th><th>觸發條件</th><th>D-Bus logging</th><th>SEL</th><th>Redfish EventLog</th><th>EventService</th><th>Telemetry</th><th>備註</th></tr>
+<tr><td>Sensor threshold</td><td>warning / critical assert / deassert</td><td>是</td><td>依平台</td><td>是</td><td>是</td><td>sensor metric</td><td>避免 polling 重複新增</td></tr>
+<tr><td>PSU fault</td><td>PMBus STATUS fault / presence change</td><td>是</td><td>是</td><td>是</td><td>是</td><td>power metric</td><td>先保存 fault snapshot</td></tr>
+<tr><td>Fan fail</td><td>tach fail / fan missing</td><td>是</td><td>是</td><td>是</td><td>是</td><td>RPM / PWM</td><td>presence 與 tach fail 分開</td></tr>
+<tr><td>Firmware update</td><td>start / success / failure / rollback</td><td>是</td><td>依平台</td><td>是</td><td>是</td><td>可選</td><td>需記錄版本與 image id</td></tr>
+<tr><td>Security</td><td>login fail / cert change / user change</td><td>是</td><td>依政策</td><td>是</td><td>是</td><td>否</td><td>需遮蔽敏感資料</td></tr>
+<tr><td>Watchdog reset</td><td>timeout / reboot</td><td>是</td><td>是</td><td>是</td><td>是</td><td>boot metric</td><td>需關聯 reset reason</td></tr>
+<tr><td>Inventory change</td><td>hot-plug insert / remove</td><td>視需求</td><td>視需求</td><td>是</td><td>可選</td><td>否</td><td>需 debounce</td></tr>
+<tr><td>Performance</td><td>boot time / CPU / memory / bandwidth</td><td>否</td><td>否</td><td>否</td><td>可選</td><td>是</td><td>適合 Telemetry 而非 EventLog</td></tr>
+</table>
+
+#### 16.14 Target 端 log 收集套件
+
+```bash
+mkdir -p /tmp/logging-debug
+cat /etc/os-release > /tmp/logging-debug/os-release.txt
+uname -a > /tmp/logging-debug/uname.txt
+cat /proc/cmdline > /tmp/logging-debug/proc-cmdline.txt
+cat /proc/uptime > /tmp/logging-debug/proc-uptime.txt
+timedatectl status > /tmp/logging-debug/timedatectl.txt 2>&1
+journalctl --list-boots > /tmp/logging-debug/journal-boots.txt 2>&1
+
+# journal / kernel
+journalctl -b --no-pager > /tmp/logging-debug/journal-current.txt
+journalctl -b -1 --no-pager > /tmp/logging-debug/journal-previous.txt 2>&1
+journalctl -k -b --no-pager > /tmp/logging-debug/journal-kernel-current.txt
+journalctl -k -b -1 --no-pager > /tmp/logging-debug/journal-kernel-previous.txt 2>&1
+dmesg -T > /tmp/logging-debug/dmesg.txt
+systemctl --failed > /tmp/logging-debug/systemctl-failed.txt 2>&1
+
+# logging service
+systemctl status xyz.openbmc_project.Logging.service --no-pager > /tmp/logging-debug/logging-status.txt 2>&1
+journalctl -u xyz.openbmc_project.Logging.service -b --no-pager > /tmp/logging-debug/logging-journal.txt 2>&1
+busctl tree xyz.openbmc_project.Logging > /tmp/logging-debug/dbus-logging-tree.txt 2>&1
+busctl tree xyz.openbmc_project.ObjectMapper > /tmp/logging-debug/dbus-objectmapper.txt 2>&1
+
+# Redfish / IPMI, if available
+ipmitool sel info > /tmp/logging-debug/ipmi-sel-info.txt 2>&1 || true
+ipmitool sel elist > /tmp/logging-debug/ipmi-sel-elist.txt 2>&1 || true
+ipmitool sdr elist > /tmp/logging-debug/ipmi-sdr-elist.txt 2>&1 || true
+
+# crash / core dump
+coredumpctl list > /tmp/logging-debug/coredump-list.txt 2>&1 || true
+
+# storage usage
+df -h > /tmp/logging-debug/df-h.txt
+df -i > /tmp/logging-debug/df-i.txt
+journalctl --disk-usage > /tmp/logging-debug/journal-disk-usage.txt 2>&1
+
+tar czf /tmp/logging-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp logging-debug
+```
+
+Redfish dump 範本：
+
+```bash
+mkdir -p /tmp/logging-debug/redfish
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/EventService > /tmp/logging-debug/redfish/EventService.json 2>&1
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/EventService/Subscriptions > /tmp/logging-debug/redfish/EventService-Subscriptions.json 2>&1
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Systems/system/LogServices > /tmp/logging-debug/redfish/System-LogServices.json 2>&1
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Systems/system/LogServices/EventLog/Entries > /tmp/logging-debug/redfish/EventLog-Entries.json 2>&1
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/TelemetryService > /tmp/logging-debug/redfish/TelemetryService.json 2>&1
+```
+
+#### 16.15 常見問題與排查入口
+
+<table>
+<tr><th>現象</th><th>可能方向</th><th>第一輪檢查</th></tr>
+<tr><td>D-Bus logging entry 沒產生</td><td>事件沒有 commit、logging service fail、error YAML / registry 不匹配</td><td>journal、busctl tree Logging、service status</td></tr>
+<tr><td>journal 有錯但 EventLog 沒有</td><td>只是 debug log，未建立標準 event</td><td>檢查 service event path 與 phosphor-logging usage</td></tr>
+<tr><td>SEL 有事件但 Redfish 沒有</td><td>轉換橋接或 LogService mapping 缺失</td><td>ipmitool、bmcweb journal、D-Bus logging entry</td></tr>
+<tr><td>Redfish EventLog 有事件但 SEL 沒有</td><td>平台政策不轉 SEL 或 sensor mapping 缺失</td><td>event policy、ipmid journal、SDR mapping</td></tr>
+<tr><td>事件重複大量產生</td><td>threshold polling 重複、fault 未 debounce、service restart loop</td><td>timestamp、AdditionalData、journal window</td></tr>
+<tr><td>EventService subscription 建立但收不到</td><td>listener unreachable、TLS、DNS、filter、queue fail</td><td>bmcweb journal、network、listener log</td></tr>
+<tr><td>Telemetry 沒資料</td><td>TelemetryService 未啟用、MetricReportDefinition 缺、sensor association 缺</td><td>Redfish Telemetry URI、D-Bus sensors、bmcweb journal</td></tr>
+<tr><td>Log 滿導致 service 異常</td><td>rwfs 滿、journal 無上限、event storm</td><td>df -h、journalctl --disk-usage、event count</td></tr>
+<tr><td>時間戳錯亂</td><td>NTP 未 sync、RTC 無效、timezone / UTC 混用</td><td>timedatectl、journal boots、EventLog Created</td></tr>
+<tr><td>清 log 後無 audit</td><td>ClearLog / DeleteAll 未產生安全事件</td><td>bmcweb / logging / audit policy</td></tr>
+<tr><td>Crash 後沒有 core</td><td>coredump disabled、容量不足、tmpfiles 清掉</td><td>coredumpctl、systemd-coredump config、df</td></tr>
+</table>
+
+#### 16.16 Bring-up 建議流程
+
+- 建立事件分類表：hardware fault、sensor threshold、availability、inventory change、update、power state、security、debug。
+- 對每個事件定義 MessageId、Severity、AdditionalData、callout、是否進 SEL、是否進 Redfish EventLog、是否推送 EventService。
+- 確認 `phosphor-logging` service、D-Bus logging entry、journal structured metadata 正常。
+- 確認 sensor threshold assert / deassert、PMBus fault、CPLD fault、watchdog reset、update failure 都能留下一致事件。
+- 驗證 Redfish EventLog、IPMI SEL、D-Bus logging entry 的時間、severity、來源、元件關聯一致。
+- 建立 EventService subscription 測試 listener，驗證事件 POST、retry、queue、filter、TLS。
+- 若平台支援 TelemetryService，建立至少一組 MetricReportDefinition 並驗證報告內容、單位、時間戳、遠端推送。
+- 設定 log 容量上限、輪替、清除與 factory reset 政策。
+- 做 event storm、service restart loop、listener offline、rwfs nearly full、NTP not synced、AC cycle、BMC reboot 測試。
+- 保存 logging-debug package、Redfish dump、IPMI dump、journal、scope / host log 對齊結果。
+
+#### 16.17 當前平台 Logging / Event / Telemetry 實測表
+
+<table>
+<tr><th>項目</th><th>指令 / 來源</th><th>實測值</th><th>備註</th></tr>
+<tr><td>phosphor-logging service</td><td>systemctl status / journalctl</td><td>[待填]</td><td>service 是否 active</td></tr>
+<tr><td>D-Bus logging entries</td><td>busctl tree xyz.openbmc_project.Logging</td><td>[待填]</td><td>entry count / latest event</td></tr>
+<tr><td>Journal storage mode</td><td>journalctl --disk-usage / journald.conf</td><td>[待填]</td><td>persistent / volatile</td></tr>
+<tr><td>SEL status</td><td>ipmitool sel info</td><td>[待填]</td><td>容量與使用率</td></tr>
+<tr><td>Redfish EventLog</td><td>curl LogServices/EventLog</td><td>[待填]</td><td>Entry schema 與 ClearLog</td></tr>
+<tr><td>EventService</td><td>curl EventService</td><td>[待填]</td><td>subscription 支援欄位</td></tr>
+<tr><td>TelemetryService</td><td>curl TelemetryService</td><td>[待填]</td><td>MetricReportDefinition</td></tr>
+<tr><td>Remote syslog</td><td>rsyslog / phosphor-rsyslog-conf</td><td>[待填]</td><td>protocol / server / TLS</td></tr>
+<tr><td>Security audit</td><td>登入 / 設定變更測試</td><td>[待填]</td><td>是否有事件</td></tr>
+<tr><td>Sensor threshold event</td><td>fault injection</td><td>[待填]</td><td>assert / deassert</td></tr>
+<tr><td>PSU / fan fault event</td><td>fault injection</td><td>[待填]</td><td>callout / AdditionalData</td></tr>
+<tr><td>Update event</td><td>firmware update 測試</td><td>[待填]</td><td>start / success / fail / rollback</td></tr>
+<tr><td>Watchdog reset event</td><td>watchdog 測試</td><td>[待填]</td><td>reset reason 對齊</td></tr>
+<tr><td>Log full policy</td><td>容量壓力測試</td><td>[待填]</td><td>輪替 / 拒絕 / 清除</td></tr>
+</table>
+
+#### 16.19 驗收 Checklist
+
+-  已建立平台事件分類、severity、MessageId、AdditionalData 與 callout 規範。
+-  `phosphor-logging`、systemd journal、D-Bus logging entry 正常運作。
+-  Redfish EventLog、IPMI SEL、D-Bus logging entry 的同一事件可互相對照。
+-  Sensor threshold assert / deassert 不會重複洗 log，且恢復事件可正確產生。
+-  PSU / VR / CPLD fault 會先保存 raw status snapshot，再依政策清除 fault。
+-  EventService subscription 可建立、刪除、推送、retry，listener offline 行為已驗證。
+-  TelemetryService / MetricReport 若平台支援，metric name、unit、sampling interval、timestamp 已驗證。
+-  journal、EventLog、SEL、core dump、telemetry report 的容量上限與輪替策略已設定。
+-  ClearLog / SEL clear / DeleteAll 有權限控管，且清除動作本身可被 audit。
+-  remote syslog 若平台支援，server、protocol、TLS、queue、filter 已驗證。
+-  NTP / RTC / timestamp / boot id 可讓 BMC log、host log、scope waveform 對齊。
+-  event storm、service restart loop、rwfs nearly full、AC cycle、BMC reboot、watchdog reset 測試已完成。
+-  logging-debug package、Redfish dump、IPMI dump、journal、core dump、版本資訊已保存。
+
+#### 16.20 本章參考資料
+
+- OpenBMC phosphor-logging README: [https://github.com/openbmc/phosphor-logging/blob/master/README.md](https://github.com/openbmc/phosphor-logging/blob/master/README.md)
+- OpenBMC phosphor-logging core overview: [https://deepwiki.com/openbmc/phosphor-logging/2-core-logging-system](https://deepwiki.com/openbmc/phosphor-logging/2-core-logging-system)
+- Redfish Event Service overview: [https://servermanagementportal.ext.hpe.com/docs/concepts/redfishevents](https://servermanagementportal.ext.hpe.com/docs/concepts/redfishevents)
+- Redfish Telemetry Service overview: [https://redfish.redoc.ly/docs/concepts/redfishtelemetry/](https://redfish.redoc.ly/docs/concepts/redfishtelemetry/)
+- DMTF Redfish Telemetry White Paper DSP2051: [https://www.dmtf.org/sites/default/files/standards/documents/DSP2051_1.0.0.pdf](https://www.dmtf.org/sites/default/files/standards/documents/DSP2051_1.0.0.pdf)
+- Redfish Schema Index: [https://redfish.dmtf.org/schemas/v1/](https://redfish.dmtf.org/schemas/v1/)
+
+
+### 17. Presence / Intrusion / GPIO State Sensor
 
 本章整理 OpenBMC 中 Presence、Intrusion 與 GPIO State 類狀態感測器的 porting 方法。這類資料通常不是溫度、電壓、電流、功率或轉速等連續數值，而是代表硬體是否存在、機殼是否被開啟、GPIO / CPLD bit 是否 asserted 的布林或列舉狀態。它們會影響 inventory、FRU / asset、fan / power policy、Redfish / IPMI 對外呈現、SEL / EventLog 與安全稽核。
 
@@ -16105,7 +16618,7 @@ FRU EEPROM 實測表：
 
 建議不要把 `Present=false` 與 `Functional=false` 混用，否則 Redfish / IPMI、event log 與 control policy 可能出現不一致。
 
-#### 16.1 適用情境
+#### 17.1 適用情境
 
 常見項目包含：
 
@@ -16146,7 +16659,7 @@ CPLD bit state        CPLD / FPGA 維護的 presence、fault、ID、interrupt bi
 
 不同 OpenBMC branch / vendor fork 的 service name、object path 或 JSON schema 可能不同，實作前需以目前專案 source tree 與實機 `busctl tree` 為準。
 
-#### 16.2 常見來源
+#### 17.2 常見來源
 
 | 來源 | 說明 | 優點 | 常見風險 |
 | :--- | :--- | :--- | :--- |
@@ -16166,7 +16679,7 @@ Bring-up 前建議建立對照表：
 | PSU0 | `/system/chassis/powersupply0` | GPIO + PMBus | `PSU0_PRESENT_N`, bus/address `[待填]` | Low = present + PMBus ACK | BMC/HW | `[待填]` |
 | Chassis cover | `/xyz/openbmc_project/Intrusion/Chassis_Intrusion` | GPIO | `CHASSIS_INTRUSION` | 依 schematic | BMC/HW/Security | `[待填]` |
 
-#### 16.3 資料路徑（Data Flow）
+#### 17.3 資料路徑（Data Flow）
 
 GPIO based presence detection：
 
@@ -16217,7 +16730,7 @@ D-Bus xyz.openbmc_project.Chassis.Intrusion
 Redfish Chassis PhysicalSecurity / EventLog / SEL / Journal
 ```
 
-#### 16.4 Porting 步驟
+#### 17.4 Porting 步驟
 
 ##### Step 1：確認硬體資訊
 
@@ -16547,7 +17060,7 @@ ipmitool -I lanplus -H <bmc> -U root -P 0penBmc sel list
 
 若 Redfish / IPMI 看不到 presence，先確認 D-Bus inventory 是否存在，再檢查 association、chassis mapping、bmcweb / IPMI SDR 產生策略。
 
-#### 16.5 進階除錯與常見陷阱
+#### 17.5 進階除錯與常見陷阱
 
 | 問題現象 | 可能方向 | 建議檢查 |
 | :--- | :--- | :--- |
@@ -16575,7 +17088,7 @@ ipmitool -I lanplus -H <bmc> -U root -P 0penBmc sel list
 5. 再看消費端：Entity Manager Probe、inventory、Redfish、IPMI、event log
 ```
 
-#### 16.6 Presence / Intrusion / GPIO State Sensor 完整 Checklist
+#### 17.6 Presence / Intrusion / GPIO State Sensor 完整 Checklist
 
 ```text
 硬體設計階段：
@@ -16636,7 +17149,7 @@ Redfish / IPMI / 事件：
 [ ] Redfish / IPMI 不會把 absent 誤報為 failed，或把 failed 誤報為 absent
 ```
 
-#### 16.7 常用指令速查
+#### 17.7 常用指令速查
 
 ```bash
 # GPIO / device tree
@@ -16668,7 +17181,7 @@ busctl get-property <service> <object-path> <interface> <property>
 busctl monitor
 ```
 
-#### 16.9 本章參考資料
+#### 17.9 本章參考資料
 
 - OpenBMC GPIO based hardware inventory design：<https://github.com/openbmc/docs/blob/master/designs/inventory/gpio-based-hardware-inventory.md>
 - OpenBMC entity-manager gpio-presence-sensor README：<https://github.com/openbmc/entity-manager/blob/master/src/gpio-presence/README.md>
@@ -16679,13 +17192,12 @@ busctl monitor
 - DMTF Redfish Chassis / PhysicalSecurity schema：<https://redfish.dmtf.org/schemas/>
 
 
-### 17. Logging / Event / Telemetry
 
-Log 分類：BMC system log、kernel log、journal、SEL、Redfish EventLog、sensor event、firmware update log、安全 log、crash dump。Log 滿時策略需明確：循環覆寫、停止新增、遠端轉存、壓縮保存。
 
 ---
 
 ## 第四部分：Host Communication
+
 
 ### 18. KCS / BT / SSIF / eSPI
 
