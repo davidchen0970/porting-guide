@@ -75,9 +75,7 @@
 | 2026-07-10 |  0.31 | Copilot | 重寫第 2 章 Flash Partition 與儲存架構，補齊 MTD / UBI / MBR / GPT、檔案系統、映像格式、更新 rollback 與 log 收集 |
 | 2026-07-10 |  0.32 | Copilot | 撰寫第 5 章周邊匯流排通用知識，補強 bus map、DTS/kernel/OpenBMC 對齊、I2C/SPI/UART/PECI/eSPI/NC-SI/MCTP/PLDM/SPDM、log 收集、回查結果與驗收 checklist |
 | 2026-07-10 |  0.33 | Copilot | 撰寫第 6 章 CPLD / FPGA / Board Glue Logic，補強 register map、power sequence、reset mux、fault latch、WP / flash mux、update / recovery、OpenBMC 整合、log 收集、回查結果與驗收 checklist |
-| 2026-07-10 |  0.34 | Copilot | 撰寫第 8 章 Device Tree 通用寫法與排查 |
-| 2026-07-10 |  0.35 | Copilot | 撰寫第 10 章 I2C / PMBus 裝置驅動架構 |
-
+| 2026-07-10 |  0.35 | Copilot | 撰寫第 15 章 Inventory / FRU / Asset 資料模型 |
 ### 0.7 資料來源可信度分級
 
 - A：官方標準、Linux kernel 文件、Yocto 文件、SoC datasheet、board schematic。
@@ -8459,7 +8457,17 @@ tar czf /tmp/i2c-pmbus-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp i2c-pmbus-deb
 | Fault handling | fault injection | [待填] | STATUS snapshot 與 clear flow |
 | Bus recovery | timeout / stuck test | [待填] | recovery 成功條件 |
 
-#### 10.18 驗收 Checklist
+#### 10.18 回查結果
+
+本章已回查前後文並補齊下列銜接點：
+
+- 第 5 章已建立周邊匯流排通用知識，本章補上 I2C / SMBus / PMBus 深入拓樸、driver、hwmon、OpenBMC 連動與 fault handling。
+- 第 8 章已說明 Device Tree，本章補上 I2C controller、mux、child device、PMBus 節點在實機 porting 中的檢查重點。
+- 第 11 章 OpenBMC 常用 Project 與服務速查將說明 Entity Manager、dbus-sensors、ObjectMapper，本章先補 I2C / PMBus sensor 的資料流與排查指令。
+- 第 12 章 Sensor 抽象層與後續 Voltage / Current / Power / PSU Sensor 章節會使用本章的 bus、driver、hwmon、D-Bus 對照方式。
+- 第 16 章 Power Control 與 PSU / VR fault 需引用本章的 PMBus STATUS snapshot、clear fault policy 與 power domain gating。
+
+#### 10.19 驗收 Checklist
 
 -  I2C physical topology、mux path、logical bus、address、power domain、owner 已建立表格。
 -  所有固定 I2C device 已在 DTS 或平台設定中描述，且不與動態 discovery 衝突。
@@ -15624,7 +15632,467 @@ Redfish / IPMI：
 
 ### 15. Inventory / FRU / Asset 資料模型
 
-資料來源需定義權威端：EEPROM、CPLD register、BIOS table、Entity Manager JSON、manufacturing provisioning。FRU 與 Redfish Inventory 欄位需一致。
+本章整理 BMC 平台中 Inventory、FRU、Asset、VPD、Field Replaceable Unit EEPROM、Entity Manager、D-Bus inventory object、Redfish Chassis / Systems / Components 與 IPMI FRU / SDR 的資料模型與排查方法。Inventory 不是單純的「清單」，而是 BMC 對實體硬體拓樸、可插拔元件、製造資訊、序號、料號、版本、位置、presence、functional 狀態與 sensor / power / thermal association 的共同資料基準。
+
+Inventory / FRU / Asset 問題常見現象包含：Redfish inventory 缺件、IPMI FRU 顯示欄位不一致、FRU EEPROM 讀不到、序號 / product name 跟標籤不一致、PSU / fan / riser 插拔後狀態不更新、Entity Manager probe 不匹配、D-Bus object path 改名導致 bmcweb / ipmid / sensor daemon 找不到 association、factory reset 後資產資料消失、量產燒錄資料被 FW update 覆蓋。
+
+本章的目標是把「資料權威端」、「欄位對映」、「OpenBMC D-Bus object」、「Redfish / IPMI 對外呈現」、「動態 presence」、「製造寫入」、「資料保存」、「log 收集」與「驗收 checklist」串在一起，避免不同團隊各自維護一份名稱與序號資料。
+
+#### 15.1 基本名詞與資料邊界
+
+<table>
+<tr><th>名詞</th><th>說明</th><th>BMC porting 關注點</th></tr>
+<tr><td>Inventory</td><td>BMC 內部對實體元件與拓樸的表示，通常由 D-Bus object 與 associations 組成</td><td>object path、interface、Present / Functional、containment、sensor association</td></tr>
+<tr><td>FRU</td><td>Field Replaceable Unit，可現場更換的元件及其識別資料</td><td>EEPROM 格式、I2C path、IPMI FRU 欄位、Redfish Asset 欄位</td></tr>
+<tr><td>Asset</td><td>資產識別資料，例如 Manufacturer、Model、PartNumber、SerialNumber、AssetTag</td><td>資料權威端、製造寫入、更新是否保留</td></tr>
+<tr><td>VPD</td><td>Vital Product Data，平台或元件的重要製造 / 識別資料</td><td>來源可能是 EEPROM、BIOS table、CPLD、NVRAM、provisioning file</td></tr>
+<tr><td>Presence</td><td>實體是否存在</td><td>來源可能是 GPIO、FRU EEPROM ACK、PMBus ACK、CPLD bit、MCTP discovery</td></tr>
+<tr><td>Functional</td><td>存在且功能狀態可用</td><td>PSU present 但 fault、fan present 但 tach fail，都應與 Present 分開描述</td></tr>
+<tr><td>Association</td><td>D-Bus object 之間的關係，例如 contained_by、inventory、sensors</td><td>Redfish / IPMI / policy 常依賴 association 找到元件關係</td></tr>
+<tr><td>Probe</td><td>Entity Manager 用來判斷某 entity 是否存在或適用的規則</td><td>Probe source、比對欄位、SKU / FRU 差異、熱插拔更新</td></tr>
+</table>
+
+建議先定義每一類資料的權威端：
+
+<table>
+<tr><th>資料類型</th><th>可能權威端</th><th>不建議作法</th><th>備註</th></tr>
+<tr><td>Baseboard 序號</td><td>Baseboard FRU EEPROM / manufacturing provisioning</td><td>同時在 EEPROM、JSON、Redfish override 各放不同值</td><td>需和機身標籤 / 工廠系統一致</td></tr>
+<tr><td>Chassis AssetTag</td><td>Factory database / user writable setting</td><td>FW update 時重設為預設值</td><td>若允許使用者修改，需定義保存位置</td></tr>
+<tr><td>PSU inventory</td><td>PSU FRU / PMBus MFR commands</td><td>只用 slot 名稱推測 model / serial</td><td>PSU absent 時需移除或標 unavailable</td></tr>
+<tr><td>Fan tray inventory</td><td>FRU EEPROM / GPIO presence + static config</td><td>fan absent 仍保留舊序號且 Present=true</td><td>需處理熱插拔與 debounce</td></tr>
+<tr><td>CPU / DIMM inventory</td><td>BIOS SMBIOS / host firmware / PECI / SPD</td><td>BMC static JSON 與 host 實際裝置不同步</td><td>host off 時資料可用性需定義</td></tr>
+<tr><td>Riser / PCIe device</td><td>GPIO ID、FRU EEPROM、MCTP / PLDM、BIOS table</td><td>只依 SKU 假設固定存在</td><td>需支援不同 riser 組合</td></tr>
+<tr><td>CPLD / FPGA version</td><td>CPLD register / update manifest</td><td>手寫在 JSON 但未隨更新改變</td><td>需與 update service 對齊</td></tr>
+</table>
+
+#### 15.2 OpenBMC Inventory 架構
+
+OpenBMC inventory 通常由多個 daemon 共同建立，並透過 D-Bus object 暴露。常見資料流如下：
+
+```text
+FRU EEPROM / GPIO / PMBus / SMBIOS / MCTP / static JSON
+    ↓
+fru-device / Entity Manager / platform daemon / host inventory daemon
+    ↓
+D-Bus inventory object
+    /xyz/openbmc_project/inventory/...
+    ↓
+phosphor-dbus-interfaces inventory item interfaces
+    Present / PrettyName / Asset / Chassis / Board / PowerSupply / Fan / Dimm ...
+    ↓
+ObjectMapper / associations
+    ↓
+bmcweb Redfish / phosphor-host-ipmid / sensor daemon / logging / policy
+```
+
+OpenBMC `entity-manager` 的設計目標是把實體元件對映到 BMC 上的軟體資源，並降低新平台移植時需要維護的客製差異；它使用 Entity、Exposes、Probe 等概念描述硬體與其可提供的功能。`fru-device` 是常見 detection daemon，會掃描可用 I2C bus 上的 IPMI FRU EEPROM，並把解析結果提供給 D-Bus，供 Entity Manager 與其他 consumer 使用。
+
+常見元件與職責：
+
+<table>
+<tr><th>元件 / service</th><th>主要職責</th><th>常見輸入</th><th>常見輸出 / 消費者</th></tr>
+<tr><td>fru-device</td><td>掃描 I2C FRU EEPROM、解析 IPMI FRU 格式、發布 FRU 欄位</td><td>I2C EEPROM、baseboard FRU file、blocklist</td><td>Entity Manager、inventory object、debug CLI</td></tr>
+<tr><td>Entity Manager</td><td>依 Probe 與 JSON config 建立 entity / exposes / inventory</td><td>FRU D-Bus、GPIO presence、static JSON、schema</td><td>sensor daemons、inventory manager、policy daemons</td></tr>
+<tr><td>phosphor-dbus-interfaces</td><td>定義標準 D-Bus inventory interface</td><td>YAML interface definitions</td><td>sdbusplus binding、service contracts</td></tr>
+<tr><td>ObjectMapper</td><td>提供 object path、service、interface 查找</td><td>D-Bus object registrations</td><td>bmcweb、ipmid、sensor daemon、debug</td></tr>
+<tr><td>platform inventory daemon</td><td>處理平台客製來源，例如 CPLD、GPIO ID、MCTP discovery</td><td>CPLD register、GPIO、host interface</td><td>inventory object、association、event</td></tr>
+<tr><td>bmcweb</td><td>將 inventory / asset / health 呈現為 Redfish resource</td><td>D-Bus inventory、associations、sensors</td><td>Redfish client / WebUI</td></tr>
+<tr><td>phosphor-host-ipmid</td><td>提供 IPMI FRU / SDR / SEL 對外介面</td><td>D-Bus inventory、FRU data、config</td><td>ipmitool / host management tool</td></tr>
+</table>
+
+#### 15.3 D-Bus Inventory object 與 interface 設計
+
+Inventory object 通常位於 `/xyz/openbmc_project/inventory` namespace。每個實體元件至少應有可識別的 object path，並依元件類型套用對應 interface，例如 `xyz.openbmc_project.Inventory.Item`、`xyz.openbmc_project.Inventory.Decorator.Asset`、`xyz.openbmc_project.Inventory.Item.Board`、`PowerSupply`、`Fan`、`Dimm`、`Cpu` 等。
+
+Object path 命名建議：
+
+```text
+/xyz/openbmc_project/inventory/system
+/xyz/openbmc_project/inventory/system/chassis
+/xyz/openbmc_project/inventory/system/chassis/motherboard
+/xyz/openbmc_project/inventory/system/chassis/motherboard/bmc
+/xyz/openbmc_project/inventory/system/chassis/motherboard/psu0
+/xyz/openbmc_project/inventory/system/chassis/motherboard/fan0
+/xyz/openbmc_project/inventory/system/chassis/motherboard/dimm0
+/xyz/openbmc_project/inventory/system/chassis/motherboard/riser0
+```
+
+命名建議：
+
+- object path 應穩定，不應因 hwmon index、I2C bus number、probe 順序改變。
+- 可插拔 slot 建議使用 slot 名稱，例如 `psu0`、`fan3`、`riser1`，而不是直接用 FRU product name。
+- 同一類型元件序號需與 silk screen / service manual 一致。
+- 若資料來自不同來源，object path 仍應維持同一個 inventory identity，避免 Redfish / IPMI 看到重複項目。
+- 不建議把 transient debug object 暴露到 production inventory tree。
+
+常見 inventory property：
+
+<table>
+<tr><th>Property / Interface</th><th>用途</th><th>資料來源</th><th>注意事項</th></tr>
+<tr><td>Present</td><td>實體是否存在</td><td>GPIO、FRU ACK、PMBus、CPLD、Probe result</td><td>不要和 Functional 混用</td></tr>
+<tr><td>PrettyName</td><td>人類可讀名稱</td><td>config、FRU product name</td><td>不應作為程式唯一識別</td></tr>
+<tr><td>Manufacturer</td><td>製造商</td><td>FRU Board/Product area、PMBus MFR_ID、SMBIOS</td><td>需定義優先順序</td></tr>
+<tr><td>Model</td><td>型號</td><td>FRU product name / part model</td><td>需和 Redfish Model 對映</td></tr>
+<tr><td>PartNumber</td><td>料號</td><td>FRU part number、ERP / factory provisioning</td><td>量產資料需保護</td></tr>
+<tr><td>SerialNumber</td><td>序號</td><td>FRU serial、factory provisioning、PMBus MFR_SERIAL</td><td>不可被 FW update 覆蓋</td></tr>
+<tr><td>AssetTag</td><td>資產標籤</td><td>FRU product asset tag、user setting</td><td>若可寫，需權限與保存策略</td></tr>
+<tr><td>BuildDate / MfgDate</td><td>製造時間</td><td>FRU manufacturing date、factory database</td><td>格式與時區需一致</td></tr>
+<tr><td>Version / Revision</td><td>硬體版本</td><td>FRU custom field、CPLD register、silicon ID</td><td>需區分 board rev、CPLD rev、FW rev</td></tr>
+<tr><td>Functional</td><td>功能狀態</td><td>fault bit、sensor status、daemon 判斷</td><td>Present=true 但 Functional=false 是有效狀態</td></tr>
+</table>
+
+#### 15.4 FRU EEPROM 與 IPMI FRU 格式
+
+IPMI FRU 資料通常存放在 I2C EEPROM 中，常見於 baseboard、PSU、fan tray、riser、backplane、GPU carrier、front panel 等。FRU 格式通常由 common header 指向不同 area，例如 chassis、board、product、multi-record 等。每個 area 有自己的長度、欄位與 checksum。
+
+FRU 設計重點：
+
+- 必須定義 EEPROM 型號、I2C bus、mux path、address、address width、page size、WP pin、容量。
+- 必須定義 FRU data 的 owner：工廠工具、BMC service、field service tool 或 PSU vendor。
+- 必須定義哪些欄位可寫、誰可寫、何時可寫、寫入失敗如何回復。
+- BMC FW update 不應覆蓋 baseboard serial / asset tag / field provisioning 資料。
+- FRU checksum 錯時需報清楚，不能默默使用半解析欄位。
+
+常見 IPMI FRU 欄位對映：
+
+<table>
+<tr><th>FRU area</th><th>欄位</th><th>Inventory / Asset 對映</th><th>Redfish 常見對映</th><th>備註</th></tr>
+<tr><td>Chassis</td><td>Chassis Type</td><td>Chassis 類型</td><td>ChassisType</td><td>需符合產品外型</td></tr>
+<tr><td>Chassis</td><td>Part Number</td><td>Chassis PartNumber</td><td>PartNumber</td><td>機箱料號</td></tr>
+<tr><td>Chassis</td><td>Serial Number</td><td>Chassis SerialNumber</td><td>SerialNumber</td><td>機身序號</td></tr>
+<tr><td>Board</td><td>Manufacturer</td><td>Board Manufacturer</td><td>Manufacturer</td><td>主板製造商</td></tr>
+<tr><td>Board</td><td>Product Name</td><td>Board PrettyName / Model</td><td>Model / Name</td><td>需避免和整機 product name 混淆</td></tr>
+<tr><td>Board</td><td>Serial Number</td><td>Board SerialNumber</td><td>SerialNumber</td><td>主板序號</td></tr>
+<tr><td>Board</td><td>Part Number</td><td>Board PartNumber</td><td>PartNumber</td><td>主板料號</td></tr>
+<tr><td>Product</td><td>Manufacturer</td><td>System Manufacturer</td><td>ComputerSystem Manufacturer</td><td>整機製造商</td></tr>
+<tr><td>Product</td><td>Product Name</td><td>System Model</td><td>ComputerSystem Model</td><td>整機型號</td></tr>
+<tr><td>Product</td><td>Part / Version</td><td>System PartNumber / Version</td><td>PartNumber / SKU</td><td>專案需定義對映</td></tr>
+<tr><td>Product</td><td>Serial Number</td><td>System SerialNumber</td><td>SerialNumber</td><td>外部管理最常使用</td></tr>
+<tr><td>Product</td><td>Asset Tag</td><td>AssetTag</td><td>AssetTag</td><td>可能可由使用者修改</td></tr>
+</table>
+
+#### 15.5 資料來源優先順序與衝突處理
+
+同一欄位可能有多個來源。例如 PSU model 可來自 FRU EEPROM、PMBus MFR_MODEL、Entity Manager JSON、vendor inventory daemon。若未定義優先順序，Redfish / IPMI / WebUI 可能顯示不同資料。
+
+建議每個欄位建立 priority：
+
+<table>
+<tr><th>欄位</th><th>Priority 1</th><th>Priority 2</th><th>Priority 3</th><th>衝突處理</th></tr>
+<tr><td>System SerialNumber</td><td>Factory provisioned FRU Product Serial</td><td>secure manufacturing file</td><td>static config placeholder</td><td>若不一致，記錄 event 並標示待確認</td></tr>
+<tr><td>Baseboard PartNumber</td><td>Board FRU Part Number</td><td>GPIO SKU ID + lookup table</td><td>Entity Manager JSON</td><td>FRU 解析失敗才 fallback</td></tr>
+<tr><td>PSU Model</td><td>PSU FRU Product Name</td><td>PMBus MFR_MODEL</td><td>slot default config</td><td>若 PSU absent，不使用舊值作為 present item</td></tr>
+<tr><td>Fan tray SerialNumber</td><td>Fan tray FRU Serial</td><td>manufacturing database</td><td>N/A</td><td>沒有序號時標未知，不偽造</td></tr>
+<tr><td>CPLD Version</td><td>CPLD register</td><td>update manifest</td><td>static config</td><td>register 讀不到時標 unavailable</td></tr>
+<tr><td>AssetTag</td><td>User writable setting / Redfish PATCH</td><td>FRU Product Asset Tag</td><td>factory default</td><td>需定義寫回 FRU 或 persistent store</td></tr>
+</table>
+
+衝突處理原則：
+
+- 不要默默覆蓋量產資料；需保留 before / after log。
+- 對外欄位只能有一個明確權威端；其他來源作為 fallback 或診斷資訊。
+- 若不同介面需不同語意，例如 System Serial vs Board Serial，必須分開欄位，不要共用。
+- 若 FRU 缺欄位，不建議填入會誤導維修的假資料；可顯示 unknown / unavailable。
+- 若允許 Redfish 更新 AssetTag，需明確定義寫到 FRU EEPROM、persistent setting 或平台資料庫。
+
+#### 15.6 Entity Manager JSON 與 Probe 設計
+
+Entity Manager 常以 JSON 設定描述 entity、probe rule 與 exposes。Probe 可依 FRU 欄位、GPIO presence、DevicePresence、SMBIOS、MCTP discovery 或其他 D-Bus interface 判斷某個配置是否適用。
+
+簡化範本：
+
+```json
+{
+  "Name": "Example Baseboard",
+  "Probe": "xyz.openbmc_project.FruDevice({'BOARD_PRODUCT_NAME': 'EXAMPLE_BOARD'})",
+  "Type": "Board",
+  "Exposes": [
+    {
+      "Name": "Baseboard",
+      "Type": "InventoryItem",
+      "PrettyName": "Example Baseboard"
+    },
+    {
+      "Name": "inlet_temp",
+      "Type": "TMP75",
+      "Bus": 5,
+      "Address": "0x48"
+    }
+  ]
+}
+```
+
+Probe 設計建議：
+
+- Probe 欄位要使用穩定且量產可控的資料，例如 board product name、part number、SKU ID。
+- 不建議使用 serial number 作為 platform config probe，因為每台都不同。
+- Probe rule 需容許 FRU 欄位大小寫、空白、vendor old format 的差異，或在工廠端先標準化。
+- 可插拔元件需定義插入、拔除、重新插入後的 object 更新行為。
+- 一個 FRU 對應多個 Exposes 時，需確認其中任何 sensor / device 失敗不會讓整個 entity 被移除，除非符合設計。
+
+#### 15.7 Presence、Functional、Available 與 Health
+
+Inventory 與 sensor / power / thermal policy 最容易混淆的是 Present、Functional、Available、Health。建議採用下列語意：
+
+<table>
+<tr><th>狀態</th><th>語意</th><th>例子</th><th>對外呈現建議</th></tr>
+<tr><td>Present</td><td>實體是否插入或存在</td><td>PSU 插入、fan tray 插入、DIMM 存在</td><td>Inventory Item Present</td></tr>
+<tr><td>Available</td><td>目前讀值或服務是否可取得</td><td>PSU present 但 PMBus 暫時 timeout</td><td>Sensor Availability</td></tr>
+<tr><td>Functional</td><td>元件是否功能正常</td><td>fan present 但 tach 為 0、PSU present 但 fault</td><td>OperationalStatus Functional=false</td></tr>
+<tr><td>Health</td><td>聚合後的健康狀態</td><td>Redfish Status Health Warning / Critical</td><td>Redfish Status</td></tr>
+<tr><td>Enabled</td><td>是否被管理軟體啟用</td><td>slot disabled、fan policy disabled</td><td>Redfish State / Enabled</td></tr>
+</table>
+
+設計提醒：
+
+- Present=false 時，不應同時報該元件 sensor threshold critical。
+- Present=true 但 Available=false 可表示通訊暫時失敗，需要 retry 與 event debounce。
+- Present=true 但 Functional=false 可表示元件在但有 fault，應保留 inventory 並顯示 fault。
+- Health 應是 policy 聚合結果，不應直接等同單一 GPIO 或單一 PMBus bit。
+- 熱插拔元件需在拔除後清除或更新 sensor association，避免 Redfish 顯示 orphan sensor。
+
+#### 15.8 Association 與拓樸模型
+
+OpenBMC inventory 需要 association 來表達物理包含、sensor 屬於哪個元件、元件位於哪個 chassis / board / slot。這些 association 會影響 Redfish resource 階層、IPMI SDR、power / thermal policy 與 event log 的 location。
+
+常見 association：
+
+<table>
+<tr><th>Association</th><th>用途</th><th>例子</th><th>注意事項</th></tr>
+<tr><td>contained_by / containing</td><td>物理包含關係</td><td>fan0 contained_by chassis</td><td>不要形成循環</td></tr>
+<tr><td>inventory / sensors</td><td>sensor 與 inventory item 關係</td><td>psu0 voltage sensor belongs to psu0</td><td>Redfish sensor placement 依賴此關係</td></tr>
+<tr><td>chassis / all_sensors</td><td>chassis 下所有 sensor</td><td>system/chassis → sensors</td><td>需避免漏掉可插拔元件 sensor</td></tr>
+<tr><td>powered_by</td><td>電源供應關係</td><td>drive backplane powered_by psu0</td><td>若平台支援可補</td></tr>
+<tr><td>cooled_by</td><td>冷卻關係</td><td>CPU cooled_by fan zone</td><td>fan policy 可引用</td></tr>
+</table>
+
+排查 association：
+
+```bash
+busctl tree xyz.openbmc_project.ObjectMapper | grep -i inventory
+busctl introspect <service> <object_path>
+busctl get-property <service> <object_path> xyz.openbmc_project.Association.Definitions Associations
+```
+
+#### 15.9 Redfish / IPMI 對映
+
+Inventory 對外通常會映射到 Redfish 與 IPMI。兩者語意不同：Redfish 偏向 resource model 與 JSON schema；IPMI FRU 偏向 legacy FRU areas 與 SDR。不能假設兩者欄位完全一對一。
+
+<table>
+<tr><th>BMC 內部資料</th><th>Redfish 可能 resource</th><th>IPMI 可能呈現</th><th>注意事項</th></tr>
+<tr><td>System inventory</td><td>ComputerSystem</td><td>Product FRU</td><td>System serial 與 board serial 需分清楚</td></tr>
+<tr><td>Chassis inventory</td><td>Chassis</td><td>Chassis FRU</td><td>ChassisType / AssetTag / SerialNumber</td></tr>
+<tr><td>Baseboard</td><td>Chassis / Assembly / Manager relation</td><td>Board FRU</td><td>Board product name 不一定等於 system model</td></tr>
+<tr><td>PSU</td><td>PowerSupply / PowerSubsystem</td><td>FRU + sensors</td><td>presence、power readout、fault 狀態需一致</td></tr>
+<tr><td>Fan</td><td>Fan / ThermalSubsystem</td><td>Fan SDR / FRU</td><td>fan tray 與 fan rotor 需分層</td></tr>
+<tr><td>DIMM / CPU</td><td>Memory / Processor</td><td>可能由 OEM IPMI / SMBIOS</td><td>來源常是 BIOS / host inventory</td></tr>
+<tr><td>Drive / PCIe</td><td>Drive / PCIeDevice / Storage</td><td>平台依需求</td><td>可能來自 MCTP / PLDM / host table</td></tr>
+</table>
+
+Redfish 檢查：
+
+```bash
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Systems
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Managers
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Power
+curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/<id>/Thermal
+```
+
+IPMI 檢查：
+
+```bash
+ipmitool fru print
+ipmitool fru print <fru_id>
+ipmitool sdr elist
+ipmitool sensor list
+ipmitool sel list
+```
+
+#### 15.10 製造寫入、provisioning 與 field update
+
+Inventory / FRU / Asset 有一部分屬於量產階段資料，不應被一般韌體更新流程覆蓋。建議把資料分成 factory data、field writable data、runtime cache 三類。
+
+<table>
+<tr><th>資料類型</th><th>例子</th><th>寫入時機</th><th>保存位置</th><th>保護策略</th></tr>
+<tr><td>Factory data</td><td>serial number、part number、MAC、UUID、manufacture date</td><td>工廠燒錄 / final test</td><td>FRU EEPROM、secure storage、factory partition</td><td>FW update 不覆蓋；需權限控管</td></tr>
+<tr><td>Field writable data</td><td>AssetTag、Location、user label</td><td>現場管理或 Redfish PATCH</td><td>persistent setting 或可寫 FRU 欄位</td><td>需 audit log 與權限</td></tr>
+<tr><td>Runtime cache</td><td>parsed FRU cache、host inventory cache</td><td>service 啟動或 discovery 後</td><td>/var/lib 或 memory</td><td>可重建；factory reset policy 需定義</td></tr>
+<tr><td>Derived data</td><td>SKU name、friendly name、slot label</td><td>依 Probe / config 產生</td><td>Entity Manager config</td><td>不可覆蓋權威序號</td></tr>
+</table>
+
+製造流程建議：
+
+1. 工廠工具寫入 FRU / asset 欄位。
+2. BMC boot 後讀回 FRU，產生 D-Bus inventory object。
+3. Redfish / IPMI / CLI 讀到的欄位與工廠資料庫比對。
+4. 執行 AC cycle、BMC reboot、FW update、factory reset 後再次比對。
+5. 保存 provisioning log、FRU binary dump、BMC inventory dump 與版本資訊。
+
+#### 15.11 FRU / Inventory 資料保存與安全
+
+Asset data 常包含序號、資產標籤、位置資訊、MAC、UUID、客戶識別資訊。需考慮 field service、RMA、資安與隱私需求。
+
+建議：
+
+- SerialNumber / PartNumber / MAC / UUID 不應被一般使用者無權限修改。
+- AssetTag 若允許修改，需透過 Redfish / CLI 權限控管與審計紀錄。
+- Factory reset 是否清除 AssetTag、Location、user label 需符合產品政策。
+- RMA 換板時需定義保留機身序號或更換主板序號的流程。
+- FRU EEPROM 寫入需避免斷電中斷造成 checksum 損壞；必要時保留備份。
+- 若 inventory 會暴露客戶自定義 label，log 收集對外分享前需評估遮蔽策略。
+
+#### 15.12 Target 端檢查與 log 收集
+
+建議建立固定 log 套件：
+
+```bash
+mkdir -p /tmp/inventory-debug
+cat /etc/os-release > /tmp/inventory-debug/os-release.txt
+uname -a > /tmp/inventory-debug/uname.txt
+cat /proc/cmdline > /tmp/inventory-debug/proc-cmdline.txt
+
+dmesg -T > /tmp/inventory-debug/dmesg.txt
+journalctl -b --no-pager > /tmp/inventory-debug/journal.txt
+systemctl --failed > /tmp/inventory-debug/systemctl-failed.txt 2>&1
+
+# FRU / Entity Manager / Inventory services
+systemctl status xyz.openbmc_project.EntityManager.service --no-pager > /tmp/inventory-debug/entity-manager-status.txt 2>&1
+systemctl status xyz.openbmc_project.FruDevice.service --no-pager > /tmp/inventory-debug/fru-device-status.txt 2>&1
+journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager > /tmp/inventory-debug/entity-manager-journal.txt 2>&1
+journalctl -u xyz.openbmc_project.FruDevice.service -b --no-pager > /tmp/inventory-debug/fru-device-journal.txt 2>&1
+
+# D-Bus inventory
+busctl tree xyz.openbmc_project.ObjectMapper > /tmp/inventory-debug/objectmapper-tree.txt 2>&1
+busctl tree xyz.openbmc_project.EntityManager > /tmp/inventory-debug/entity-manager-tree.txt 2>&1
+busctl tree xyz.openbmc_project.Inventory.Manager > /tmp/inventory-debug/inventory-manager-tree.txt 2>&1
+busctl tree xyz.openbmc_project.FruDevice > /tmp/inventory-debug/fru-device-tree.txt 2>&1
+busctl tree xyz.openbmc_project.ObjectMapper | grep -i inventory > /tmp/inventory-debug/inventory-paths.txt 2>&1
+
+# I2C / EEPROM
+command -v i2cdetect >/dev/null 2>&1 && i2cdetect -l > /tmp/inventory-debug/i2cdetect-l.txt 2>&1
+ls -l /sys/bus/i2c/devices > /tmp/inventory-debug/sys-bus-i2c-devices.txt 2>&1
+find /sys/bus/i2c/devices -maxdepth 3 -name eeprom -print > /tmp/inventory-debug/eeprom-files.txt 2>&1
+
+# GPIO presence
+gpiodetect > /tmp/inventory-debug/gpiodetect.txt 2>&1 || true
+gpioinfo > /tmp/inventory-debug/gpioinfo.txt 2>&1 || true
+
+# Redfish / IPMI local tools, if available
+ipmitool fru print > /tmp/inventory-debug/ipmi-fru-print.txt 2>&1 || true
+ipmitool sdr elist > /tmp/inventory-debug/ipmi-sdr-elist.txt 2>&1 || true
+ipmitool sel list > /tmp/inventory-debug/ipmi-sel-list.txt 2>&1 || true
+
+tar czf /tmp/inventory-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp inventory-debug
+```
+
+若要保存 FRU binary，請先確認資料是否可分享：
+
+```bash
+# 範例：保存 EEPROM binary，bus/address 需依平台替換
+cp /sys/bus/i2c/devices/<bus>-00<addr>/eeprom /tmp/inventory-debug/fru-<bus>-<addr>.bin 2>/dev/null || true
+```
+
+#### 15.13 常見問題與排查入口
+
+<table>
+<tr><th>現象</th><th>可能方向</th><th>第一輪檢查</th></tr>
+<tr><td>Redfish 看不到某個元件</td><td>D-Bus inventory object 未建立，或 association 缺失</td><td>busctl tree、ObjectMapper、bmcweb journal</td></tr>
+<tr><td>IPMI FRU 有資料但 Redfish 沒資料</td><td>FRU 只被 ipmid 使用，未轉成 inventory object</td><td>fru-device tree、Entity Manager Probe、inventory path</td></tr>
+<tr><td>Redfish 有 inventory 但 IPMI FRU 缺欄位</td><td>IPMI FRU ID / mapping 未更新</td><td>ipmitool fru print、ipmid journal、FRU config</td></tr>
+<tr><td>FRU EEPROM 讀不到</td><td>I2C path、address、WP、EEPROM size、mux、power 問題</td><td>i2cdetect、/sys/bus/i2c/devices、scope</td></tr>
+<tr><td>FRU checksum error</td><td>資料寫入中斷、格式錯、area length 錯</td><td>fru-device journal、binary dump、factory tool</td></tr>
+<tr><td>序號顯示 unknown</td><td>FRU 欄位空、Probe fallback 未定義、權威端讀取失敗</td><td>FRU dump、D-Bus value、factory log</td></tr>
+<tr><td>PSU 拔掉後 inventory 仍 Present=true</td><td>presence source 未更新，使用舊 cache</td><td>GPIO / PMBus presence、fru-device journal、Entity Manager object</td></tr>
+<tr><td>Fan tray 插入後 sensor 不出現</td><td>inventory 建立了但 Exposes / sensor daemon 未收到 config</td><td>Entity Manager journal、dbus-sensors journal、association</td></tr>
+<tr><td>Factory reset 後資產資料消失</td><td>factory reset 清掉 persistent store 或 FRU cache 當成權威端</td><td>reset script、保存策略、FRU EEPROM 原始資料</td></tr>
+<tr><td>FW update 後料號變回預設</td><td>image 內 static config 覆蓋 runtime / factory data</td><td>update script、rwfs migration、inventory config</td></tr>
+<tr><td>不同介面顯示不同 model</td><td>Redfish / IPMI / D-Bus 使用不同來源</td><td>欄位優先順序表、bmcweb / ipmid log</td></tr>
+<tr><td>Object path 每次開機不同</td><td>依 bus number / hwmon index / discovery order 命名</td><td>命名規則、Probe source、service log</td></tr>
+</table>
+
+#### 15.14 Bring-up 建議流程
+
+- 建立所有實體元件清單：system、chassis、baseboard、BMC、PSU、fan、riser、backplane、drive、CPU、DIMM、CPLD、FPGA、NIC、GPU。
+- 對每個元件定義資料權威端：FRU EEPROM、PMBus MFR command、SMBIOS、CPLD register、GPIO ID、Entity Manager JSON、manufacturing provisioning。
+- 建立欄位對映表：Manufacturer、Model、PartNumber、SerialNumber、AssetTag、Version、Location、Present、Functional。
+- 建立 object path 命名規則，確保 path 穩定且與 service manual slot 名稱一致。
+- 對可插拔元件定義 presence source、debounce、插入 / 拔除後 D-Bus object 更新行為。
+- 對每個 FRU EEPROM 驗證 I2C path、address、EEPROM size、WP、checksum、欄位內容。
+- 撰寫或更新 Entity Manager JSON，確認 Probe 與 Exposes 不會互相衝突。
+- 驗證 D-Bus inventory object、associations、ObjectMapper 查找結果。
+- 驗證 Redfish / IPMI / WebUI 顯示一致。
+- 做異常測試：FRU missing、checksum error、hot-plug、service restart、BMC reboot、AC cycle、FW update、factory reset。
+- 保存 inventory-debug log、FRU binary dump、Redfish output、IPMI output 與工廠資料比對結果。
+
+#### 15.15 當前平台 Inventory / FRU / Asset 實測表
+
+<table>
+<tr><th>項目</th><th>資料來源</th><th>D-Bus object</th><th>Redfish / IPMI 對映</th><th>實測值</th><th>狀態</th></tr>
+<tr><td>System Model</td><td>[待填]</td><td>[待填]</td><td>ComputerSystem Model / Product FRU</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>System SerialNumber</td><td>[待填]</td><td>[待填]</td><td>ComputerSystem SerialNumber / Product FRU</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>Chassis SerialNumber</td><td>[待填]</td><td>[待填]</td><td>Chassis SerialNumber / Chassis FRU</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>Baseboard PartNumber</td><td>[待填]</td><td>[待填]</td><td>Board FRU / Redfish Assembly</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>Baseboard SerialNumber</td><td>[待填]</td><td>[待填]</td><td>Board FRU / Redfish Assembly</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>BMC FRU / version</td><td>[待填]</td><td>[待填]</td><td>Manager / BMC inventory</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>PSU0 inventory</td><td>[待填]</td><td>[待填]</td><td>PowerSupply / FRU / sensors</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>PSU1 inventory</td><td>[待填]</td><td>[待填]</td><td>PowerSupply / FRU / sensors</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>Fan tray inventory</td><td>[待填]</td><td>[待填]</td><td>Fan / Thermal / FRU</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>Riser inventory</td><td>[待填]</td><td>[待填]</td><td>PCIeSlot / Assembly</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>DIMM inventory</td><td>[待填]</td><td>[待填]</td><td>Memory / host inventory</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>CPU inventory</td><td>[待填]</td><td>[待填]</td><td>Processor / host inventory</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>CPLD version</td><td>[待填]</td><td>[待填]</td><td>Assembly / OEM field</td><td>[待填]</td><td>[待確認]</td></tr>
+<tr><td>AssetTag</td><td>[待填]</td><td>[待填]</td><td>Chassis / System AssetTag</td><td>[待填]</td><td>[待確認]</td></tr>
+</table>
+
+FRU EEPROM 實測表：
+
+<table>
+<tr><th>FRU</th><th>I2C path</th><th>Address</th><th>EEPROM</th><th>WP</th><th>FRU areas</th><th>Checksum</th><th>Owner</th><th>狀態</th></tr>
+<tr><td>Baseboard</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>Factory/BMC</td><td>[待確認]</td></tr>
+<tr><td>PSU0</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>N/A</td><td>[待填]</td><td>[待填]</td><td>PSU vendor</td><td>[待確認]</td></tr>
+<tr><td>PSU1</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>N/A</td><td>[待填]</td><td>[待填]</td><td>PSU vendor</td><td>[待確認]</td></tr>
+<tr><td>Fan board</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>Factory/BMC</td><td>[待確認]</td></tr>
+<tr><td>Riser</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>[待填]</td><td>Factory/BMC</td><td>[待確認]</td></tr>
+</table>
+
+#### 15.16 回查結果
+
+本章已回查前後文並補齊下列銜接點：
+
+- 第 3 章 Pinmux / GPIO 已有 presence / intrusion / GPIO state，本章補上 presence 與 inventory object、functional、association 的資料模型。
+- 第 5 章與第 10 章已涵蓋 I2C / PMBus，本章補上 FRU EEPROM、PSU FRU、PMBus MFR 欄位與 inventory 對映。
+- 第 11 章 OpenBMC 常用 Project 已介紹 Entity Manager、ObjectMapper、dbus-sensors，本章把這些服務套用到 Inventory / FRU / Asset 流程。
+- 第 12～14 章 Sensor 章節會使用 inventory association 將 sensor 連到實體元件，本章補上 association 與 Redfish / IPMI 呈現方式。
+- 第 16 章 Power Control 可引用 PSU inventory、presence、functional 與 PMBus fault 狀態，避免 power policy 與 inventory 顯示不一致。
+- 第 2 章 Flash / Storage 與更新流程已說明 persistent data，本章補上 factory data、field writable data、runtime cache 的保存與 factory reset policy。
+
+#### 15.17 驗收 Checklist
+
+-  所有實體元件已建立 inventory 清單與 object path 命名規則。
+-  每個 asset 欄位已定義權威端、fallback、衝突處理與 owner。
+-  FRU EEPROM 的 I2C path、address、size、WP、checksum、欄位內容已驗證。
+-  Entity Manager Probe 可正確匹配 board / SKU / FRU，不會因 serial number 差異失敗。
+-  D-Bus inventory object 位於穩定 path，且 Present / Functional / Asset 欄位正確。
+-  Association 已建立，sensor、power、thermal、inventory、chassis 關係可由 ObjectMapper 查到。
+-  Redfish System / Chassis / Power / Thermal / Assembly 顯示與 D-Bus inventory 一致。
+-  IPMI FRU / SDR 顯示與 FRU EEPROM、D-Bus inventory 一致，差異已有明確說明。
+-  可插拔元件插入 / 拔除 / 重插後，inventory、sensor、event 狀態可正確更新。
+-  Present=false 不會產生誤導性的 threshold critical；Present=true + fault 可正確顯示 Functional=false 或 Health warning。
+-  AssetTag / Location 等可寫欄位有權限控管、審計與保存策略。
+-  FW update、BMC reboot、AC cycle、factory reset 不會破壞 factory data。
+-  FRU checksum error、EEPROM missing、Probe mismatch、service restart 等異常流程已測試。
+-  inventory-debug log、FRU binary dump、Redfish output、IPMI output、factory 比對結果已保存。
+
+#### 15.18 本章參考資料
+
+- OpenBMC entity-manager README: [https://github.com/openbmc/entity-manager](https://github.com/openbmc/entity-manager)
+- OpenBMC phosphor-dbus-interfaces inventory item definitions: [https://github.com/openbmc/phosphor-dbus-interfaces/tree/master/yaml/xyz/openbmc_project/Inventory/Item](https://github.com/openbmc/phosphor-dbus-interfaces/tree/master/yaml/xyz/openbmc_project/Inventory/Item)
+- OpenBMC phosphor-dbus-interfaces repository: [https://github.com/openbmc/phosphor-dbus-interfaces](https://github.com/openbmc/phosphor-dbus-interfaces)
+- IPMI Platform Management FRU Information Storage Definition: [https://www.intel.com/content/www/us/en/products/docs/servers/ipmi/ipmi-platform-mgt-fru-infostore-def-v1-0-rev-1-3-spec-update.html](https://www.intel.com/content/www/us/en/products/docs/servers/ipmi/ipmi-platform-mgt-fru-infostore-def-v1-0-rev-1-3-spec-update.html)
+- DMTF Redfish Schema Index: [https://redfish.dmtf.org/schemas/v1/](https://redfish.dmtf.org/schemas/v1/)
+
 
 ### 16. Presence / Intrusion / GPIO State Sensor
 
