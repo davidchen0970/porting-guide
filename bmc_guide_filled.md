@@ -73,6 +73,7 @@
 | 2026-07-09 |  0.29 | Copilot | 撰寫第 3 章 Pinmux / GPIO 通用設計模式、DTS 範本、OpenBMC GPIO presence、log 收集與驗收 checklist |
 | 2026-07-09 |  0.30 | Copilot | 撰寫第 4 章 Reset / Clock / Power Domain、DTS 範本、domain timing、reset reason、log 收集與驗收 checklist |
 | 2026-07-10 |  0.31 | Copilot | 重寫第 2 章 Flash Partition 與儲存架構，補齊 MTD / UBI / MBR / GPT、檔案系統、映像格式、更新 rollback 與 log 收集 |
+| 2026-07-10 |  0.32 | Copilot | 撰寫第 5 章周邊匯流排通用知識，補強 bus map、DTS/kernel/OpenBMC 對齊、I2C/SPI/UART/PECI/eSPI/NC-SI/MCTP/PLDM/SPDM、log 收集、回查結果與驗收 checklist |
 
 ### 0.7 資料來源可信度分級
 
@@ -2119,15 +2120,857 @@ find /sys/class/regulator -maxdepth 2 -type l -o -type d 2>/dev/null
 
 ### 5. 周邊匯流排通用知識
 
-I2C / SMBus：需整理 bus number、mux channel、device address、driver、timeout、clock frequency、pull-up、loading。`i2cdetect` 僅作為輔助，對部分 device 可能產生副作用，執行前需知道該 device 行為。
+本章整理 BMC 平台常見周邊匯流排的共用觀念、設計欄位、Device Tree、kernel、userspace、OpenBMC service 與外部管理介面的對齊方式。第 3 章聚焦 pinmux / GPIO，第 4 章聚焦 reset / clock / power domain；本章則聚焦「匯流排路徑是否清楚、controller 是否 probe、child device 是否正確 bind、raw interface 是否可讀寫、上層服務是否有一致的 inventory / sensor / state 對應」。
 
-SPI：需確認 mode、clock、CS polarity、flash opcode、dual/quad enable、WP/HOLD pin 狀態。
+BMC 平台常見匯流排包含 I2C / SMBus / PMBus、SPI、UART、ADC / IIO、PWM / Tach、PECI / APML、eSPI / LPC、KCS / BT、Port80、NC-SI、RGMII / RMII、MDIO、PCIe 管理路徑、USB gadget、MCTP / PLDM / SPDM 等。這些介面看起來差異很大，但 bring-up 與排查可以共用同一套分層方法：先確認硬體前置條件，再確認 bus controller，接著確認 child device 或 endpoint，最後確認 OpenBMC service、D-Bus、Redfish / IPMI / EventLog。
 
-UART：bring-up 初期至少保留一組 console，紀錄 baud rate 與 pin header。
+本章特別強調三件事：
 
-ADC / PWM / Tach：sensor scaling、fan pulse per revolution、PWM polarity 必須與硬體一致。
+- 不要只用「掃得到 device」作為匯流排完成標準。許多管理匯流排還需要 page、phase、EID、route、package / channel、role、host power state、ownership 與 update / recovery policy。
+- 不要只看 Linux bus number。I2C mux、MCTP netdev、USB gadget、NC-SI channel、SPI CS、PECI address 都可能在 runtime 形成新視角，文件要能從 schematic 追到 Linux runtime，再追到 D-Bus / Redfish / IPMI。
+- 不要忽略 debug 指令的副作用。I2C quick command、PMBus CLEAR_FAULTS、SPI erase / write、EEPROM write、PLDM control command、retimer sideband 設定都可能改變平台狀態或清掉故障證據。
 
-PECI / eSPI / LPC / NC-SI / RGMII / RMII / PCIe / USB gadget：需建立 bus map 與 DT node 對照表。
+#### 5.1 共用分層模型
+
+```text
+硬體連線 / connector / device / endpoint
+    ↓
+power rail / reset / clock / pull-up / termination / level shift
+    ↓
+pinmux / pad configuration / strap / mux select
+    ↓
+Linux bus controller driver
+    ↓
+Linux child device / endpoint / protocol driver
+    ↓
+sysfs / dev node / netdev / hwmon / IIO / tty / socket
+    ↓
+OpenBMC daemon / Entity Manager / platform service
+    ↓
+D-Bus object / inventory / sensor / state / event
+    ↓
+Redfish / IPMI / WebUI / SEL / telemetry / policy
+```
+
+排查時建議先找出停在哪一層，不要從對外介面現象直接推論硬體異常。相同的「Redfish sensor 不見」可能來自 I2C NACK、mux channel 錯、driver 未 bind、hwmon label 錯、Entity Manager Probe 不符、PowerState gating、D-Bus association 錯或 bmcweb cache 未更新。
+
+| 層級 | 典型檢查 | 常見問題 | 建議保存 |
+| --- | --- | --- | --- |
+| 硬體 | schematic、BOM、scope、LA、DMM | 接線錯、address strap 錯、pull-up 不足、termination 錯、connector pinout 錯 | schematic 頁碼、量測截圖、BOM 型號 |
+| Power / reset / clock | rail、PGOOD、reset waveform、clock waveform、第 4 章 domain 表 | rail 未穩、reset 未釋放、clock gate 未開、host-off 時 device 無電 | waveform、CPLD / PMIC latch、reset reason |
+| Pinmux / mux select | pinctrl debugfs、gpioinfo、CPLD mux bit、DTS | pinmux 到錯功能、GPIO hog 占用、mux select 預設值錯 | pinctrl dump、gpioinfo、CPLD dump |
+| Bus controller | dmesg、sysfs、debugfs、kernel config | controller disabled、driver 未 probe、clock / reset provider 缺失 | dmesg、kernel config、DTS node |
+| Child device / endpoint | I2C address、SPI CS、PECI address、MCTP EID、NC-SI package/channel | address / CS / mode / EID 錯、device 未上電、driver binding 錯 | sysfs path、driver link、raw read log |
+| Raw interface | hwmon、IIO、tty、netdev、spidev、mctp socket | sysfs index mapping 錯、netdev rename、tty console 衝突 | sysfs tree、ip link、tty list |
+| OpenBMC service | systemctl、journalctl、busctl、Entity Manager JSON | Probe 條件錯、PowerState gating、service dependency、D-Bus path 錯 | service status、journal、config commit |
+| External interface | Redfish、IPMI SDR、SEL / EventLog | association 不完整、schema mapping 錯、inventory cache 舊 | Redfish dump、ipmitool output、event log |
+
+#### 5.2 匯流排地圖必填資料
+
+每個平台都建議維護一份 bus map。bus map 的價值不是列出所有 device，而是讓每個 device 都能從硬體來源追到 Linux runtime 與 OpenBMC 對外狀態。
+
+| 欄位 | 說明 |
+| --- | --- |
+| Bus type | I2C、SPI、UART、PECI、eSPI、LPC、MDIO、NC-SI、USB、MCTP 等 |
+| Physical controller | schematic / SoC 命名，例如 BMC_I2C5、SPI1、UART5、MAC0 |
+| Linux bus / device | `i2c-5`、`spi1.0`、`ttyS4`、`eth0`、`mctp0`、`peci-0` |
+| Topology | direct、mux channel、bridge、switch、slot、connector、package/channel |
+| Device / endpoint | device 型號、FRU 名稱、CPU socket、PSU slot、NVMe slot、retimer |
+| Address / CS / endpoint | I2C 7-bit address、SPI CS、PECI address、MDIO addr、MCTP EID、NC-SI package/channel |
+| Driver / service | kernel driver、hwmon driver、dbus-sensors、mctpd、pldmd、network daemon |
+| Power domain | AlwaysOn、Standby、HostOn、SlotPower、Presence-based、Hotplug |
+| Reset / clock dependency | reset line、clock source、ready signal、host state dependency |
+| Protocol | PMBus、SMBus、NVMe-MI、PLDM、SPDM、NC-SI、APML、KCS、BT |
+| Sysfs / dev path | hwmon path、IIO path、`/dev/spidev*`、`/dev/tty*`、netdev、MCTP interface |
+| D-Bus / OpenBMC path | sensor path、inventory path、state object、software object、event path |
+| External mapping | Redfish URI、IPMI SDR、SEL、EventLog、OEM command |
+| Debug risk | read-clear、write side effect、bus hang、host ownership、security boundary |
+| Owner | HW、BMC FW、BIOS、CPLD、ME / PCH、Security、QA |
+| Status | [待確認]、[量測值]、已驗證、限制事項 |
+
+平台 bus map 範本：
+
+| Bus | Controller | Linux node | Topology | Device | Address / CS / EID | Driver / Service | PowerState | 用途 | 狀態 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| I2C | BMC_I2C5 | `i2c-5` | direct | TMP75 inlet | `0x48` | lm75 / dbus-sensors | AlwaysOn | inlet temperature | [待確認] |
+| I2C | BMC_I2C7 | `i2c-20` | mux@0x70 ch2 | PSU0 PMBus | `0x58` | pmbus / PSUSensor | AlwaysOn | PSU telemetry | [待確認] |
+| I2C | BMC_I2C8 | `i2c-24` | mux ch1 | Riser FRU EEPROM | `0x50` | at24 / FruDevice | Presence-based | FRU / inventory | [待確認] |
+| SPI | FMC | `spi0.0` | CS0 | BMC boot flash | CS0 | spi-nor / mtd | AlwaysOn | boot flash | [待確認] |
+| SPI | SPI1 | `spi1.0` | CS0 | TPM / CPLD / MCU | CS0 | platform driver | Standby | security / board logic | [待確認] |
+| UART | UART5 | `ttyS4` | header | BMC debug console | 115200 8N1 | serial-getty | AlwaysOn | bring-up console | [待確認] |
+| UART | UART2 | `ttyS1` | muxed | Host SOL | 115200 8N1 | obmc-console | HostOn | host serial | [待確認] |
+| PECI | PECI0 | `peci-0` | direct | CPU0 | `0x30` | peci-cputemp | HostOn | CPU / DIMM telemetry | [待確認] |
+| MAC | MAC0 | `eth0` | RGMII | Dedicated PHY | MDIO addr [待填] | aspeed-mac / networkd | AlwaysOn | BMC LAN | [待確認] |
+| NC-SI | MAC1 | `eth1` | NC-SI | Host NIC | pkg/ch [待填] | kernel ncsi / networkd | HostOn/Standby | shared NIC mgmt | [待確認] |
+| MCTP | SMBus | `mctp0` | mux ch [待填] | NVMe / retimer | EID [待填] | mctpd / pldmd | HostOn | PLDM / NVMe-MI | [待確認] |
+| USB | UDC0 | `usb_gadget/*` | device mode | Host USB | N/A | gadget configfs | HostOn | virtual media | [待確認] |
+
+#### 5.3 DTS、kernel、Yocto 與 OpenBMC 設定對齊
+
+同一個匯流排資訊可能出現在 DTS、kernel config、Yocto recipe、Entity Manager JSON、dbus-sensors config、systemd unit、network config、udev rule、Redfish / IPMI mapping 中。排查前需先確認目前 running image 載入的是哪一份 DTB 與哪一份 service config。
+
+| 來源 | 常見檔案 / 指令 | 作用 | 需對齊內容 |
+| --- | --- | --- | --- |
+| Device Tree | `arch/.../dts/*.dts`、`/proc/device-tree` | 描述 controller、child device、mux、address、clock/reset/supply | controller status、reg、compatible、pinctrl、clocks、resets、supplies |
+| Kernel config | `zcat /proc/config.gz`、build config | 啟用 bus / protocol driver | I2C、SPI、PECI、MCTP、NC-SI、IIO、hwmon、USB gadget |
+| Yocto recipe / bbappend | layer recipe、package config | 將工具與 service 放入 image | i2c-tools、mtd-utils、ethtool、libmctp、pldmd、dbus-sensors |
+| Entity Manager JSON | `/usr/share/entity-manager/configurations` | 建立 inventory 與 sensor config | Bus、Address、Name、Probe、PowerState、Exposes |
+| D-Bus service | systemd unit、service config | 讀取 raw device 並暴露 D-Bus objects | dependency、restart policy、host state gating |
+| Network config | systemd-networkd、netplan、platform script | netdev naming、DHCP/static、VLAN、NC-SI | interface name、MAC、link policy、failover |
+| Update / security policy | update service、secure boot | 控制 SPI flash、EEPROM、CPLD / BIOS write path | write protect、signed image、授權流程 |
+
+建議每個 bus controller 都保留 DTS 節點與 runtime 對照：
+
+```sh
+# 看 running DT model 與 compatible
+tr '\0' '\n' < /proc/device-tree/model 2>/dev/null
+tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null
+
+# 查 I2C / SPI / serial / ethernet / peci 相關 node
+find /proc/device-tree -type f | grep -Ei 'i2c|spi|serial|uart|ethernet|mdio|peci|usb|mctp' | head -200
+
+# 查 kernel config
+zcat /proc/config.gz 2>/dev/null | grep -E 'CONFIG_(I2C|SPI|SERIAL|PECI|MCTP|NCSI|IIO|HWMON|USB_GADGET|IPMI|ASPEED|NPCM)'
+```
+
+#### 5.4 I2C / SMBus / PMBus
+
+I2C 是 BMC 最常見的管理匯流排。FRU EEPROM、temperature sensor、voltage / current monitor、VR、HSC、PSU、fan controller、GPIO expander、CPLD、retimer、clock generator、MUX、NVMe-MI bridge 都可能掛在 I2C / SMBus / PMBus 上。Linux 會把實體 controller 與 mux channel 抽象成 logical bus，因此文件中不能只寫 schematic 上的 `I2C5`，也要記錄 Linux 的 `i2c-X`。
+
+##### 5.4.1 I2C topology 與 logical bus
+
+```text
+BMC I2C controller
+  └─ I2C mux @0x70
+      ├─ channel 0 → logical bus i2c-20 → PSU0 PMBus @0x58
+      ├─ channel 1 → logical bus i2c-21 → PSU1 PMBus @0x58
+      ├─ channel 2 → logical bus i2c-22 → fan board EEPROM @0x50
+      └─ channel 3 → logical bus i2c-23 → retimer @0x18
+```
+
+重點：
+
+- 實體 controller number 來自 schematic / SoC，例如 BMC_I2C5。
+- Linux logical bus number 由 kernel runtime 建立，可能因 mux、driver probe 或 alias 而與實體 number 不同。
+- Entity Manager JSON 的 `Bus` 通常使用 Linux logical bus number；若填成 schematic number，service 可能找錯 device。
+- I2C mux 下游 bus number 若不固定，建議在 DTS 使用 aliases 或在文件中保存 `i2cdetect -l` 與 sysfs topology。
+
+常用檢查：
+
+```sh
+i2cdetect -l
+ls -l /sys/bus/i2c/devices/
+for b in /sys/bus/i2c/devices/i2c-*; do
+    echo "==== $b"
+    readlink -f "$b"
+done
+find /sys/bus/i2c/devices -maxdepth 2 -type l | sort
+find /sys/bus/i2c/devices -name channel-* -o -name mux_device 2>/dev/null | sort
+```
+
+##### 5.4.2 I2C / SMBus bring-up 欄位
+
+| 欄位 | 說明 |
+| --- | --- |
+| Physical bus | schematic 上的 controller，例如 BMC_I2C5 |
+| Logical bus | Linux `i2c-X` |
+| Mux path | mux address、channel、下游 logical bus |
+| Pull-up rail | pull-up 電壓、電阻值、是否 always-on |
+| Bus speed | 100kHz、400kHz、1MHz；需確認 controller、board、device 都支援 |
+| Address | 7-bit address；需避免 8-bit address 混用 |
+| Address strap | A0/A1/A2、slot ID、board ID、PSU slot ID |
+| Protocol | I2C、SMBus、PMBus、MCTP over SMBus、vendor mailbox |
+| Driver | kernel driver、hwmon driver、userspace daemon |
+| Side effect | read-clear、write-one-to-clear、page select、fault clear |
+| PowerState | AlwaysOn、HostOn、SlotPower、Presence-based |
+| Bus recovery | SCL toggle、controller reset、mux reset、device power cycle |
+
+##### 5.4.3 DTS 範本：controller、mux、EEPROM、sensor
+
+```dts
+&i2c5 {
+    status = "okay";
+    clock-frequency = <400000>;
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_i2c5_default>;
+
+    mux@70 {
+        compatible = "nxp,pca9548";
+        reg = <0x70>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+        i2c-mux-idle-disconnect;
+
+        i2c@0 {
+            reg = <0>;
+            psu0: power-supply@58 {
+                compatible = "pmbus";
+                reg = <0x58>;
+            };
+        };
+
+        i2c@2 {
+            reg = <2>;
+            fanboard_eeprom: eeprom@50 {
+                compatible = "atmel,24c64";
+                reg = <0x50>;
+                pagesize = <32>;
+            };
+        };
+    };
+};
+```
+
+檢查重點：
+
+- `clock-frequency` 需符合最慢 device 能力與 signal integrity。
+- mux channel 若有同 address device，需確認 idle disconnect / idle state，避免多通道同時連通。
+- EEPROM pagesize、address-width、write protect 與 FRU 工具需一致。
+- sensor 若由 dbus-sensors 或 Entity Manager 建立，不一定需要 DTS child node；但 bus / address / PowerState 仍需在文件對齊。
+
+##### 5.4.4 使用 i2c-tools 的注意事項
+
+`i2cdetect` 僅能作為輔助，不適合在不了解 device 行為時對整條 bus 做盲掃。某些 device 對 quick command、read byte 或特定 command 有副作用；PMBus / VR / PSU 類 device 也可能有 PAGE、PHASE、vendor mode 或 fault latch。
+
+較安全的流程：
+
+1. 先確認 bus map 與 mux channel。
+2. 查 device datasheet，確認 address 與安全讀取 command。
+3. 先用 `i2cdetect -l` 找 bus，不先掃全部 bus。
+4. 只對預期 bus、預期 address 做讀取。
+5. PMBus / VR / PSU 不任意使用 `i2cset`。
+6. 若 device status 可能被讀取清除，先保存 PMBus / CPLD / service log。
+
+```sh
+# 列出 bus
+i2cdetect -l
+
+# 只掃指定 bus；若 device 有副作用，先不要使用
+ i2cdetect -y 5
+
+# 查 kernel 是否已有 driver bind
+ls -l /sys/bus/i2c/devices/5-0048
+readlink -f /sys/bus/i2c/devices/5-0048/driver 2>/dev/null
+
+# hwmon mapping
+find /sys/bus/i2c/devices/5-0048 -maxdepth 3 -type f | sort
+find /sys/class/hwmon -maxdepth 3 -type f | grep -E 'name|temp|in|curr|power|fan' | sort
+```
+
+##### 5.4.5 PMBus 特別注意事項
+
+PMBus 常用於 PSU、VR、HSC、eFuse、power monitor。PMBus bring-up 常見問題不是 bus 不通，而是 PAGE / PHASE / format / scale / fault state 對不上。
+
+| 項目 | 說明 | 排查資料 |
+| --- | --- | --- |
+| PAGE | 多 rail / 多輸出 device 需先選 PAGE | device datasheet、driver channel label |
+| PHASE | 多相 VR 可能需要 phase mapping | VR config、vendor tool、driver log |
+| Linear / Direct format | raw value 轉換需依 PMBus format 與 driver | hwmon value、datasheet coefficient |
+| STATUS_WORD | fault / warning 的入口 | dump before clear |
+| CLEAR_FAULTS | 可能清除診斷資訊 | 僅在保存 status 後執行 |
+| VOUT_MODE | 影響 VOUT 轉換 | driver log、datasheet |
+| Manufacturer registers | vendor-specific 狀態或設定 | vendor app note、保密文件 |
+
+建議 PMBus 先由 kernel hwmon / PMBus driver 暴露 sysfs，再由 userspace service 讀取。raw i2c command 適合 bring-up 與故障定位，不建議在量產流程中成為主要讀值路徑。
+
+##### 5.4.6 I2C bus hang 與 recovery
+
+I2C bus hang 常見於 SDA 被 device 拉低、SCL 被拉低、level shifter half-powered、mux channel 未釋放、device powered-off 但 sideband back-powering。排查時應同步看 scope 與 kernel log。
+
+| 現象 | 可能方向 | 第一輪檢查 |
+| --- | --- | --- |
+| SCL high、SDA low | slave stuck、transaction 中斷 | SCL pulse recovery、device reset、power cycle |
+| SCL low、SDA high/low | master 或 slave clock stretching 卡住 | controller reset、scope、driver timeout |
+| mux 下游全 NACK | mux channel 未切、mux reset、pull-up rail off | mux sysfs、scope、CPLD mux bit |
+| 只有 host on 才可讀 | device rail 依賴 host | PowerState gating、host power timeline |
+| scan 後 device 狀態改變 | scan command 有副作用 | 停止盲掃，改用安全 command |
+
+#### 5.5 SPI / SPI-NOR / SPI-NAND / spidev
+
+SPI 常用於 boot flash、TPM、CPLD、FPGA、MCU、GPIO expander、debug bridge。BMC bring-up 中 SPI boot flash 是關鍵路徑，需同時確認 BootROM 支援、strap、pinmux、controller mode、clock、CS、flash opcode、address byte、dual / quad / octal mode、WP / HOLD、板上 mux 與 write protect policy。
+
+##### 5.5.1 SPI 必填欄位
+
+| 欄位 | 說明 |
+| --- | --- |
+| Controller | SoC SPI / FMC / QSPI controller |
+| Chip select | CS0 / CS1 / GPIO CS，active level |
+| Mode | CPOL / CPHA，mode 0～3 |
+| Max frequency | controller、PCB、device 三者都要符合 |
+| Data lanes | single、dual、quad、octal |
+| Address byte | 3-byte / 4-byte address mode |
+| Opcode | read / fast read / quad read / erase / program opcode |
+| WP / HOLD / RESET | 腳位狀態、pull、是否由 BMC / CPLD 控制 |
+| Boot role | 是否為 BootROM boot media 或 recovery media |
+| Linux node | `/sys/bus/spi/devices/spiB.C`、MTD device、spidev node |
+| Security | write protect、secure boot、signed image、field update 權限 |
+
+##### 5.5.2 SPI flash bring-up
+
+```sh
+dmesg | grep -Ei 'spi|spi-nor|spi-nand|mtd|jedec|quad|qspi|fmc'
+cat /proc/mtd
+ls -l /sys/bus/spi/devices/
+find /sys/bus/spi/devices -maxdepth 3 -type l -o -type f | sort | head -200
+```
+
+U-Boot 常用指令：
+
+```text
+sf probe
+sf read <addr> <offset> <size>
+sf erase <offset> <size>
+sf write <addr> <offset> <size>
+```
+
+注意：`sf erase` 與 `sf write` 會修改 flash。使用前需確認 offset、partition、備份檔、recovery path 與 write protect 狀態。
+
+##### 5.5.3 SPI mode / clock / signal integrity
+
+| 現象 | 可能方向 | 第一輪檢查 |
+| --- | --- | --- |
+| JEDEC ID 全 0 或全 FF | CS、MISO、power、pinmux | scope CS/CLK/MOSI/MISO、DTS、U-Boot `sf probe` |
+| JEDEC ID 偶發錯 | clock 過快、signal integrity、mode 錯 | 降低 SPI clock、scope、LA decode |
+| erase / program fail | WP、block lock、voltage、4-byte mode | status register、WP pin、driver log |
+| kernel 可讀但 BootROM 不開 | BootROM opcode / alignment / header 不符 | SoC boot spec、image offset、strap |
+| quad read fail | QE bit、IO2/IO3、HOLD / WP multiplex | flash status、pinmux、DTS bus-width |
+
+##### 5.5.4 spidev 使用限制
+
+spidev 提供 userspace SPI 存取，適合 bring-up 或簡單 protocol 驗證；正式產品若 device 有 kernel driver，建議使用 kernel driver 或清楚的 userspace daemon。Device Tree 不建議以 `compatible = "spidev"` 代表真實硬體，應填入實際 device compatible，並在開發期間以明確方式 bind spidev。
+
+```sh
+ls -l /dev/spidev* 2>/dev/null
+ls -l /sys/bus/spi/devices/spi* 2>/dev/null
+readlink -f /sys/bus/spi/devices/spi1.0/driver 2>/dev/null
+```
+
+#### 5.6 UART / Serial / SOL
+
+UART 是 bring-up 初期最重要的 debug 入口。至少需保留一組 BMC local console，並記錄 pin header、baud rate、電壓、flow control、mux、是否與 SOL / host console 共用。
+
+| 欄位 | 說明 |
+| --- | --- |
+| UART controller | UART1 / UART5 / SoC serial instance |
+| Linux tty | `ttyS0`、`ttyS4`、`ttyAMA0` |
+| Baud / format | 115200 8N1、57600 8N1、921600 8N1 |
+| Voltage | 1.8V / 3.3V，避免 USB-UART 電壓不符 |
+| Pin header | board silkscreen / connector pinout / GND 位置 |
+| Flow control | RTS / CTS 是否使用 |
+| Console role | bootloader console、kernel console、login console、SOL、host console |
+| Mux owner | BMC、CPLD、host、manual jumper |
+| Log policy | AC-on 前開始收、保留完整 boot log、標記時間 |
+
+```sh
+cat /proc/cmdline | tr ' ' '\n' | grep console
+cat /proc/tty/driver/serial 2>/dev/null
+ls -l /dev/ttyS* /dev/ttyAMA* 2>/dev/null
+systemctl status 'serial-getty@*.service' --no-pager 2>/dev/null
+journalctl -b --no-pager | grep -Ei 'tty|serial|console|uart' | tail -200
+```
+
+Bring-up 建議：
+
+- bootloader 與 kernel console 若共用同一 UART，baud rate 與 pinmux 需一致。
+- 若 UART 經 CPLD / mux 切到 host console 或 BMC console，需記錄 mux select 預設值與控制方式。
+- SOL / host serial 與 BMC local debug console 要分開命名，避免現場接錯線。
+- 若 console log 中斷在特定階段，需同步檢查 reset / clock / pinmux，而不是只看 `serial-getty`。
+
+#### 5.7 ADC / IIO、PWM、Tach
+
+ADC / PWM / Tach 不一定被稱為 bus，但在 BMC sensor / fan control 中與匯流排相同：需要 controller、channel、scale、polarity、sampling、PowerState、userspace mapping 與對外 sensor 名稱。
+
+##### 5.7.1 ADC / IIO
+
+| 欄位 | 說明 |
+| --- | --- |
+| Controller | SoC ADC、external ADC、PMBus ADC |
+| Channel | SoC channel、IIO channel、hwmon index |
+| Voltage divider | Rtop / Rbottom、最大 pin voltage |
+| Reference voltage | internal Vref / external Vref |
+| Unit | raw code、mV、V；確認 daemon 期待單位 |
+| Scaling formula | raw → voltage / current / power 的轉換式 |
+| PowerState | AlwaysOn、HostOn、rail dependent |
+| D-Bus path | `/xyz/openbmc_project/sensors/voltage/...` |
+
+```sh
+dmesg | grep -Ei 'adc|iio|hwmon'
+find /sys/bus/iio/devices -maxdepth 3 -type f | sort
+find /sys/class/hwmon -maxdepth 4 -type f | grep -E 'in[0-9]+_input|name|label' | sort
+```
+
+##### 5.7.2 PWM / Tach
+
+| 欄位 | 說明 |
+| --- | --- |
+| PWM controller / channel | SoC PWM instance、fan controller channel |
+| Tach channel | tach input channel 與 fan 物理位置 |
+| PWM frequency | 依 fan spec，4-wire fan 常見 25kHz，但需以 datasheet 為準 |
+| Duty range | raw 0-255、0-100%、或 period / duty_cycle |
+| Polarity | normal / inversed，需以 scope 驗證 |
+| Pulse per revolution | 2 PPR / 4 PPR 等，需依 fan datasheet |
+| Fan power | fan rail、hot-swap、presence、fault |
+| Policy owner | manual mode、fan daemon、PID service、thermal policy |
+
+```sh
+dmesg | grep -Ei 'pwm|tach|fan'
+find /sys/class/hwmon -maxdepth 4 -type f | grep -E 'fan[0-9]+_input|pwm[0-9]|name|label' | sort
+find /sys/class/pwm -maxdepth 5 -type f 2>/dev/null | sort
+busctl tree xyz.openbmc_project.Sensor 2>/dev/null | grep -Ei 'fan|tach|pwm'
+```
+
+注意：fan daemon 若正在管理 PWM，手動寫 sysfs 可能會被 daemon 立即覆蓋。手動測試前應進入 maintenance / manual mode，或暫停對應 service，並留下測試紀錄。
+
+#### 5.8 PECI / APML
+
+PECI 是 Intel processor 與 BMC / management controller 之間的管理通訊介面，常用於 CPU / DIMM thermal、power 與平台 debug 資訊。PECI 使用 single-wire physical layer；CPU package address 需依平台設計與 CPU 文件確認，常見 socket address 如 `0x30`、`0x31` 但不可只靠慣例。
+
+APML 是 AMD 平台常見管理介面集合，常見資料路徑包含 SB-TSI / SB-RMI，用於 CPU temperature、power 或 mailbox 類資訊。這兩類介面都依賴 host power state；Host off、CPU reset、socket absent 或 power transition 中時，service 應將 sensor 標示為 unavailable，而不是直接判為 sensor fault。
+
+| 介面 | 常見用途 | 需確認 |
+| --- | --- | --- |
+| PECI | Intel CPU / DIMM telemetry、platform debug | PECI controller、CPU address、host power state、kernel driver、timeout |
+| SB-TSI | AMD CPU temperature | I2C bus、address、driver、host power state、sensor scale |
+| SB-RMI | AMD CPU management / mailbox | I2C bus、address、mailbox protocol、timeout、service dependency |
+
+```sh
+dmesg | grep -Ei 'peci|sbtsi|sbrmi|apml|cpu.*temp|dimm'
+find /sys/bus/peci -maxdepth 4 -type f 2>/dev/null | sort
+find /sys/class/hwmon -maxdepth 4 -type f | grep -Ei 'name|temp|power|label' | sort
+busctl tree xyz.openbmc_project.Sensor 2>/dev/null | grep -Ei 'cpu|dimm|peci|apml'
+busctl tree xyz.openbmc_project.State.Host 2>/dev/null
+```
+
+PECI / APML 驗證重點：
+
+- Host off 時予以 unavailable，不產生大量 critical event。
+- Host power on 後 polling start 時機需等待 CPU / PCH ready。
+- 多 socket 平台需確認 socket address 與 physical socket 對應。
+- CPU / DIMM sensor 命名需與 inventory association 對齊。
+- timeout / retry 不可造成 sensor daemon 長時間阻塞。
+
+#### 5.9 eSPI / LPC / KCS / BT / Port80
+
+eSPI / LPC 是 BMC 與 host PCH / chipset 之間的管理通道，常承載 KCS / BT / IPMI、POST code、host status、virtual wire 或其他 sideband。此類介面高度依賴 host standby / reset / power state，需和第 4 章 eSPI/LPC domain、第 14 章 Power Control、第 18 章 KCS / BT / SSIF / eSPI 一起看。
+
+| 項目 | 說明 |
+| --- | --- |
+| Host dependency | RSMRST、PLTRST、PCH power、eSPI clock |
+| Mode | eSPI peripheral channel、VW channel、OOB channel、Flash channel；或 legacy LPC |
+| BMC controller | SoC eSPI / LPC controller |
+| Host interface | KCS、BT、Port80、mailbox、SERIRQ、virtual UART |
+| Driver / service | kernel eSPI/LPC driver、phosphor-host-ipmid、postcode service |
+| Security | host flash access、OOB command、privilege boundary、field mode |
+
+```sh
+dmesg | grep -Ei 'espi|lpc|kcs|bt|ipmi|port80|postcode|serirq|vw'
+ls -l /dev/ipmi* /dev/kcs* 2>/dev/null
+systemctl status phosphor-ipmi-host.service --no-pager 2>/dev/null
+journalctl -u phosphor-ipmi-host.service -b --no-pager | tail -200
+busctl tree xyz.openbmc_project.State.Host 2>/dev/null
+busctl tree xyz.openbmc_project.State.Chassis 2>/dev/null
+```
+
+常見問題：
+
+| 現象 | 可能方向 | 第一輪檢查 |
+| --- | --- | --- |
+| host IPMI 不通 | KCS / BT device 不見、daemon 未起、host side disabled | dmesg、`/dev/ipmi*`、ipmid journal、BIOS setting |
+| Port80 無資料 | LPC/eSPI channel 未 ready、POST source 錯 | host state、postcode service、scope / LA |
+| eSPI channel timeout | RSMRST / PLTRST / clock / virtual wire 狀態不符 | timing、CPLD register、kernel log |
+| BMC reboot 後 host state 錯 | state rediscovery 不完整 | power daemon log、host GPIO、D-Bus state |
+
+#### 5.10 Network sideband：RGMII、RMII、MDIO、NC-SI
+
+BMC network 可能使用 dedicated PHY，也可能透過 NC-SI 與 host NIC 共用管理網路。Dedicated PHY 常見 RGMII / RMII / MDIO；NC-SI 則需注意 package / channel、host NIC power state、AEN、MAC address、link failover 與 filter policy。
+
+##### 5.10.1 RGMII / RMII / MDIO
+
+| 項目 | RGMII | RMII |
+| --- | --- | --- |
+| Clock | 常見 125MHz / 25MHz dependency | 常見 50MHz REFCLK |
+| Signal | TX/RX data + control + clock | data line 較少，共用 REFCLK |
+| 常見風險 | TX/RX delay、skew、PHY strap | REFCLK source、clock direction、strap |
+| Debug | `ethtool`、MDIO、scope | `ethtool`、MDIO、scope |
+
+```sh
+dmesg | grep -Ei 'eth|mac|mdio|phy|rgmii|rmii|ncsi'
+ip link
+ip addr
+ethtool eth0 2>/dev/null
+ethtool -S eth0 2>/dev/null | head -100
+find /sys/class/net -maxdepth 3 -type l -o -type f | sort | head -100
+```
+
+DTS / hardware 注意事項：
+
+- `phy-mode` 需和硬體設計一致，例如 `rgmii-id`、`rgmii-rxid`、`rgmii-txid`、`rmii`。
+- PHY reset 與 clock stable 的順序會影響 strap latch。
+- MDIO address 由 PHY strap 決定，需與 DTS `reg` 一致。
+- RGMII delay 是 PHY / MAC / board 三者分工，不能只改一端。
+
+##### 5.10.2 NC-SI
+
+NC-SI 常用於 BMC 與 host NIC 共享實體網路埠。需記錄 package ID、channel ID、hostless / hostful policy、link failover、MAC address、VLAN、filter、AEN 與 recovery 行為。
+
+| 欄位 | 說明 |
+| --- | --- |
+| Package / Channel | NIC 內部 NC-SI package / channel mapping |
+| Interface | BMC netdev，例如 `eth1` |
+| Host dependency | NIC 是否在 standby 可用、host power transition 是否影響 |
+| MAC policy | BMC MAC、host MAC、shared / dedicated、factory programmed |
+| VLAN / filter | 是否由 NIC filter 或 BMC network stack 控制 |
+| Recovery | link down、AEN、channel reset、package select |
+| Service | kernel NC-SI、networkd、平台 NCSI daemon |
+
+```sh
+dmesg | grep -Ei 'ncsi|NCSI|AEN|package|channel|link'
+ip link show
+networkctl status 2>/dev/null
+journalctl -b --no-pager | grep -Ei 'ncsi|network|eth|mac|link' | tail -300
+```
+
+驗證矩陣：
+
+| 測試 | 預期 |
+| --- | --- |
+| BMC boot only、Host off | 依產品政策，NC-SI 可用或標示依賴 host |
+| Host power on / off | BMC 管理網路不應無預期掉線，或 log 中需清楚記錄 transition |
+| NIC reset / driver reload | BMC network 可 recovery |
+| cable plug / unplug | link event、Redfish / network state 一致 |
+| shared port failover | channel / package 選擇符合設計 |
+
+#### 5.11 PCIe 管理路徑與 USB gadget
+
+##### 5.11.1 PCIe 管理路徑
+
+BMC 不一定直接是 PCIe root complex，但仍可能透過 sideband、MCTP over PCIe、SMBus、PERST、presence、hot-plug、retimer / switch management 參與 PCIe 裝置管理。此處重點是「BMC 管理路徑」而非 host PCIe enumeration 本身。
+
+| 項目 | 需確認 |
+| --- | --- |
+| Slot power | slot power enable、PGOOD、fault、hot-swap controller |
+| Reset | PERST_N、fundamental reset、hot reset、CPLD owner |
+| Refclk | source、enable、spread spectrum、clock buffer |
+| Presence | PRSNT pin、CPLD bit、GPIO、debounce |
+| Management transport | SMBus、I2C、MCTP over PCIe、vendor sideband |
+| Inventory | slot、FRU、PCIe device、retimer association |
+| Security | device firmware update 授權、SPDM、debug lock |
+
+##### 5.11.2 USB gadget
+
+USB gadget 常用於 virtual media、USB network、USB serial、host-to-BMC debug 或 provisioning。需確認 BMC USB device controller、VBUS detect、ID pin、role switch、gadget configfs、systemd service 與 host OS driver。
+
+```sh
+dmesg | grep -Ei 'usb|gadget|udc|configfs|mass storage|rndis|ecm|hid'
+ls -l /sys/class/udc 2>/dev/null
+find /sys/kernel/config/usb_gadget -maxdepth 4 -type f 2>/dev/null | sort
+systemctl --type=service | grep -Ei 'usb|gadget|virtual'
+```
+
+USB gadget 驗證重點：
+
+- Host OS 可辨識 device class。
+- BMC reboot / Host reboot 後 gadget role 能回復。
+- Virtual media mount / unmount 不造成 BMC filesystem 殘留 busy state。
+- USB network 與管理 LAN 的 route / firewall 不互相衝突。
+- 量產模式與 field mode 對 gadget 功能的開關政策明確。
+
+#### 5.12 MCTP / PLDM / SPDM
+
+MCTP 是伺服器內部管理通訊常見基礎協定，可承載 PLDM、SPDM、NVMe-MI 與 OEM protocol。Linux kernel MCTP 以 netdevice 表示 MCTP interface，並提供 socket-based API；MCTP topology 需定義 network、interface、EID、route 與 message type。
+
+##### 5.12.1 MCTP 分層
+
+```text
+Physical transport binding
+    SMBus / I2C, PCIe, serial, vendor transport
+        ↓
+Linux MCTP netdev
+    mctp0, mctp1 ...
+        ↓
+MCTP network / route / EID
+        ↓
+Upper protocol
+    PLDM, SPDM, NVMe-MI, OEM
+        ↓
+OpenBMC service
+    mctpd, pldmd, SPDM responder/requester, NVMe-MI daemon
+```
+
+| 項目 | 說明 |
+| --- | --- |
+| Transport binding | SMBus / I2C、PCIe、serial、vendor transport |
+| Interface | Linux MCTP netdev，例如 `mctp0` |
+| Network ID | 本地 MCTP network identifier |
+| Local EID | BMC endpoint id |
+| Remote EID | endpoint id，需避免同一 network 內衝突 |
+| Route | EID → interface / network 的路由設定 |
+| Upper protocol | PLDM、SPDM、NVMe-MI、OEM |
+| Discovery | endpoint discovery、EID assignment、route setup |
+| Service | mctpd、pldmd、SPDM service、NVMe-MI daemon |
+
+```sh
+dmesg | grep -Ei 'mctp|pldm|spdm|nvme-mi|eid'
+ip link | grep -i mctp -A3 -B1
+ip route show table all 2>/dev/null | grep -i mctp || true
+busctl tree xyz.openbmc_project.PLDM 2>/dev/null
+journalctl -b --no-pager | grep -Ei 'mctp|pldm|spdm|eid|nvme-mi' | tail -300
+```
+
+##### 5.12.2 PLDM / SPDM bring-up 注意事項
+
+| 協定 | 常見用途 | Bring-up 重點 |
+| --- | --- | --- |
+| PLDM | FRU、sensor、firmware update、platform monitoring | endpoint discovery、terminus ID、PDR、sensor mapping、firmware package flow |
+| SPDM | 裝置身份、憑證、measurement、secure session | certificate chain、algorithm、measurement hash、session policy |
+| NVMe-MI | NVMe 管理、SMART、firmware slot | transport binding、controller ID、sideband availability、host state |
+
+MCTP / PLDM / SPDM 常見現象：
+
+| 現象 | 可能方向 | 第一輪檢查 |
+| --- | --- | --- |
+| MCTP netdev 不見 | kernel config、transport driver、DTS binding | dmesg、`ip link`、kernel config |
+| EID 重複 | discovery policy、static config、multiple network 混淆 | mctpd log、route table、endpoint list |
+| PLDM endpoint 有回應但 sensor 不出現 | PDR parsing、terminus mapping、inventory association | pldmd journal、PDR dump、D-Bus tree |
+| SPDM handshake fail | algorithm mismatch、cert chain、time、policy | SPDM log、cert dump、endpoint capability |
+| NVMe-MI timeout | slot power、MCTP route、controller reset、host state | slot power log、MCTP packet log、endpoint status |
+
+#### 5.13 OpenBMC service 整合
+
+OpenBMC 中同一個硬體裝置可能經過多個 service 才對外呈現。例如 PSU PMBus device 可能先由 kernel pmbus driver 產生 hwmon，再由 PSUSensor 建立 D-Bus sensor，再由 inventory association 與 Redfish PowerSubsystem 呈現。排查時需記錄每一層。
+
+```text
+I2C PMBus device
+    ↓
+kernel pmbus / hwmon
+    ↓
+dbus-sensors / PSUSensor
+    ↓
+D-Bus sensor path + inventory association
+    ↓
+Redfish PowerSubsystem / Chassis / EventLog
+```
+
+常用指令：
+
+```sh
+systemctl --failed
+systemctl status xyz.openbmc_project.EntityManager.service --no-pager
+journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager | tail -200
+busctl tree xyz.openbmc_project.ObjectMapper | head -200
+busctl tree xyz.openbmc_project.Sensor 2>/dev/null
+busctl tree xyz.openbmc_project.Inventory.Manager 2>/dev/null
+busctl tree xyz.openbmc_project.State.Host 2>/dev/null
+```
+
+服務整合檢查表：
+
+| 項目 | 檢查重點 |
+| --- | --- |
+| Probe 條件 | FRU / GPIO presence / compatible / SKU 判斷是否正確 |
+| PowerState gating | HostOff、Presence false、SlotPower off 時是否停止讀取或標 unavailable |
+| Retry policy | device late ready、hot-swap、bus recovery 後是否重試 |
+| Naming | sensor name、inventory name、Redfish name 是否一致 |
+| Association | sensor → inventory、inventory → chassis / board / slot 是否完整 |
+| Event policy | unavailable、warning、critical、functional false 的事件規則 |
+| Service dependency | mux、GPIO expander、host state、network、mctpd / pldmd 是否先 ready |
+
+#### 5.14 匯流排安全與副作用
+
+周邊匯流排 debug 不只是「能不能讀到」，也要注意是否會造成副作用。建議在 bus map 中把高風險指令與安全讀取指令分開列出。
+
+| 類型 | 風險 | 建議 |
+| --- | --- | --- |
+| I2C quick command | 可能觸發 device 行為 | 不熟 device 時避免對全 bus 掃描 |
+| I2C write / EEPROM write | 改變 FRU / VPD / config | 預設 write protect，測試前備份 |
+| PMBus CLEAR_FAULTS | 清除故障證據 | 先 dump status，再依流程 clear |
+| PMBus PAGE / vendor mode | 影響後續讀值或控制 | 每次 raw 存取後恢復預期 page |
+| SPI erase / write | 破壞 boot flash / CPLD / BIOS image | 先確認 offset、備份、recovery |
+| GPIO reset / power enable | 造成 host 或 device reset | 先確認 owner、safe state、測試窗口 |
+| Retimer / PCIe sideband | 影響 host link training | 配合 host power state 與測試計畫 |
+| MCTP / PLDM control | 改變 endpoint 設定或 firmware 狀態 | 區分 read-only query 與 control command |
+| USB gadget | 暴露 provisioning / storage / network path | field mode 與 factory mode 權限分開 |
+| eSPI / LPC / KCS | host / BMC privilege boundary | 確認 BIOS、BMC security policy |
+
+#### 5.15 Target 端共用 log 收集
+
+本節提供匯流排共用 log 套件。實際平台可依 image 中可用工具調整；指令失敗時不代表測試失敗，但需保留 stderr 供分析。
+
+```sh
+mkdir -p /tmp/bus-debug
+cat /etc/os-release > /tmp/bus-debug/os-release.txt
+uname -a > /tmp/bus-debug/uname.txt
+cat /proc/cmdline > /tmp/bus-debug/proc-cmdline.txt
+zcat /proc/config.gz > /tmp/bus-debug/kernel-config.txt 2>&1 || true
+dmesg -T > /tmp/bus-debug/dmesg.txt
+journalctl -b --no-pager > /tmp/bus-debug/journal.txt
+systemctl --failed > /tmp/bus-debug/systemctl-failed.txt 2>&1
+
+# Device Tree / pinctrl / gpio / clock
+tr '\0' '\n' < /proc/device-tree/model > /tmp/bus-debug/dt-model.txt 2>&1 || true
+tr '\0' '\n' < /proc/device-tree/compatible > /tmp/bus-debug/dt-compatible.txt 2>&1 || true
+find /proc/device-tree -maxdepth 6 -type f | grep -Ei 'i2c|spi|serial|uart|ethernet|mdio|peci|usb|mctp' > /tmp/bus-debug/dt-bus-files.txt 2>&1 || true
+mount | grep debugfs || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+cat /sys/kernel/debug/clk/clk_summary > /tmp/bus-debug/clk-summary.txt 2>&1 || true
+cat /sys/kernel/debug/gpio > /tmp/bus-debug/debug-gpio.txt 2>&1 || true
+find /sys/kernel/debug/pinctrl -maxdepth 3 -type f -print > /tmp/bus-debug/pinctrl-files.txt 2>&1 || true
+
+# I2C / SMBus / PMBus
+i2cdetect -l > /tmp/bus-debug/i2cdetect-l.txt 2>&1 || true
+ls -l /sys/bus/i2c/devices > /tmp/bus-debug/sys-bus-i2c-devices.txt 2>&1 || true
+find /sys/bus/i2c/devices -maxdepth 3 -type l -o -type f > /tmp/bus-debug/i2c-tree.txt 2>&1 || true
+
+# SPI / MTD
+ls -l /sys/bus/spi/devices > /tmp/bus-debug/sys-bus-spi-devices.txt 2>&1 || true
+find /sys/bus/spi/devices -maxdepth 3 -type l -o -type f > /tmp/bus-debug/spi-tree.txt 2>&1 || true
+cat /proc/mtd > /tmp/bus-debug/proc-mtd.txt 2>&1 || true
+
+# UART
+cat /proc/tty/driver/serial > /tmp/bus-debug/proc-tty-serial.txt 2>&1 || true
+ls -l /dev/ttyS* /dev/ttyAMA* > /tmp/bus-debug/tty-devices.txt 2>&1 || true
+
+# ADC / hwmon / PWM / fan
+find /sys/class/hwmon -maxdepth 5 -type f > /tmp/bus-debug/hwmon-files.txt 2>&1 || true
+find /sys/bus/iio/devices -maxdepth 4 -type f > /tmp/bus-debug/iio-files.txt 2>&1 || true
+find /sys/class/pwm -maxdepth 5 -type f > /tmp/bus-debug/pwm-files.txt 2>&1 || true
+
+# PECI / APML
+find /sys/bus/peci -maxdepth 4 -type f > /tmp/bus-debug/peci-files.txt 2>&1 || true
+
+# eSPI / LPC / IPMI host interface
+ls -l /dev/ipmi* /dev/kcs* > /tmp/bus-debug/ipmi-devices.txt 2>&1 || true
+journalctl -u phosphor-ipmi-host.service -b --no-pager > /tmp/bus-debug/phosphor-ipmi-host-journal.txt 2>&1 || true
+
+# Network / NC-SI / MDIO
+ip link > /tmp/bus-debug/ip-link.txt 2>&1 || true
+ip addr > /tmp/bus-debug/ip-addr.txt 2>&1 || true
+networkctl status > /tmp/bus-debug/networkctl-status.txt 2>&1 || true
+for n in /sys/class/net/*; do
+    iface=$(basename "$n")
+    ethtool "$iface" > "/tmp/bus-debug/ethtool-${iface}.txt" 2>&1 || true
+    ethtool -S "$iface" > "/tmp/bus-debug/ethtool-${iface}-stats.txt" 2>&1 || true
+done
+
+# MCTP / PLDM / SPDM
+ip link | grep -i mctp -A3 -B1 > /tmp/bus-debug/mctp-link.txt 2>&1 || true
+journalctl -b --no-pager | grep -Ei 'mctp|pldm|spdm|eid|nvme-mi' > /tmp/bus-debug/mctp-pldm-spdm-journal.txt 2>&1 || true
+busctl tree xyz.openbmc_project.PLDM > /tmp/bus-debug/pldm-tree.txt 2>&1 || true
+
+# D-Bus / inventory / sensor
+busctl tree xyz.openbmc_project.Sensor > /tmp/bus-debug/sensor-tree.txt 2>&1 || true
+busctl tree xyz.openbmc_project.Inventory.Manager > /tmp/bus-debug/inventory-tree.txt 2>&1 || true
+busctl tree xyz.openbmc_project.State.Host > /tmp/bus-debug/host-state-tree.txt 2>&1 || true
+busctl tree xyz.openbmc_project.State.Chassis > /tmp/bus-debug/chassis-state-tree.txt 2>&1 || true
+
+tar czf /tmp/bus-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp bus-debug
+```
+
+#### 5.16 常見問題與排查入口
+
+| 現象 | 可能方向 | 第一輪檢查 |
+| --- | --- | --- |
+| I2C bus 不見 | controller disabled、pinmux、clock/reset、DTS status | dmesg、`i2cdetect -l`、pinctrl、clk_summary |
+| I2C device NACK | address 錯、power off、reset asserted、mux channel 錯、pull-up rail off | scope、指定 bus 掃描、mux sysfs、PowerState |
+| I2C bus hang | SDA/SCL 被拉低、device stuck、level shifter 問題 | scope、bus recovery、device reset |
+| PMBus 讀值錯 | PAGE / PHASE / format / scale 錯 | hwmon label、datasheet、driver log |
+| PMBus fault 消失 | status 被 clear | journal、clear history、測試流程 |
+| SPI flash JEDEC ID 錯 | SPI mode、CS、clock、pinmux、WP/HOLD、電壓 | scope、dmesg、U-Boot `sf probe` |
+| spidev 不出現 | compatible / driver binding 不符 | dmesg、`/sys/bus/spi/devices` |
+| UART 無 log | pinmux、baud rate、電壓、console bootargs、mux | scope、`/proc/cmdline`、serial-getty |
+| UART 有亂碼 | baud rate、clock parent、電壓不符 | U-Boot env、kernel cmdline、scope |
+| ADC 讀值 0 或滿量程 | channel 錯、分壓錯、Vref、power state | IIO sysfs、DMM、DTS channel |
+| PWM 無輸出 | pinmux、clock、polarity、service 覆蓋 | scope、pwm sysfs、fan daemon log |
+| Tach RPM 為 0 | fan power、tach pull-up、PPR、channel mapping | scope、hwmon、fan presence |
+| PECI / APML timeout | host off、CPU reset、address 錯、driver 未 probe | host state、dmesg、hwmon |
+| eSPI / LPC 不 ready | RSMRST / PLTRST / clock / PCH sideband | power timeline、dmesg、host state |
+| KCS / BT host IPMI 不通 | `/dev/ipmi*` 不見、daemon fail、BIOS disabled | dmesg、ipmid journal、BIOS setup |
+| Dedicated LAN no link | PHY reset/clock/strap、RGMII delay、MDIO address | ethtool、MDIO、scope |
+| NC-SI link 不起 | package / channel、NIC power、AEN、MAC policy | dmesg、`ip link`、network journal |
+| USB gadget 不出現 | UDC not bound、role switch、VBUS detect、host driver | dmesg、configfs、host device manager |
+| MCTP endpoint 不見 | EID / route / binding / service 未 ready | `ip link`、mctpd / pldmd journal |
+| PLDM sensor 不出現 | PDR / terminus / association 問題 | pldmd journal、D-Bus tree、inventory |
+| SPDM handshake fail | algorithm / certificate / policy mismatch | SPDM log、cert chain、endpoint capability |
+| Redfish / IPMI 不顯示 | D-Bus object / inventory association / mapping | busctl、bmcweb、ipmid log |
+
+#### 5.17 Bring-up 建議流程
+
+1. 建立完整 bus map：controller、Linux node、mux、address / endpoint、driver、OpenBMC service。
+2. 先確認 power / reset / clock / pinmux，引用第 3、4 章表格。
+3. 確認 controller probe：dmesg、sysfs、debugfs、kernel config。
+4. 確認 child device / endpoint：address、CS、package/channel、EID、binding、driver。
+5. 確認 raw interface：hwmon、IIO、tty、spidev、MTD、netdev、MCTP interface。
+6. 導入 OpenBMC config：Entity Manager、dbus-sensors、fan service、power service、network service、mctpd / pldmd。
+7. 驗證 D-Bus object：ObjectMapper、sensor path、inventory path、state path、association。
+8. 驗證外部介面：Redfish、IPMI、SEL / EventLog。
+9. 做異常測試：NACK、bus hang、hot-swap、host power off/on、service restart、BMC reboot、AC cycle。
+10. 保存 bus-debug log、scope / LA、版本、DTS commit、service config commit。
+11. 回填 Chapter 5 bus map、當前平台實測表、限制事項與 owner。
+
+#### 5.18 當前平台匯流排實測表
+
+##### 5.18.1 Bus controller 實測表
+
+| Bus type | Controller | Linux node | DTS status | Driver | Power domain | Pinmux state | 實測結果 | 狀態 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| I2C | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待確認] |
+| SPI | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待確認] |
+| UART | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待確認] |
+| PECI/APML | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待確認] |
+| eSPI/LPC | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待確認] |
+| Ethernet/NC-SI | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待確認] |
+| MCTP | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待確認] |
+| USB gadget | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待確認] |
+
+##### 5.18.2 I2C / SMBus / PMBus 實測表
+
+| Physical bus | Logical bus | Mux path | Device | Address | Driver / service | PowerState | Safe read command | 實測結果 | 備註 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+| [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+
+##### 5.18.3 MCTP / PLDM / SPDM 實測表
+
+| Transport | Interface | Network ID | Local EID | Remote EID | Endpoint | Upper protocol | Service | 實測結果 | 備註 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+| [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+
+#### 5.19 驗收 Checklist
+
+- [ ] 每個 bus controller 已建立 schematic → DTS → Linux runtime → OpenBMC config 對照。
+- [ ] I2C logical bus number、mux channel、device address、driver、PowerState 已填入 bus map。
+- [ ] I2C / SMBus / PMBus 高風險讀寫 command 已標示副作用。
+- [ ] PMBus PAGE / PHASE / data format / fault clear policy 已確認。
+- [ ] SPI mode、clock、CS、data lane、flash opcode、address byte、WP / HOLD 已確認。
+- [ ] SPI boot flash 的 BootROM、U-Boot、kernel MTD / UBI 路徑已與第 2 章對齊。
+- [ ] UART console 至少保留一組，baud rate、pin header、電壓、mux owner 已記錄。
+- [ ] SOL / host serial 與 BMC local console 命名清楚，現場接線不易混淆。
+- [ ] ADC channel、scale、Vref、divider、D-Bus path 已對齊。
+- [ ] PWM / Tach channel、polarity、frequency、PPR、fan presence 已驗證。
+- [ ] PECI / APML address、host power state、driver / hwmon mapping 已驗證。
+- [ ] eSPI / LPC / KCS / BT / Port80 與 host power / reset dependency 已記錄。
+- [ ] RGMII / RMII / MDIO 的 clock、reset、PHY strap、delay mode 已驗證。
+- [ ] NC-SI package / channel、MAC policy、host dependency、link recovery 已驗證。
+- [ ] USB gadget 的 UDC、role、configfs、host driver 與安全模式已確認。
+- [ ] MCTP transport、netdev、network、EID、route、service 狀態已確認。
+- [ ] PLDM / SPDM / NVMe-MI endpoint discovery 與 service log 已保存。
+- [ ] D-Bus / Redfish / IPMI / SEL 對外狀態與 raw bus / sysfs 資料一致。
+- [ ] bus-debug log 收集腳本已可執行，且納入 bring-up / regression 流程。
+- [ ] 高風險 debug 指令已建立使用限制與備份 / recovery 流程。
+
+#### 5.20 本章參考資料
+
+- Linux kernel documentation - I2C / SMBus subsystem: https://docs.kernel.org/i2c/index.html
+- Linux kernel documentation - Linux I2C Sysfs: https://docs.kernel.org/i2c/i2c-sysfs.html
+- Linux kernel documentation - Serial Peripheral Interface: https://docs.kernel.org/spi/index.html
+- Linux kernel documentation - SPI userspace API: https://docs.kernel.org/spi/spidev.html
+- Linux kernel documentation - Low Level Serial API: https://docs.kernel.org/driver-api/serial/driver.html
+- Linux kernel documentation - PECI subsystem: https://docs.kernel.org/peci/index.html
+- Linux kernel documentation - MCTP networking: https://docs.kernel.org/networking/mctp.html
+- DMTF DSP0236 - Management Component Transport Protocol Base Specification: https://www.dmtf.org/dsp/DSP0236
+- DMTF PMCI standards page, including NC-SI / MCTP family specifications: https://www.dmtf.org/standards/pmci
+- OpenBMC libmctp: https://github.com/openbmc/libmctp
+- OpenBMC docs - MCTP kernel design: https://github.com/openbmc/docs/blob/master/designs/mctp/mctp-kernel.md
 
 ### 6. CPLD / FPGA / Board Glue Logic
 
