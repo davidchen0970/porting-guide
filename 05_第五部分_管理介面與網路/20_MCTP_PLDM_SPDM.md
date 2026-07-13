@@ -1,502 +1,948 @@
-### 20. MCTP / PLDM / SPDM
+### 20. MCTP、PLDM 與 SPDM
 
-本章整理 BMC 平台中 MCTP、PLDM 與 SPDM 的架構、porting、bring-up、除錯與驗收方法。MCTP（Management Component Transport Protocol）是平台內部管理通訊的傳輸層，可承載在 SMBus / I2C、PCIe VDM、I3C、UART / serial、USB 等不同媒體上，並以 EID（Endpoint ID）描述管理 endpoint。PLDM（Platform Level Data Model）是 MCTP 之上的管理資料模型，可用於 base discovery、platform monitoring/control、BIOS 設定、FRU inventory、firmware update、event。SPDM（Security Protocol and Data Model）則提供裝置認證、憑證、量測、challenge、session 與安全訊息基礎。
+MCTP 提供 BMC 與平台元件之間的管理訊息傳輸；PLDM 在 MCTP 上定義 inventory、sensor、control、BIOS 與 firmware update 等管理功能；SPDM 則提供裝置身分驗證、憑證、量測與 secure session。
 
-BMC 平台採用 MCTP / PLDM / SPDM 後，管理路徑會從傳統 IPMI / SMBus / vendor command 分散模式，逐步收斂到標準化 transport、endpoint discovery、message type、terminus、PDR、certificate chain、measurement 與 firmware update flow。這一章的目標是讓新平台 porting 能清楚回答：哪條 physical link 跑 MCTP、誰是 bus owner、EID 如何分配、endpoint 支援哪些 message type、PLDM terminus 如何建立、PDR / sensor / FRU / firmware update 如何對映到 OpenBMC D-Bus、SPDM attestation 與 secure session 是否啟用，以及發生 timeout / discovery fail / attestation fail 時要收哪些 log。
+本章從 MCTP endpoint 與 EID 開始，接著說明 transport binding、routing、PLDM terminus、PDR、FRU、firmware update，以及 SPDM attestation 如何整合到 OpenBMC。
 
-#### 20.1 分層模型與資料流
+#### 20.1 三個 Protocol 的關係
 
-建議先用下列分層理解 MCTP / PLDM / SPDM：
-
-```text
-Physical / Binding layer
-  SMBus/I2C、PCIe VDM、I3C、USB、serial、vendor bridge
-    ↓
-MCTP transport layer
-  EID、message type、fragmentation、routing、control command、MTU
-    ↓
-Upper protocols
-  PLDM、SPDM、NC-SI over MCTP、vendor-defined message
-    ↓
-OpenBMC services
-  mctpd、pldmd、libpldm、SPDM requester/responder、platform daemon
-    ↓
-D-Bus / inventory / sensors / firmware update / security policy
-    ↓
-Redfish / IPMI / event / telemetry / field service
-```
-
-
-| 層級 | 主要責任 | 常見資料 | 排查入口 |
-| --- | --- | --- | --- |
-| Physical binding | 實際通訊媒體與封包承載 | I2C bus、PCIe BDF、I3C dynamic address、link state | scope / LA、lspci、i2cdetect、kernel log |
-| MCTP | endpoint 定址、routing、message type、MTU、fragmentation | EID、UUID、network id、route、message tag | mctp tools、mctpd D-Bus、tcpdump / trace、journal |
-| PLDM | 平台管理資料模型 | terminus、TID、PDR、sensor、FRU、BIOS attributes、FW update | pldmtool、pldmd journal、PDR dump、D-Bus object |
-| SPDM | 裝置身分、認證、量測、安全 session | capabilities、algorithms、cert chain、measurement、session id | SPDM trace、libspdm log、security event |
-| OpenBMC integration | 將資料轉成 D-Bus / Redfish / update flow | inventory、sensor、version、event、firmware activation | busctl、bmcweb、software inventory、EventLog |
-
-
-#### 20.2 MCTP 基本概念
-
-MCTP 是管理元件間的 common transport。它以 endpoint 為單位建立通訊，不要求上層協定知道底層是 SMBus、PCIe VDM 或其他 media。
-
-常見名詞：
-
-
-| 名詞 | 說明 | Bring-up 注意事項 |
-| --- | --- | --- |
-| Endpoint | 支援 MCTP 的管理端點，例如 BMC、NIC、GPU、CXL device、retimer、satellite controller | 需確認 Endpoint UUID、EID、message type support |
-| EID | Endpoint ID，MCTP network 內的 logical address | 需定義 static / dynamic 分配與 persistence |
-| Bus owner | 某個 binding 上負責 discovery / EID assignment 的管理者 | 多 BMC 或 host / BMC 共用時需清楚定義 |
-| Message type | MCTP payload 類型，例如 Control、PLDM、SPDM、NC-SI、Vendor Defined | endpoint discovery 後需確認支援清單 |
-| MTU / packet size | 單段 transport 可承載大小 | PLDM FW update / SPDM cert chain 會受到影響 |
-| Message tag | request / response match 的 tag | timeout / retry / concurrent request 需管理 |
-| Routing | 跨 bridge / 多 segment MCTP path | 需保存 route table 與 bridge entry |
-| Network ID | Linux / OpenBMC 中區分 MCTP network 的識別 | 多 transport 平台需避免混淆 |
-
-
-MCTP bring-up 最小成功條件：
-
-- physical link 可用，例如 I2C ACK、PCIe device present、I3C target online。
-- MCTP binding driver / daemon 啟動。
-- endpoint discovery 成功，能取得 endpoint ID / UUID / supported message types。
-- BMC route table 能送 request 並收到 response。
-- 上層 PLDM / SPDM 能完成 basic command，例如 GetPLDMTypes 或 SPDM GET_VERSION。
-
-#### 20.3 MCTP transport binding：SMBus / I2C、PCIe VDM、I3C
-
-不同 binding 的排查方式差異很大，文件需保存每條 link 的 owner、physical path、EID 分配與上層用途。
-
-
-| Binding | 常見用途 | 優點 | 風險 | 第一輪檢查 |
-| --- | --- | --- | --- | --- |
-| SMBus / I2C | PSU、VR、retimer、satellite controller、OCP NIC sideband | 硬體普遍、低成本 | bus stuck、address conflict、低速、大 message fragment 成本 | I2C waveform、mctp-i2c driver、bus owner |
-| PCIe VDM | NIC、GPU、accelerator、CXL / PCIe endpoint | 適合 PCIe device 管理 | 依 host power / link training / BDF；hot-plug 複雜 | lspci、PCIe link state、VDM support |
-| I3C | 新平台管理 bus | 支援動態 address、較高 throughput | controller / target 支援度與 tooling 需確認 | I3C bus enumeration、kernel log |
-| USB / serial | 特定 bridge 或 debug path | 可跨 subsystem | 標準化與量產支援需確認 | driver、device node、protocol trace |
-| Vendor bridge | CPLD / MCU 轉接 | 可支援既有硬體 | 需清楚 bridge 行為、MTU、retry、error mapping | bridge log、vendor tool、scope |
-
-
-平台表格範本：
-
-
-| Endpoint | Binding | Physical path | EID | UUID | Message types | Owner | 狀態 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| OCP NIC | PCIe VDM / SMBus [待填] | [待填] | [待填] | [待填] | PLDM / SPDM [待填] | BMC / Host [待填] | [待確認] |
-| Retimer0 | I2C / SMBus | [待填] | [待填] | [待填] | PLDM / SPDM [待填] | BMC | [待確認] |
-| GPU0 | PCIe VDM | [待填] | [待填] | [待填] | PLDM / SPDM / vendor [待填] | BMC / Host | [待確認] |
-
-
-#### 20.4 Linux / OpenBMC MCTP stack
-
-OpenBMC 平台可能採用 kernel MCTP socket（AF_MCTP）、userspace mctpd、或 vendor stack。新平台需要先確認目前專案的 MCTP stack 邊界。
-
-常見元件：
-
-
-| 元件 | 用途 | 常見檢查點 |
-| --- | --- | --- |
-| kernel MCTP | 提供 MCTP network、route、AF_MCTP socket 與 binding driver | kernel config、link、route、netlink |
-| mctpd | 管理 endpoint discovery、EID、D-Bus 介面 | service status、D-Bus object、endpoint signal |
-| mctp tools | 查 link / route / endpoint，送 control command | 工具版本與 kernel stack 是否相容 |
-| pldmd | 監聽 MCTP endpoint，建立 PLDM terminus，處理 PLDM request / response | terminus table、PDR、pldmtool |
-| SPDM requester | 對 endpoint 執行 discovery、certificate、challenge、measurement | policy、cert chain、algorithm、session |
-
-
-常用檢查：
-
-```bash
-# service 與 kernel log
-systemctl status mctpd --no-pager 2>/dev/null || true
-systemctl status pldmd --no-pager 2>/dev/null || true
-journalctl -u mctpd -b --no-pager 2>/dev/null
-journalctl -u pldmd -b --no-pager 2>/dev/null
-dmesg | grep -Ei 'mctp|pldm|spdm|vdm|i3c'
-
-# D-Bus
-busctl tree xyz.openbmc_project.MCTP 2>/dev/null || true
-busctl tree xyz.openbmc_project.PLDM 2>/dev/null || true
-busctl tree xyz.openbmc_project.ObjectMapper | grep -Ei 'MCTP|PLDM|SPDM' || true
-
-# Linux MCTP tools，依 image 內容而定
-mctp link 2>/dev/null || true
-mctp route 2>/dev/null || true
-mctp addr 2>/dev/null || true
-```
-
-#### 20.5 MCTP discovery、EID 分配與 route
-
-MCTP discovery 是上層 PLDM / SPDM 能否運作的基礎。若 endpoint 沒有 EID 或 route 不正確，上層常只看到 timeout。
-
-建議記錄欄位：
-
-
-| 項目 | 說明 | 資料來源 |
-| --- | --- | --- |
-| EID assignment mode | static、dynamic、pre-assigned、host assigned | platform design、mctpd config |
-| Bus owner | 誰負責 Set Endpoint ID / discovery | BMC / host / bridge policy |
-| Endpoint UUID | endpoint 穩定識別 | MCTP Control Get Endpoint UUID |
-| Supported message types | PLDM、SPDM、vendor-defined 等 | MCTP Control Get Message Type Support |
-| MTU | path transmission unit | MCTP Control / binding config |
-| Route table | EID 到 link / next hop 的對照 | mctp route / D-Bus |
-| Endpoint state | discovered、reachable、lost、removed | mctpd journal / D-Bus signal |
-
-
-常見問題：
-
-- BMC 與 host 都嘗試當 bus owner，造成 EID 變動或重複。
-- Endpoint reset 後 EID 消失，上層 PLDM terminus 沒有重新 discovery。
-- Hot-plug 端點移除後 route 還在，造成 request timeout。
-- 多 transport 到同一 endpoint 時，route priority 未定義。
-- MCTP bridge 兩側 network id / EID range 設計不清楚。
-
-#### 20.6 PLDM 基本概念與 Types
-
-PLDM 定義多種 Type，每種 Type 對應一組管理功能。OpenBMC `pldmd` 常透過 MCTP 發現 endpoint，建立 terminus，讀取 PDR，再把 sensor / inventory / BIOS / firmware update 資料接到 D-Bus 或平台 service。
-
-
-| PLDM Type | 用途 | BMC 常見使用情境 |
-| --- | --- | --- |
-| Type 0 Base | protocol discovery、version、type、command support | 建立 terminus 的第一步 |
-| Type 1 SMBIOS | SMBIOS table transfer | host inventory / system info，依平台支援 |
-| Type 2 Platform | sensor、effecter、PDR、event | remote sensor、state set、control |
-| Type 3 BIOS | BIOS attributes 與 configuration | 遠端 BIOS 設定 / host firmware config |
-| Type 4 FRU | FRU records 與 inventory | endpoint FRU / device inventory |
-| Type 5 Firmware Update | 標準化裝置 FW update flow | NIC、retimer、satellite controller 更新 |
-| OEM / vendor Type | 廠商擴充 | 平台特定功能，需風險控管 |
-
-
-PLDM bring-up 最小流程：
+BMC 可能需要管理 NIC、GPU、retimer、CXL device、satellite controller 與其他管理元件。這些裝置使用的實體連接可能不同，但上層希望使用一致的管理方式。
 
 ```text
-MCTP endpoint reachable
-    ↓
-PLDM Base：GetPLDMVersion / GetPLDMTypes / GetPLDMCommands
-    ↓
-建立 terminus / TID
-    ↓
-若支援 Platform：讀 PDR repository
-    ↓
-建立 sensor / effecter / inventory / event mapping
-    ↓
-若支援 FRU：讀 FRU records 並對映 inventory
-    ↓
-若支援 FW Update：查 component / version / transfer capability
+SMBus / I2C、PCIe VDM、I3C、USB、Serial
+        ↓
+MCTP
+Endpoint 定址、訊息類型、分段與 routing
+        ↓
+PLDM
+Inventory、Sensor、Control、BIOS、Firmware Update
+
+SPDM
+裝置認證、憑證、量測與 Secure Session
+        ↓
+OpenBMC D-Bus、Redfish、Event 與 Update Service
 ```
 
-#### 20.7 PLDM PDR、sensor、effecter 與 event
+##### 20.1.1 MCTP
 
-PDR（Platform Descriptor Record）是 PLDM Platform Monitoring and Control 的核心資料結構，用來描述 sensor、effecter、entity association、state set 等。BMC 需要理解 PDR 才能把 remote endpoint 的 sensor 和 control 對映到 OpenBMC D-Bus。
+MCTP（Management Component Transport Protocol）讓管理訊息可以在不同 transport bindings 上傳送。上層 protocol 使用 endpoint 與 EID 通訊，不需要直接處理 I2C address、PCIe BDF 或 I3C dynamic address。
 
+##### 20.1.2 PLDM
 
-| 資料 | 用途 | OpenBMC 對映 | 注意事項 |
-| --- | --- | --- | --- |
-| Numeric Sensor PDR | 連續數值 sensor，例如 temperature、voltage、power | D-Bus sensor Value / thresholds | scale、unit、range、state 需正確 |
-| State Sensor PDR | 離散狀態，例如 presence、fault、link state | inventory / event / state property | state set mapping 需完整 |
-| Numeric Effecter PDR | 可調數值，例如 power limit、fan target | control interface / policy daemon | 權限與安全限制需定義 |
-| State Effecter PDR | 可設狀態，例如 reset、enable、mode | control method | 不可無限制暴露危險控制 |
-| Entity Association PDR | 描述元件層級與關係 | inventory association | 需與 Redfish / service manual slot 名稱對齊 |
-| PLDM Event | endpoint 主動上報事件 | Logging / EventLog / sensor update | 需處理 ack、sequence、去重 |
+PLDM（Platform Level Data Model）定義平台管理 commands 與資料結構。常見功能包括：
 
+- Protocol capability discovery。
+- Sensors 與 effecters。
+- Platform Descriptor Records。
+- FRU inventory。
+- BIOS attributes。
+- Device firmware update。
 
-PDR 排查：
+##### 20.1.3 SPDM
 
-```bash
-# 工具名稱依平台 image 而定
-pldmtool base GetPLDMTypes 2>/dev/null || true
-pldmtool base GetPLDMCommands 2>/dev/null || true
-pldmtool platform GetPDR 2>/dev/null || true
-journalctl -u pldmd -b --no-pager | grep -Ei 'PDR|terminus|sensor|effecter|event'
-```
+SPDM（Security Protocol and Data Model）用來確認 endpoint 身分與軟體狀態。它可以協商安全演算法、驗證 certificate chain、執行 challenge、取得 measurements，並建立 secure session。
 
-常見問題：
+#### 20.2 MCTP Endpoint 與 EID
 
-- PDR scale / unit 錯，造成 Redfish sensor 值不合理。
-- PDR entity association 不完整，sensor 沒有掛到正確 inventory。
-- Endpoint event enable 未設定，sensor 狀態只能靠 polling。
-- Event receiver 未註冊或 ack flow 錯，endpoint 重複送 event。
-- PDR repository change 事件後，BMC 未重新讀 PDR。
+Endpoint 是支援 MCTP 的管理通訊端點，例如 BMC、NIC、GPU、retimer 或 satellite controller。
 
-#### 20.8 PLDM FRU、BIOS 與 Firmware Update
-
-PLDM FRU 可提供 endpoint inventory；PLDM BIOS 可支援 host firmware / BIOS attributes；PLDM Firmware Update 可支援標準化裝置更新。這些功能通常比 basic sensor 更牽涉產品政策、權限與安全。
-
-PLDM FRU：
-
-- 需定義 FRU record set 如何對映到 OpenBMC inventory object。
-- 需區分 endpoint 自身 FRU 與 endpoint 管理的 downstream FRU。
-- 若同一欄位也存在 IPMI FRU / PMBus MFR / Redfish，需定義優先順序。
-
-PLDM BIOS：
-
-- 需定義哪些 BIOS attributes 可讀 / 可寫。
-- 需確認變更何時生效：立即、下次 host reboot、下次 AC cycle。
-- 需保存 BIOS attribute pending / current / default 的差異。
-- 需有權限、audit log 與 rollback policy。
-
-PLDM Firmware Update：
-
-- 需確認 endpoint 支援的 transfer size、component classification、activation method。
-- 需定義 firmware image package、version、signature、component ID 與 rollback policy。
-- 需處理 update 中斷、endpoint reset、BMC reset、host power state 變化。
-- 需將 activation / progress / failure reason 對映到 OpenBMC software inventory、Redfish UpdateService 與 event log。
-
-#### 20.9 SPDM 基本概念與安全流程
-
-SPDM 用於 requester 與 responder 之間的安全協商、裝置認證、量測與安全 session。BMC 常作為 requester，對 NIC、GPU、CXL device、retimer、security component 等 endpoint 進行 attestation。
-
-典型 SPDM 流程：
+每個 endpoint 需要可供 MCTP network 使用的 EID（Endpoint ID）。EID 是 MCTP network 內的 logical address。
 
 ```text
-GET_VERSION / VERSION
-    ↓
-GET_CAPABILITIES / CAPABILITIES
-    ↓
-NEGOTIATE_ALGORITHMS / ALGORITHMS
-    ↓
-GET_DIGESTS / DIGESTS
-    ↓
-GET_CERTIFICATE / CERTIFICATE
-    ↓
-CHALLENGE / CHALLENGE_AUTH
-    ↓
-GET_MEASUREMENTS / MEASUREMENTS
-    ↓
-可選：KEY_EXCHANGE / FINISH 建立 secured session
-    ↓
-可選：secured message carrying management traffic
+BMC EID 8
+NIC EID 9
+Retimer EID 10
+GPU EID 11
 ```
 
-SPDM porting 需要先定義：
+##### 20.2.1 EID 的用途
 
+MCTP request 以 destination EID 指定接收端。Routing layer 再依 EID 找到對應 link 或 next hop。
 
-| 項目 | 需要確認 | 備註 |
-| --- | --- | --- |
-| Requester / Responder | BMC、host、device 誰發起 SPDM | 多 requester 場景需協調 session |
-| Transport binding | SPDM over MCTP、PCIe DOE、TCP、storage binding 等 | 本章聚焦 SPDM over MCTP |
-| Version | 雙方支援 SPDM 版本 | 需與 libspdm / endpoint firmware 對齊 |
-| Algorithms | hash、asym、DHE、AEAD、measurement hash | 安全政策需定義最低要求 |
-| Certificate chain | slot、root CA、intermediate、device cert | 需有 trust anchor 與 provisioning 流程 |
-| Measurements | measurement block、index、manifest、TCB value | 需定義 expected value 與驗證資料庫 |
-| Session | 是否建立 secure session | 會影響 message size、timeout、key lifecycle |
-| Policy | 認證失敗如何處理 | log only、degrade、block device、raise event |
+```text
+PLDM Request to EID 9
+        ↓
+MCTP route lookup
+        ↓
+PCIe VDM link
+        ↓
+NIC endpoint
+```
 
+##### 20.2.2 Static 與 Dynamic EID
 
-#### 20.10 SPDM 信任鏈、量測與 policy
+- Static EID：平台預先指定，開機後使用固定值。
+- Dynamic EID：由 bus owner discovery 後分配。
+- Pre-assigned EID：endpoint 已保存或由其他 firmware 事先設定。
 
-SPDM 是否有價值，取決於 trust anchor、certificate validation、measurement expected value 與 policy 是否完整。只送 GET_VERSION 不代表完成裝置安全驗證。
+不論採用哪種方式，都需定義 endpoint reset、BMC reboot、hot-plug 與 multi-owner 情況下的重新分配規則。
 
-建議政策表：
+##### 20.2.3 Endpoint UUID
 
+EID 可能重新分配；Endpoint UUID 用來辨識較穩定的 endpoint identity。Inventory 與 policy 不宜只以 EID 當永久身分。
 
-| 檢查項目 | Pass 條件 | Fail 行為 | Log / Event |
-| --- | --- | --- | --- |
-| 版本支援 | endpoint 支援平台允許的 SPDM version | 標記 unsupported | Warning event |
-| 演算法 | 符合最低 hash / asym / AEAD 要求 | 拒絕 attestation 或 downgrade warning | Security event |
-| 憑證鏈 | 可追溯到信任錨且未過期 / revoked | Functional=false 或 security health warning | Critical / Warning |
-| Challenge | signature 驗證通過 | 不信任 endpoint | Critical event |
-| Measurements | measurement digest 與 expected value / allowlist 符合 | 依產品策略隔離或告警 | Security event + raw digest |
-| Session | key exchange 成功，secured message 可收發 | fallback 或阻擋敏感 command | Warning event |
+##### 20.2.4 Network ID
 
+Linux 可同時管理多個 MCTP networks。Network ID 用來區分不同 routing domains。相同 EID 在不同 networks 中可代表不同 endpoints，因此診斷紀錄應同時保存 network ID 與 EID。
 
-注意事項：
+#### 20.3 Bus Owner 與 Discovery
 
-- 憑證與 measurement expected value 屬於安全資料，需有安全更新與回復機制。
-- 若允許 firmware update 改變 measurement，update flow 必須同步更新 expected value 或 manifest。
-- SPDM log 不應記錄 private key、session secret 或完整敏感資料。
-- Attestation 結果需能對映到 inventory / Redfish Health / EventLog / security audit。
+Bus owner 負責在某個 MCTP binding 上管理 discovery 與 EID assignment。平台需明確指定 BMC、Host 或 bridge 中的哪一方擔任 owner。
 
-#### 20.11 OpenBMC 整合：D-Bus、Inventory、Redfish、Event
+Discovery 通常包含：
 
-MCTP / PLDM / SPDM 的結果不應只停在 protocol tool output，應整合到平台狀態。
+```text
+確認 Physical Link
+        ↓
+找到 MCTP Endpoint
+        ↓
+取得或設定 EID
+        ↓
+取得 Endpoint UUID
+        ↓
+查詢支援的 Message Types
+        ↓
+建立 Route
+        ↓
+通知 PLDM / SPDM Services
+```
 
+##### 20.3.1 多個 Owners
 
-| 資料 | OpenBMC 對映 | 外部呈現 | 注意事項 |
-| --- | --- | --- | --- |
-| MCTP endpoint | D-Bus endpoint object / inventory association | Redfish OEM / inventory | endpoint remove 時需更新 |
-| PLDM FRU | inventory Asset / FRU fields | Redfish Chassis / Assembly / Device | 需定義權威端 |
-| PLDM sensor | D-Bus Sensor.Value / Availability / thresholds | Redfish Sensor / Thermal / Power | scale / unit / association 要正確 |
-| PLDM event | phosphor-logging entry | SEL / Redfish EventLog / EventService | 需去重與 ack |
-| PLDM FW update | software inventory / activation | Redfish UpdateService | 需 progress / failure reason |
-| SPDM attestation | security status / inventory decorator / event | Redfish Health / Security event | 需保護敏感資料 |
+若 Host 與 BMC 同時分配 EID，可能造成：
 
+- EID 重複。
+- Endpoint 每次開機使用不同 EID。
+- Existing route失效。
+- PLDM terminus 重複建立。
+- Hot-plug 後 endpoint 無法重新加入。
 
-#### 20.12 Build / Yocto / Kernel 設定重點
+平台文件應記錄 owner、EID range、allocation timing 與 persistence policy。
 
-平台需確認 kernel、daemon、library、tool、D-Bus interface 與 service file 都包含在 image。
+##### 20.3.2 Endpoint 消失
 
-Build 端檢查：
+Endpoint 被拔除、斷電或 reset 時，MCTP stack 應更新 route 與 endpoint state。上層 PLDM sensors、inventory 與 SPDM status 也需同步更新。
+
+#### 20.4 MCTP Message
+
+MCTP packet 包含 transport header 與 payload。Transport header 用來傳遞 source / destination EID、message tag、sequence 與分段狀態；payload 開頭則指出 message type。
+
+常見 message types：
+
+| Message Type | 用途 |
+|---|---|
+| MCTP Control | Endpoint discovery、EID、UUID、message type support |
+| PLDM | Platform management |
+| SPDM | Security negotiation 與 attestation |
+| NC-SI over MCTP | Network controller management |
+| Vendor Defined | 廠商自訂管理訊息 |
+
+##### 20.4.1 Message Tag
+
+Message tag 用來配對 request 與 response。Sender 在同一 endpoint 上同時發出多筆 requests 時，需要避免 tag 重複使用造成 response 配錯。
+
+##### 20.4.2 Fragmentation 與 Reassembly
+
+一筆上層 message 可能大於 binding 單一 packet 可承載的大小。MCTP 會將它拆成多個 packets，接收端再依 sequence、SOM / EOM 與 tag 重組。
+
+大型 PLDM firmware update payload、PDR、FRU record 與 SPDM certificate chain 都會受 path MTU 影響。
+
+##### 20.4.3 Path MTU
+
+Path MTU 是一條 MCTP path 可使用的 packet size。它受 binding、bridge 與 endpoint capability 影響。MTU 設定錯誤可能造成短 command 正常，但大型 response timeout 或無法重組。
+
+#### 20.5 MCTP Transport Bindings
+
+Transport binding 定義 MCTP 如何在特定實體介面上傳送。
+
+##### 20.5.1 MCTP over SMBus / I2C
+
+常見於 retimer、OCP NIC sideband、satellite controller 與其他低速管理裝置。
+
+需記錄：
+
+- Root adapter 與 mux path。
+- Endpoint SMBus address。
+- Bus owner。
+- MCTP EID。
+- Bus speed、pull-up 與 power domain。
+- Endpoint reset / presence。
+- Binding driver 與 service owner。
+
+此 binding 的效能受到 SMBus speed 與 block size 限制，大型 message 會產生較多 fragments。
+
+##### 20.5.2 MCTP over PCIe VDM
+
+PCIe Vendor Defined Message binding 常用於 NIC、GPU、accelerator 與 CXL / PCIe endpoints。
+
+需確認：
+
+- PCIe device 已完成 enumeration。
+- Link state 與 target BDF。
+- Endpoint 是否支援 MCTP VDM。
+- Host power state 需求。
+- Hot-plug 與 Function Level Reset 後的 discovery。
+- BMC 與 Host 對 VDM path 的 ownership。
+
+##### 20.5.3 MCTP over I3C
+
+I3C binding 可利用 dynamic addressing 與較高 throughput。Bring-up 需要先確認：
+
+- I3C controller 與 target support。
+- Dynamic address assignment。
+- Endpoint discovery timing。
+- In-Band Interrupt，若平台使用。
+- Kernel binding driver 與工具支援。
+
+##### 20.5.4 Bridge
+
+MCTP bridge 連接兩個或更多 MCTP segments。Bridge 需管理 next-hop route、EID visibility、MTU 與 endpoint changes。
+
+```text
+BMC MCTP Network
+        ↓
+MCTP Bridge
+   ├── SMBus Segment
+   └── PCIe VDM Segment
+```
+
+排查 bridge path 時需保存完整路徑，而非只記錄最終 EID。
+
+#### 20.6 Linux 與 OpenBMC MCTP Stack
+
+Linux kernel MCTP stack 可提供：
+
+- MCTP links。
+- Local addresses。
+- Routes。
+- Neighbor information，依 binding 與工具支援。
+- `AF_MCTP` socket。
+
+OpenBMC 專案可能使用 kernel MCTP、`mctpd`、其他 userspace daemon 或 vendor stack。實際架構需以目前 branch、recipes 與 systemd services 為準。
+
+##### 20.6.1 基本檢查
 
 ```bash
-# kernel config
+zcat /proc/config.gz | grep CONFIG_MCTP
+
+dmesg | grep -Ei 'mctp|vdm|i3c'
+
+mctp link
+mctp addr
+mctp route
+```
+
+工具輸出格式會依 `mctp` userspace tool 與 kernel version 不同。
+
+##### 20.6.2 D-Bus Endpoint
+
+若平台使用 MCTP daemon 發布 endpoints，可從 D-Bus 確認：
+
+- EID。
+- UUID。
+- Network ID。
+- Binding / physical path。
+- Supported message types。
+- Connectivity state。
+
+```bash
+busctl tree xyz.openbmc_project.MCTP 2>/dev/null
+busctl tree xyz.openbmc_project.ObjectMapper | grep -i mctp
+```
+
+Service name 與 object path 依專案整合而異。
+
+#### 20.7 MCTP Bring-up
+
+MCTP bring-up 應由底層往上驗證。
+
+```text
+Endpoint 已供電
+        ↓
+Physical Binding 可用
+        ↓
+Binding Driver 建立 Link
+        ↓
+Bus Owner 發現 Endpoint
+        ↓
+EID / UUID / Message Types 可取得
+        ↓
+Route 建立
+        ↓
+Control Request / Response 正常
+        ↓
+PLDM / SPDM 開始運作
+```
+
+##### 20.7.1 最小驗證資料
+
+| 項目 | 實測值 |
+|---|---|
+| Endpoint name | [待填] |
+| Binding | SMBus / PCIe VDM / I3C / Other |
+| Physical path | [待填] |
+| Network ID | [待填] |
+| EID | [待填] |
+| UUID | [待填] |
+| Message types | [待填] |
+| Path MTU | [待填] |
+| Bus owner | [待填] |
+| Route | [待填] |
+
+#### 20.8 PLDM Terminus 與 TID
+
+PLDM communication peer 稱為 terminus。一個 MCTP endpoint 可以提供一個或多個 PLDM termini，實際模型取決於 endpoint firmware 與 PLDM implementation。
+
+TID（Terminus ID）用來識別 PLDM terminus。系統需要保存 MCTP endpoint、EID 與 TID 的對照。
+
+```text
+MCTP Endpoint
+Network 1 / EID 9 / UUID X
+        ↓
+PLDM Terminus
+TID 3
+        ↓
+PDR、Sensors、Effecters、FRU、FW Components
+```
+
+Endpoint reset 或 rediscovery 後，PLDM service 需要清除 stale terminus，再重新建立 PDR 與 sensor mapping。
+
+#### 20.9 PLDM Base Discovery
+
+PLDM Type 0 Base 用來查詢 protocol capability。常見 commands 包括：
+
+- GetTID。
+- SetTID，依角色與流程使用。
+- GetPLDMVersion。
+- GetPLDMTypes。
+- GetPLDMCommands。
+
+Bring-up 順序：
+
+```text
+MCTP Route Ready
+        ↓
+確認 Endpoint 支援 PLDM Message Type
+        ↓
+Get PLDM Types
+        ↓
+Get PLDM Version
+        ↓
+Get Commands for each Type
+        ↓
+建立 Terminus Capability
+```
+
+`GetPLDMTypes` 成功只代表 endpoint 宣告支援哪些 types；每個 type 的版本與 command set 仍需另外查詢。
+
+#### 20.10 PLDM Types
+
+| Type | 功能 |
+|---:|---|
+| 0 Base | Version、Type 與 Command discovery |
+| 1 SMBIOS | SMBIOS table transfer |
+| 2 Platform | PDR、Sensor、Effecter、Event |
+| 3 BIOS | BIOS attributes 與設定 |
+| 4 FRU | FRU record data |
+| 5 Firmware Update | Device firmware update |
+| OEM | 廠商擴充 |
+
+Endpoint 不必支援全部 types。BMC 應依 discovery 結果建立對應功能，不應直接假設每個 endpoint 都有 sensor、FRU 或 firmware update。
+
+#### 20.11 PDR 是什麼
+
+PDR（Platform Descriptor Record）描述 PLDM platform 的 entities、sensors、effecters 與 associations。BMC 先取得 PDR repository，才知道 endpoint 提供哪些管理項目以及如何解讀資料。
+
+##### 20.11.1 Numeric Sensor PDR
+
+描述連續數值，例如：
+
+- Temperature。
+- Voltage。
+- Current。
+- Power。
+- Fan speed。
+
+PDR 會提供 unit、resolution、offset、range、threshold 等資訊。Scale 或 unit 解讀錯誤會直接造成 D-Bus 與 Redfish 數值錯誤。
+
+##### 20.11.2 State Sensor PDR
+
+描述離散狀態，例如：
+
+- Present / absent。
+- Link state。
+- Fault state。
+- Device enabled state。
+- Firmware update state。
+
+每個 state set 的數值需映射到清楚的 D-Bus property 或 event。
+
+##### 20.11.3 Effecter PDR
+
+Effecter 是 BMC 可設定的 remote control。
+
+- Numeric effecter：power limit、fan target 等數值。
+- State effecter：reset、enable、mode 等狀態。
+
+Effecter 可能影響 power、reset 或安全狀態，需要權限、policy、range checking 與 audit log。
+
+##### 20.11.4 Entity Association PDR
+
+Entity Association PDR 描述 endpoint 中 entities 的父子關係，例如：
+
+```text
+NIC
+├── Port 0
+├── Port 1
+└── Temperature Sensor
+```
+
+OpenBMC 可將這些關係轉成 inventory associations，讓 sensor 與 Redfish resource 歸屬到正確元件。
+
+##### 20.11.5 PDR Repository Change
+
+Endpoint firmware 更新或 configuration 改變後，PDR repository 可能變更。BMC 收到 change event 時，需要重新取得受影響的 records，更新 sensors、effecters 與 associations。
+
+#### 20.12 PLDM Sensor 與 Event
+
+BMC 可以 polling PLDM sensor，也可以讓 endpoint 主動送出 Platform Event Message。
+
+##### 20.12.1 Polling
+
+Polling 流程較直接，但會增加 MCTP traffic。Polling period 應依 sensor 重要性、link throughput 與 endpoint能力設定。
+
+##### 20.12.2 Event
+
+Event flow 通常需要：
+
+- 設定 event receiver。
+- 啟用 endpoint event generation。
+- 處理 event sequence與 acknowledgement。
+- 更新 D-Bus sensor / inventory state。
+- 產生必要的 logging entry。
+- 去除重複 event。
+
+Endpoint retry 與 BMC service restart 後，需避免同一事件被重複記錄多次。
+
+#### 20.13 PLDM FRU
+
+PLDM FRU 提供 FRU Record Set。BMC 可將 record fields 映射到 OpenBMC inventory，例如：
+
+- Manufacturer。
+- Model。
+- PartNumber。
+- SerialNumber。
+- Version。
+
+需要先定義資料權威端。若同一欄位也存在 IPMI FRU、PMBus MFR command、SMBIOS 或 static config，必須設定 priority 與 conflict policy。
+
+Endpoint 自身 FRU 與 endpoint 管理的 downstream FRU 也需要建立不同 inventory identity。
+
+#### 20.14 PLDM BIOS
+
+PLDM BIOS 提供 BIOS attributes 與 configuration exchange。常見資料包括：
+
+- Current value。
+- Pending value。
+- Default value。
+- Allowed values / range。
+- Read-only / read-write attribute。
+
+設定變更可能在下一次 Host reboot 或特定 firmware stage 才生效。OpenBMC 需要顯示 pending 與 current 的差異，並記錄修改者與時間。
+
+#### 20.15 PLDM Firmware Update
+
+PLDM Firmware Update 定義 BMC 與 device 的更新流程。
+
+```text
+Discover Device Identity / Components
+        ↓
+確認 Package 與 Device 相容
+        ↓
+Request Update
+        ↓
+Pass Component Table
+        ↓
+Transfer Firmware Data
+        ↓
+Verify
+        ↓
+Apply / Activate
+        ↓
+Confirm New Version
+```
+
+##### 20.15.1 Update 前
+
+確認：
+
+- Endpoint identity。
+- Component classification / identifier。
+- Current version。
+- Package version。
+- Transfer size。
+- Update option flags。
+- Activation method。
+- Host / device power state。
+- Signature 與產品政策。
+
+##### 20.15.2 Firmware Data Transfer
+
+PLDM update 的 data request size 會受 endpoint buffer、MCTP path MTU 與 implementation limits 影響。Transfer timeout、retry 與 duplicate block handling 必須驗證。
+
+##### 20.15.3 Activation
+
+Activation 可能需要：
+
+- Immediate apply。
+- Endpoint reset。
+- Host reset。
+- AC cycle。
+- Manual activation。
+
+OpenBMC software inventory、Redfish UpdateService 與 event log 應呈現 progress、activation state 與失敗原因。
+
+##### 20.15.4 中斷與 Recovery
+
+測試：
+
+- MCTP link中斷。
+- Endpoint reset。
+- BMC service restart。
+- BMC reboot。
+- Host power transition。
+- Transfer timeout。
+- Verify failure。
+- Activation failure。
+
+需確認舊 firmware 能繼續運作，或 endpoint 有 recovery image / external update path。
+
+#### 20.16 SPDM Roles 與流程
+
+SPDM 通訊包含 requester 與 responder。BMC 常作為 requester，remote device 作為 responder。
+
+典型流程：
+
+```text
+GET_VERSION
+        ↓
+GET_CAPABILITIES
+        ↓
+NEGOTIATE_ALGORITHMS
+        ↓
+GET_DIGESTS
+        ↓
+GET_CERTIFICATE
+        ↓
+CHALLENGE
+        ↓
+GET_MEASUREMENTS
+        ↓
+可選：KEY_EXCHANGE / FINISH
+        ↓
+Secure Session
+```
+
+每一階段都會使用前面協商的版本、capability 與 algorithms。前一步失敗時，後續認證或 session 不會成立。
+
+#### 20.17 SPDM Version、Capabilities 與 Algorithms
+
+##### 20.17.1 Version
+
+Requester 與 responder 選擇雙方都支援的 SPDM version。平台 security policy 可以設定最低可接受版本。
+
+##### 20.17.2 Capabilities
+
+Capabilities 可能包括：
+
+- Certificate support。
+- Challenge support。
+- Measurement support。
+- Key exchange。
+- PSK exchange。
+- Heartbeat。
+- Key update。
+- Encrypted / MAC protected message。
+
+後續流程必須依協商結果進行。
+
+##### 20.17.3 Algorithms
+
+常見協商項目：
+
+- Base hash。
+- Base asymmetric signature。
+- DHE group。
+- AEAD cipher。
+- Key schedule。
+- Measurement hash。
+
+平台應明確定義允許清單與最低安全要求，避免 endpoint 自動選用已不符合產品政策的演算法。
+
+#### 20.18 Certificate 與 Challenge
+
+Endpoint 可提供一個或多個 certificate slots。Requester 先取得 digest，再分段讀取 certificate chain，最後驗證：
+
+- Chain encoding。
+- Root / intermediate / leaf certificate。
+- Signature。
+- Validity time，若 policy 使用時間驗證。
+- Device identity。
+- Trust anchor。
+- Revocation policy，若平台支援。
+
+Challenge 由 requester 提供 nonce，responder 使用 device private key 簽署 transcript。驗證成功表示 responder 持有與 certificate 對應的 private key。
+
+Private key 與 session secrets 不應出現在一般 log。
+
+#### 20.19 SPDM Measurements
+
+Measurements 用來取得 endpoint firmware、configuration 或其他 TCB components 的 cryptographic evidence。
+
+每個 measurement block 可能包含：
+
+- Index。
+- Measurement type。
+- Raw bit stream 或 digest。
+- Measurement hash algorithm。
+- Signature，依 request attributes與能力而定。
+
+验证 measurement 需要 expected values、signed manifest 或其他 reference data。只取得 digest，尚不足以判斷 endpoint 是否可信。
+
+##### 20.19.1 Firmware Update 與 Measurement
+
+Device 更新後 measurement 可能改變。Firmware package、release process 與 attestation database 需要同步更新 expected values，並保留版本對照。
+
+#### 20.20 Secure Session
+
+若雙方支援，SPDM 可透過 key exchange 或 PSK 建立 secure session。Secured message 可提供：
+
+- Integrity protection。
+- Peer authentication。
+- Replay protection。
+- Confidentiality，依協商結果。
+
+需要管理：
+
+- Session ID。
+- Sequence number。
+- Heartbeat。
+- Key update。
+- Session teardown。
+- Endpoint reset後的 session cleanup。
+- Concurrent sessions。
+
+Secure session 增加 header 與 cryptographic overhead，也會影響 message size、MTU 與 timeout。
+
+#### 20.21 SPDM Policy 與 OpenBMC
+
+Attestation 結果需要被平台 policy 使用。
+
+| 結果 | 可能處理 |
+|---|---|
+| Endpoint 不支援要求版本 | Unsupported / Warning |
+| Algorithm 不符合最低要求 | 拒絕認證或標示 degraded |
+| Certificate chain 失敗 | Security fault / Functional false |
+| Challenge signature 失敗 | Endpoint untrusted |
+| Measurement mismatch | Warning、Critical 或隔離，依產品政策 |
+| Secure session 失敗 | 阻擋敏感 command 或使用受限模式 |
+
+Policy 必須明確定義「記錄事件」、「限制功能」與「阻擋裝置」的條件，避免 security failure 只留在 debug console。
+
+#### 20.22 OpenBMC 資料映射
+
+```text
+MCTP Endpoint
+    → Endpoint D-Bus object / Inventory association
+
+PLDM FRU
+    → Inventory Asset properties
+
+PLDM Sensor
+    → Sensor.Value / Availability / Thresholds
+
+PLDM Event
+    → Logging entry / Redfish EventLog
+
+PLDM Firmware Update
+    → Software inventory / Activation / UpdateService
+
+SPDM Attestation
+    → Security status / Health / Event
+```
+
+需要確認：
+
+- Endpoint remove 時 inventory 與 sensors 更新。
+- PDR repository change 後 D-Bus objects 同步更新。
+- FRU 欄位使用正確權威端。
+- SPDM raw measurements 與 certificate data 的存取權限。
+- Redfish / EventLog 不洩漏敏感 security material。
+
+#### 20.23 Kernel、Yocto 與 Service
+
+Build 需要確認：
+
+- Kernel MCTP core。
+- Binding drivers。
+- MCTP userspace tools / daemon。
+- PLDM daemon 與 `pldmtool`。
+- `libpldm`。
+- SPDM requester / responder library與 service。
+- D-Bus interfaces。
+- Systemd units。
+- Endpoint-specific configuration。
+
+```bash
+bitbake -s | grep -Ei 'mctp|pldm|spdm|libpldm|libspdm'
 bitbake -e virtual/kernel | grep '^S='
-grep -R "CONFIG_MCTP" tmp/work/*/linux-*/build/.config 2>/dev/null || true
 
-# package / recipe
-bitbake -s | grep -Ei 'mctp|pldm|spdm|libmctp|libpldm|libspdm'
-bitbake obmc-phosphor-image -g
-
-# service file / package content
-find tmp/work -path '*mctp*' -o -path '*pldm*' -o -path '*spdm*' | head -200
+systemctl --type=service | grep -Ei 'mctp|pldm|spdm'
+command -v mctp
+command -v pldmtool
 ```
 
-Target 端檢查：
+需保存 kernel、services、libraries、endpoint firmware 與 specification versions。
+
+#### 20.24 Target 端排查順序
+
+##### 20.24.1 Physical Binding
+
+SMBus：
 
 ```bash
-systemctl list-units | grep -Ei 'mctp|pldm|spdm'
-which mctp 2>/dev/null || true
-which pldmtool 2>/dev/null || true
-ls -l /usr/bin | grep -Ei 'mctp|pldm|spdm' || true
+i2cdetect -l
+dmesg | grep -Ei 'i2c|mctp'
 ```
 
-需保存的版本：
-
-- kernel version 與 MCTP config。
-- mctpd / pldmd / libpldm / libmctp / SPDM library 版本或 commit。
-- endpoint firmware version。
-- PLDM / MCTP / SPDM spec version 與 vendor compliance statement。
-- Yocto layer / recipe commit。
-
-#### 20.13 Target 端 log 收集套件
+PCIe VDM：
 
 ```bash
-mkdir -p /tmp/mctp-pldm-spdm-debug
-cat /etc/os-release > /tmp/mctp-pldm-spdm-debug/os-release.txt
-uname -a > /tmp/mctp-pldm-spdm-debug/uname.txt
-cat /proc/cmdline > /tmp/mctp-pldm-spdm-debug/proc-cmdline.txt
-
-dmesg -T > /tmp/mctp-pldm-spdm-debug/dmesg.txt
-journalctl -b --no-pager > /tmp/mctp-pldm-spdm-debug/journal.txt
-systemctl --failed > /tmp/mctp-pldm-spdm-debug/systemctl-failed.txt 2>&1
-
-# services
-systemctl status mctpd --no-pager > /tmp/mctp-pldm-spdm-debug/mctpd-status.txt 2>&1 || true
-systemctl status pldmd --no-pager > /tmp/mctp-pldm-spdm-debug/pldmd-status.txt 2>&1 || true
-journalctl -u mctpd -b --no-pager > /tmp/mctp-pldm-spdm-debug/mctpd-journal.txt 2>&1 || true
-journalctl -u pldmd -b --no-pager > /tmp/mctp-pldm-spdm-debug/pldmd-journal.txt 2>&1 || true
-
-# D-Bus
-busctl tree xyz.openbmc_project.ObjectMapper > /tmp/mctp-pldm-spdm-debug/objectmapper.txt 2>&1
-busctl tree xyz.openbmc_project.MCTP > /tmp/mctp-pldm-spdm-debug/dbus-mctp.txt 2>&1 || true
-busctl tree xyz.openbmc_project.PLDM > /tmp/mctp-pldm-spdm-debug/dbus-pldm.txt 2>&1 || true
-
-# MCTP tools
-mctp link > /tmp/mctp-pldm-spdm-debug/mctp-link.txt 2>&1 || true
-mctp addr > /tmp/mctp-pldm-spdm-debug/mctp-addr.txt 2>&1 || true
-mctp route > /tmp/mctp-pldm-spdm-debug/mctp-route.txt 2>&1 || true
-
-# PLDM tools
-pldmtool base GetPLDMTypes > /tmp/mctp-pldm-spdm-debug/pldm-types.txt 2>&1 || true
-pldmtool base GetPLDMCommands > /tmp/mctp-pldm-spdm-debug/pldm-commands.txt 2>&1 || true
-pldmtool platform GetPDR > /tmp/mctp-pldm-spdm-debug/pldm-pdr.txt 2>&1 || true
-
-# physical hints
-lspci -vv > /tmp/mctp-pldm-spdm-debug/lspci-vv.txt 2>&1 || true
-i2cdetect -l > /tmp/mctp-pldm-spdm-debug/i2cdetect-l.txt 2>&1 || true
-ls -l /sys/bus/i2c/devices > /tmp/mctp-pldm-spdm-debug/sys-bus-i2c.txt 2>&1 || true
-
-tar czf /tmp/mctp-pldm-spdm-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp mctp-pldm-spdm-debug
+lspci -nn
+lspci -vv
+dmesg | grep -Ei 'pcie|vdm|mctp'
 ```
 
-若有 SPDM tool 或 vendor attestation tool，需額外保存：
+I3C：
 
 ```bash
-# 依平台工具調整
-# spdmtool get-version > /tmp/mctp-pldm-spdm-debug/spdm-version.txt
-# spdmtool get-capabilities > /tmp/mctp-pldm-spdm-debug/spdm-capabilities.txt
-# spdmtool get-measurements > /tmp/mctp-pldm-spdm-debug/spdm-measurements.txt
+dmesg | grep -Ei 'i3c|mctp'
 ```
 
-#### 20.14 常見問題與排查入口
+##### 20.24.2 MCTP
 
+```bash
+mctp link
+mctp addr
+mctp route
 
-| 現象 | 可能方向 | 第一輪檢查 |
-| --- | --- | --- |
-| MCTP endpoint 掃不到 | physical link、binding driver、bus owner、endpoint power state | dmesg、mctpd journal、scope / lspci / i2cdetect |
-| EID 重複或跳動 | 多個 bus owner、dynamic EID policy 不一致、endpoint reset | mctp route、mctpd D-Bus、power timeline |
-| PLDM GetTypes timeout | MCTP route 錯、message type 不支援、endpoint busy | MCTP message type support、pldmd journal |
-| PDR 讀取失敗 | terminus 未建立、PDR repository error、large transfer / MTU 問題 | pldmtool、PDR trace、MTU |
-| PLDM sensor 值不合理 | PDR scale / unit / entity mapping 錯 | PDR dump、D-Bus sensor、raw value |
-| PLDM event 重複 | event ack flow 錯、endpoint retry、BMC 未去重 | pldmd journal、event sequence、logging entries |
-| PLDM FW update 中斷 | transfer size、timeout、endpoint reset、activation policy | update log、MCTP trace、endpoint FW log |
-| SPDM negotiation fail | version / capability / algorithm mismatch | SPDM transcript、policy、library version |
-| SPDM certificate fail | trust anchor、cert chain、time、slot id、revocation | cert dump、time sync、security policy |
-| SPDM measurement mismatch | endpoint firmware 不同、manifest 未更新、expected value 錯 | measurement digest、FW version、manifest |
-| Hot-plug 後 endpoint 沒回來 | route stale、discovery 沒重新跑、power state gating | mctpd signal、kernel hotplug、D-Bus endpoint |
-| Redfish 沒看到 PLDM sensor | D-Bus association 缺、sensor mapping 未建立 | busctl、ObjectMapper、bmcweb journal |
+journalctl -b --no-pager | grep -Ei 'mctp|eid|route|endpoint'
+```
 
+確認 endpoint、EID、UUID、message types、MTU 與 route。
 
-#### 20.15 Bring-up 建議流程
+##### 20.24.3 PLDM
 
-- 建立 MCTP endpoint 表，列出 endpoint、binding、physical path、power state、owner、EID、UUID、message type。
-- 先驗證 physical link，再驗證 MCTP discovery，不要直接從 PLDM timeout 判斷問題。
-- 確認 bus owner 與 EID assignment policy，做 BMC reboot、endpoint reset、host power cycle 後確認 EID 穩定性。
-- 對每個 endpoint 執行 MCTP Control discovery，保存 UUID、message type、MTU、route。
-- 對支援 PLDM 的 endpoint 執行 Base discovery，保存 type / command support。
-- 若支援 Platform，讀 PDR repository，建立 sensor / effecter / event mapping，驗證 D-Bus 與 Redfish。
-- 若支援 FRU / BIOS / FW update，逐項驗證資料來源、權限、update 中斷回復與 event log。
-- 若支援 SPDM，先跑 version / capability / algorithm，再跑 certificate / challenge / measurement，最後依需求測 secure session。
-- 對所有安全結果建立 event / inventory / health mapping，不只保留 tool output。
-- 做 hot-plug、endpoint reset、BMC reboot、host power state transition、bus fault、timeout、firmware update、attestation fail 測試。
-- 保存 mctp-pldm-spdm-debug log、protocol trace、Redfish output、event log、版本與 endpoint firmware 資訊。
+```bash
+systemctl --type=service | grep -i pldm
+journalctl -b --no-pager | grep -Ei 'pldm|terminus|pdr|effecter'
 
-#### 20.16 當前平台 MCTP / PLDM / SPDM 實測表
+pldmtool base GetPLDMTypes 2>/dev/null
+pldmtool base GetPLDMCommands 2>/dev/null
+```
 
+`pldmtool` syntax 依版本與 endpoint selection方式不同，應先查看 `pldmtool --help`。
 
-| 項目 | 指令 / 來源 | 實測值 | 備註 |
-| --- | --- | --- | --- |
-| MCTP kernel config | kernel .config | [待填] | CONFIG_MCTP / binding driver |
-| MCTP services | systemctl / journal | [待填] | mctpd / vendor daemon |
-| Endpoint list | mctpd D-Bus / mctp tool | [待填] | EID / UUID / route |
-| Transport bindings | schematic / lspci / i2c | [待填] | SMBus / PCIe / I3C |
-| Bus owner policy | platform design | [待填] | BMC / host / bridge |
-| Message type support | MCTP control | [待填] | PLDM / SPDM / vendor |
-| PLDM terminus list | pldmd / pldmtool | [待填] | TID / endpoint mapping |
-| PLDM command support | GetPLDMTypes / Commands | [待填] | Base / Platform / FRU / FWU |
-| PDR repository | pldmtool platform GetPDR | [待填] | sensor / effecter count |
-| PLDM sensor mapping | D-Bus / Redfish | [待填] | unit / scale / association |
-| PLDM FRU mapping | inventory / Redfish | [待填] | 權威端 |
-| PLDM FW update | update test | [待填] | progress / activation / rollback |
-| SPDM version / capability | SPDM tool / log | [待填] | 版本與演算法 |
-| SPDM certificate | cert chain validation | [待填] | trust anchor / slot |
-| SPDM measurement | measurement digest | [待填] | expected value |
-| Event / health mapping | EventLog / Redfish | [待填] | attestation / PLDM event |
+##### 20.24.4 SPDM
 
+依實際 requester 或 vendor tool 保存：
 
-#### 20.17 回查結果
+- Version response。
+- Capabilities。
+- Selected algorithms。
+- Certificate slot 與 validation result。
+- Challenge result。
+- Measurement summary。
+- Session state。
+- Policy decision。
 
-本章已回查前後文並補齊下列銜接點：
+不保存 private key、derived secret 或未經遮蔽的敏感資料。
 
-- 第 5 章周邊匯流排已介紹 MCTP / PLDM / SPDM 所需 physical binding，本章補上 endpoint、EID、route、PLDM terminus 與 SPDM attestation 流程。
-- 第 10 章 I2C / PMBus 已涵蓋 SMBus / I2C bring-up，本章補上 MCTP over SMBus / I2C 的 bus owner、EID 與多 endpoint 注意事項。
-- 第 15 章 Inventory / FRU / Asset 已定義資料權威端，本章補上 PLDM FRU 與 endpoint inventory 對映。
-- 第 16 章 Logging / Event / Telemetry 已定義事件與安全 log，本章補上 PLDM event、SPDM attestation fail、FW update fail 的 logging / health 對映。
-- 第 18～19 章 Host communication 相關章節可引用本章的 host / BMC sideband、PCIe VDM、BIOS / firmware PLDM flow。
-- 第 24 章 Security Baseline 可引用本章的 SPDM trust anchor、certificate、measurement、policy 與 audit log。
-- 第 25 章 Firmware Update 可引用本章的 PLDM Firmware Update 流程、transfer size、activation 與 rollback 測試。
+#### 20.25 常見問題與判讀
 
-#### 20.18 驗收 Checklist
+| 現象 | 流程大約停在哪裡 | 優先檢查 |
+|---|---|---|
+| Endpoint 完全找不到 | Physical / binding | Power、link、driver、owner |
+| EID 重複或變動 | Discovery / ownership | Bus owner、assignment policy、reset |
+| Route 存在但 request timeout | Path / endpoint | MTU、next hop、power state、tag |
+| 小 response 正常，大 response 失敗 | Fragment / MTU | Packet size、sequence、reassembly |
+| PLDM type discovery 失敗 | Message type / terminus | Supported types、route、service |
+| PDR repository讀取失敗 | PLDM transfer | Repository state、MTU、record handle |
+| Sensor 數值錯誤 | PDR mapping | Unit、resolution、offset、raw value |
+| Event 重複 | Event receiver / ACK | Sequence、retry、deduplication |
+| FRU 欄位不一致 | Data authority | PLDM FRU、IPMI FRU、PMBus priority |
+| Firmware update 中斷 | Transfer / activation | Block size、timeout、endpoint reset |
+| SPDM version negotiation 失敗 | Version policy | Requester / responder support |
+| Certificate validation 失敗 | Trust chain | Slot、CA、time、signature、revocation |
+| Challenge 失敗 | Device identity | Transcript、algorithm、private-key possession |
+| Measurement mismatch | Reference data | Device firmware、manifest、expected value |
+| Secure session 無法建立 | Key exchange | DHE / AEAD、MTU、session state |
+| Hot-plug 後 endpoint 不回來 | Rediscovery | Route cleanup、power、daemon signals |
 
--  已建立所有 MCTP endpoint、binding、physical path、EID、UUID、message type 與 owner 表。
--  Physical link、binding driver、mctpd / vendor MCTP daemon 已驗證。
--  EID assignment、bus owner、route table、MTU、message type support 已記錄。
--  BMC reboot、endpoint reset、host power cycle 後，endpoint discovery 與 route 可恢復。
--  PLDM Base discovery、type / command support 已驗證。
--  PLDM PDR repository 可讀，sensor / effecter / event / entity association 對映正確。
--  PLDM sensor 已對映到 D-Bus / Redfish，scale、unit、availability、association 已驗證。
--  PLDM FRU / BIOS / Firmware Update 若平台支援，權限、event、rollback 與 update 中斷回復已測試。
--  SPDM version、capability、algorithm negotiation 已完成。
--  SPDM certificate chain、challenge、measurement 驗證與 policy 已定義。
--  SPDM fail / measurement mismatch / cert fail 會產生 security event，且不洩漏敏感資料。
--  Hot-plug、route stale、timeout、endpoint reset、bus fault、large transfer、event storm 已測試。
--  mctp-pldm-spdm-debug log、protocol trace、journal、Redfish、EventLog、endpoint firmware version 已保存。
+#### 20.26 Debug Log 收集
 
-#### 20.19 本章參考資料
+以下腳本以唯讀狀態為主。不同 image 的 commands 與 service names 可能不同。
 
-- DMTF MCTP Base Specification DSP0236: [https://www.dmtf.org/sites/default/files/standards/documents/DSP0236_1.3.3.pdf](https://www.dmtf.org/sites/default/files/standards/documents/DSP0236_1.3.3.pdf)
-- DMTF SPDM Specification DSP0274: [https://www.dmtf.org/standards/spdm](https://www.dmtf.org/standards/spdm)
-- DMTF SPDM over MCTP Binding Specification DSP0275: [https://www.dmtf.org/sites/default/files/standards/documents/DSP0275_1.0.2.pdf](https://www.dmtf.org/sites/default/files/standards/documents/DSP0275_1.0.2.pdf)
-- DMTF libspdm reference implementation: [https://github.com/DMTF/libspdm](https://github.com/DMTF/libspdm)
-- OpenBMC MCTP / PLDM communication overview: [https://deepwiki.com/openbmc/docs/4.7-mctp-and-pldm-communication](https://deepwiki.com/openbmc/docs/4.7-mctp-and-pldm-communication)
-- OpenBMC PLDM overview: [https://deepwiki.com/openbmc/pldm](https://deepwiki.com/openbmc/pldm)
-- OpenBMC MCTP design note: [https://github.com/CodeConstruct/openbmc-docs/blob/master/designs/mctp/mctp.md](https://github.com/CodeConstruct/openbmc-docs/blob/master/designs/mctp/mctp.md)
+```bash
+#!/bin/sh
+
+OUT=/tmp/mctp-pldm-spdm-debug
+mkdir -p "$OUT"
+
+cat /etc/os-release > "$OUT/os-release.txt" 2>&1
+uname -a > "$OUT/uname.txt"
+cat /proc/cmdline > "$OUT/proc-cmdline.txt"
+zcat /proc/config.gz > "$OUT/proc-config.txt" 2>&1
+
+dmesg -T > "$OUT/dmesg.txt"
+journalctl -b --no-pager > "$OUT/journal.txt" 2>&1
+systemctl --failed > "$OUT/systemctl-failed.txt" 2>&1
+systemctl --type=service | grep -Ei 'mctp|pldm|spdm' \
+    > "$OUT/services.txt" 2>&1
+
+command -v mctp >/dev/null 2>&1 && {
+    mctp link > "$OUT/mctp-link.txt" 2>&1
+    mctp addr > "$OUT/mctp-addr.txt" 2>&1
+    mctp route > "$OUT/mctp-route.txt" 2>&1
+}
+
+busctl tree xyz.openbmc_project.ObjectMapper \
+    > "$OUT/objectmapper.txt" 2>&1
+busctl tree xyz.openbmc_project.MCTP \
+    > "$OUT/mctp-dbus.txt" 2>&1
+busctl tree xyz.openbmc_project.PLDM \
+    > "$OUT/pldm-dbus.txt" 2>&1
+
+command -v lspci >/dev/null 2>&1 && \
+    lspci -vv > "$OUT/lspci-vv.txt" 2>&1
+command -v i2cdetect >/dev/null 2>&1 && \
+    i2cdetect -l > "$OUT/i2cdetect-l.txt" 2>&1
+
+# PLDM / SPDM commands需依 endpoint 與工具版本另外執行。
+# 通用腳本不自動觸發 firmware update、effecter 或 repeated attestation。
+
+tar czf "/tmp/mctp-pldm-spdm-debug-$(date +%Y%m%d-%H%M%S).tar.gz" \
+    -C /tmp mctp-pldm-spdm-debug
+```
+
+#### 20.27 Bring-up 順序
+
+1. 建立 endpoint 清單與 physical binding path。
+2. 確認 endpoint power、reset 與 presence。
+3. 啟用 kernel MCTP core 與 binding driver。
+4. 指定 bus owner 與 EID assignment policy。
+5. 取得 EID、UUID、message types 與 path MTU。
+6. 建立並驗證 routes。
+7. 執行 PLDM Base discovery。
+8. 建立 terminus 與 TID mapping。
+9. 讀取 PDR repository，驗證 sensors、effecters 與 associations。
+10. 驗證 PLDM event receiver 與 event handling。
+11. 驗證 PLDM FRU、BIOS 與 firmware update，若 endpoint 支援。
+12. 執行 SPDM version、capability 與 algorithm negotiation。
+13. 驗證 certificate、challenge 與 measurements。
+14. 依需求建立 secure session。
+15. 將 PLDM 與 SPDM 結果映射到 D-Bus、Redfish 與 event。
+16. 測試 endpoint reset、hot-plug、BMC reboot、Host power transition 與 path failure。
+17. 保存 protocol versions、endpoint firmware、logs、routes 與 policy 結果。
+
+#### 20.28 平台實測紀錄表
+
+| Endpoint | Binding / Path | Network / EID | UUID | Message Types | Power State | Owner |
+|---|---|---|---|---|---|---|
+| [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+| [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+
+| PLDM 項目 | 實測值 | 備註 |
+|---|---|---|
+| TID / Terminus | [待填] | EID 對照 |
+| Supported Types | [待填] | Base / Platform / FRU / BIOS / FWU |
+| PDR Count | [待填] | Repository version / change number |
+| Numeric Sensors | [待填] | Unit / scale |
+| State Sensors | [待填] | State sets |
+| Effecters | [待填] | Authorization |
+| FRU Records | [待填] | Inventory authority |
+| Event Receiver | [待填] | ACK / retry |
+| FW Update | [待填] | Transfer / activation / recovery |
+
+| SPDM 項目 | 實測值 | 備註 |
+|---|---|---|
+| Version | [待填] | Minimum policy |
+| Capabilities | [待填] | Cert / challenge / measurement / session |
+| Algorithms | [待填] | Hash / asym / DHE / AEAD |
+| Certificate Slot | [待填] | Trust anchor |
+| Challenge | [待填] | Pass / fail |
+| Measurements | [待填] | Expected values |
+| Secure Session | [待填] | Session / heartbeat / key update |
+| Policy Result | [待填] | Health / event / restriction |
+
+#### 20.29 驗收 Checklist
+
+MCTP：
+
+- [ ] 所有 endpoints 都有 binding、physical path、EID、UUID 與 owner 紀錄。
+- [ ] Bus owner 與 EID assignment policy 已確認。
+- [ ] Link、local address、route 與 path MTU 已驗證。
+- [ ] BMC reboot、endpoint reset 與 hot-plug 後可重新 discovery。
+- [ ] Large message fragmentation / reassembly 已測試。
+
+PLDM：
+
+- [ ] Base Type、Version 與 Commands discovery 正常。
+- [ ] EID、TID 與 terminus identity 已對齊。
+- [ ] PDR repository 可完整讀取並處理 change event。
+- [ ] Sensor unit、scale、range、threshold 與 association 正確。
+- [ ] Effecter 具有 range、權限與 audit controls。
+- [ ] Event receiver、ACK、retry 與 deduplication 已驗證。
+- [ ] FRU、BIOS 與 Firmware Update 依 endpoint capability 完成測試。
+
+SPDM：
+
+- [ ] Version、capabilities 與 algorithms 符合 security policy。
+- [ ] Certificate chain 可追溯到核准的 trust anchor。
+- [ ] Challenge signature 驗證成功。
+- [ ] Measurements具有 expected value 或 signed manifest 可供判讀。
+- [ ] Firmware update 後 expected measurements 會同步更新。
+- [ ] Secure session 的建立、heartbeat、key update 與 teardown 已測試，若使用。
+- [ ] Logs 不包含 private key 或 session secret。
+- [ ] Attestation failure 會產生明確 policy result 與 security event。
+
+OpenBMC：
+
+- [ ] Endpoint、inventory、sensor、software 與 security objects 正確建立。
+- [ ] Redfish 與 EventLog 能呈現必要結果。
+- [ ] Endpoint 消失時 stale routes、termini、sensors 與 associations 會清理。
+- [ ] Debug logs、protocol traces、versions 與 endpoint firmware 已保存。
+
+#### 20.30 本章重點
+
+1. MCTP 提供 endpoint 定址、message type、fragmentation 與 routing。
+2. EID 是 network 內的 logical address；UUID 適合用來辨識較穩定的 endpoint identity。
+3. Bus owner 負責 discovery 與 EID assignment，平台只能有清楚一致的 ownership policy。
+4. Transport binding 可使用 SMBus、PCIe VDM、I3C 或其他媒體。
+5. PLDM terminus 透過 Base discovery 宣告支援的 Types、Versions 與 Commands。
+6. PDR 描述 sensors、effecters、entities 與 associations。
+7. PLDM Firmware Update 需要處理資料傳輸、activation、中斷與 recovery。
+8. SPDM 透過 version、capability、algorithm、certificate、challenge 與 measurement 建立信任判斷。
+9. Measurement digest需要 expected value 或 manifest 才能形成 attestation 結果。
+10. MCTP、PLDM 與 SPDM 的結果應整合到 OpenBMC D-Bus、Redfish、Update Service 與 Security Event。
+
+#### 20.31 本章參考資料
+
+- DMTF MCTP Base Specification DSP0236: https://www.dmtf.org/dsp/DSP0236
+- DMTF PLDM Specifications: https://www.dmtf.org/standards/pmci
+- DMTF SPDM Specification DSP0274: https://www.dmtf.org/standards/spdm
+- DMTF SPDM over MCTP Binding DSP0275: https://www.dmtf.org/dsp/DSP0275
+- DMTF libspdm: https://github.com/DMTF/libspdm
+- Linux kernel MCTP documentation: https://docs.kernel.org/networking/mctp.html
+- OpenBMC PLDM project: https://github.com/openbmc/pldm
+- OpenBMC documentation: https://github.com/openbmc/docs

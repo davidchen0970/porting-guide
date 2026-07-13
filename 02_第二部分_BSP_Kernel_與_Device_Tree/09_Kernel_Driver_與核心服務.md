@@ -1,272 +1,1241 @@
-### 9. Kernel Driver 與核心服務
+### 9. Kernel Driver：從硬體初始化到 OpenBMC 服務
 
-本章整理 BMC 平台移植時常遇到的 Linux kernel driver、driver model、probe flow、resource dependency、deferred probe、sysfs / debugfs / hwmon / input / net / mtd / watchdog interface、kernel config、module / built-in、OpenBMC service 銜接與排查方法。第 8 章已說明 Device Tree 如何描述硬體；本章接著說明 kernel 如何把 DT node 轉成 device，如何讓 driver match / probe，並在 probe 成功後提供 userspace 可讀寫的介面。
+Kernel driver 是 Linux kernel 中用來控制硬體的程式。Device Tree 告訴 kernel 板子上有哪些裝置，以及裝置使用的位址、中斷、GPIO、clock 和 reset；driver 則依照這些資訊初始化硬體、處理硬體事件，並將硬體功能提供給系統中的其他程式。
 
-BMC 平台的 kernel driver 問題常呈現為：I2C device 沒有出現、hwmon 沒值、fan tach 沒讀值、PWM 無輸出、GPIO line busy、MTD partition 不對、watchdog reset、network link 不起、MCTP endpoint 不見、service 讀不到 D-Bus object。這些現象不一定都是 OpenBMC service 問題；很多時候真正的入口是 driver 是否 probe、resource 是否 ready、sysfs 是否建立、kernel config 是否啟用、device 是否被正確綁定。
+例如，板子上有一顆 TMP75 溫度感測器，接在 I2C bus 5，位址為 `0x48`：
 
-#### 9.1 Linux Driver Model 基本觀念
+- Device Tree 描述這顆感測器的位置與型號。
+- Kernel 建立對應的 I2C device。
+- TMP75 driver 與這個 device 配對，並讀取感測器暫存器。
+- Driver 將溫度註冊到 hwmon。
+- OpenBMC sensor service 讀取 hwmon，再建立 D-Bus sensor object。
 
-Linux driver model 把 bus、device、driver 統一到共同模型。Bus 負責 match device 與 driver；driver 註冊 probe / remove / suspend / resume 等 callback；device 則由 Device Tree、ACPI、PCI enumeration、I2C core、SPI core、platform code 或 hotplug 流程建立。
-
-典型關係：
+可以先記住以下關係：
 
 ```text
-Device Tree / bus enumeration / hotplug
-    ↓
-struct device / bus-specific device
-    ↓
-bus match：compatible / id_table / modalias / ACPI / PCI ID
-    ↓
-driver probe
-    ↓
-取得 resource：regulator / clock / reset / GPIO / IRQ / pinctrl / memory / DMA
-    ↓
+Device Tree 描述硬體
+Driver 控制硬體
+Kernel subsystem 提供共同介面
+OpenBMC service 將資料轉成 D-Bus object
+```
+
+本章依照「Kernel driver 的用途 → Linux 如何管理裝置與 driver → device 如何建立 → driver 如何配對與 probe → 硬體資源與 subsystem → OpenBMC 銜接 → 開發與排查」的順序說明。
+
+#### 9.1 Kernel Driver 是什麼
+
+CPU 不會因為板子上焊了一顆 IC，就自動知道如何使用它。以 TMP75 溫度感測器為例，Linux 必須知道：
+
+- 感測器接在哪一個 I2C bus 與 address。
+- TMP75 有哪些暫存器。
+- 要用什麼 I2C 交易讀取暫存器。
+- 暫存器中的數值如何換算成溫度。
+- 讀到的溫度要用什麼方式提供給其他程式。
+
+其中，裝置位置與硬體接線由 Device Tree 描述；如何和 TMP75 通訊、如何解讀資料，則由 TMP75 driver 處理。
+
+```text
+Device Tree
+描述 I2C bus 5、address 0x48 有一顆 TMP75
+        ↓
+TMP75 driver
+讀取暫存器並換算溫度
+        ↓
+hwmon
+用 Linux 共通格式提供溫度
+        ↓
+OpenBMC sensor service
+建立 D-Bus sensor object
+```
+
+因此，Kernel driver 的核心工作是把特定硬體的控制方法接到 Linux kernel 的共同架構中。
+
+##### 9.1.1 Driver 如何控制硬體
+
+不同硬體的控制方式不同，driver 可能透過下列方式與裝置溝通：
+
+- 讀寫 SoC 的 MMIO 暫存器。
+- 透過 I2C 或 SPI controller 傳送 bus transaction。
+- 接收硬體 interrupt。
+- 啟動或停止 DMA。
+- 控制 GPIO、clock、reset 與 regulator。
+
+Driver 初始化硬體時，通常會：
+
+1. 讀取 Device Tree 提供的資料。
+2. 向 kernel 取得硬體需要的資源。
+3. 確認硬體型號或目前狀態。
+4. 設定暫存器與工作模式。
+5. 註冊 hwmon、GPIO、network、MTD 等 Linux 介面。
+
+##### 9.1.2 Driver 與 OpenBMC 的分工
+
+Driver 負責硬體的基本控制；會因板子或產品而改變的使用方式，通常由 Device Tree 或 OpenBMC service 決定。
+
+例如：
+
+| 內容 | 負責位置 |
+|---|---|
+| TMP75 的 I2C address | Device Tree |
+| 如何讀取 TMP75 溫度暫存器 | Kernel driver |
+| 溫度以 millidegree Celsius 提供 | hwmon subsystem |
+| Sensor 顯示名稱與 threshold | OpenBMC sensor config |
+| 溫度過高時如何調整 fan | Fan / thermal service |
+| Service 失敗後如何重啟 | systemd unit |
+
+這樣分工後，同一份 TMP75 driver 可以在不同板子上共用，不需要為每一塊板子寫一份 driver。
+
+#### 9.2 Linux 如何管理裝置與 Driver
+
+Linux 不會讓每一份 driver 各自建立一套管理方式。Kernel 會用 device、driver、bus、subsystem 與 class 組織硬體。這些部分的關係如下：
+
+```text
+Bus
+├── 管理 devices
+├── 管理 drivers
+└── 決定 device 與 driver 是否相符
+          ↓
+       Probe
+          ↓
+Driver 初始化硬體
+          ↓
+Subsystem 提供共同介面
+          ↓
+Class 將同類功能整理到 /sys/class/
+```
+
+##### 9.2.1 Device
+
+Device 是 kernel 對一個裝置的記錄。這個裝置可以是板子上的一顆 IC，也可以是 SoC 內部的一個 controller。
+
+例如：
+
+```text
+板子上的第 1 顆 TMP75
+板子上的第 2 顆 TMP75
+AST2600 的 I2C5 controller
+SPI bus 上 CS0 的 flash
+```
+
+Kernel 會分別管理它們。若四顆 TMP75 位於不同 bus 或 address，可能看到：
+
+```text
+5-0048
+5-0049
+6-0048
+6-0049
+```
+
+這四個 device 都可以交由同一份 TMP75 driver 控制，但每個 device 仍有自己的 bus、address、狀態與 sysfs 路徑。
+
+##### 9.2.2 Driver
+
+Driver 是支援某一類 device 的 kernel 程式。同一份 driver 可以管理多個相同或相容的 devices。
+
+```text
+5-0048 ─┐
+5-0049 ─┼──> TMP75 driver
+6-0048 ─┤
+6-0049 ─┘
+```
+
+Driver 會為每個 device 分別保存所需資料，例如 address、校正值、clock、GPIO、interrupt 與目前工作狀態。
+
+##### 9.2.3 Bus
+
+Bus 在硬體上可能是 I2C、SPI、PCI 或 USB；在 Linux driver model 中，它也代表一套管理 devices、drivers 與配對流程的規則。
+
+例如 I2C bus 會處理：
+
+- I2C device 的建立與命名。
+- I2C driver 的註冊。
+- Device 與 driver 的配對。
+- I2C read / write API。
+
+常見 bus：
+
+| Bus | 常見裝置 | Device 通常如何出現 |
+|---|---|---|
+| Platform | SoC 內部 GPIO、PWM、watchdog | Kernel 解析 Device Tree |
+| I2C | Sensor、EEPROM、PMBus、CPLD | I2C controller 下的 DT child node |
+| SPI | Flash、TPM、ADC | SPI controller 下的 DT child node |
+| PCI | NIC、GPU、PCIe switch | PCI controller 自動枚舉 |
+| USB | USB 裝置 | USB controller 自動枚舉 |
+| MDIO | Ethernet PHY | MDIO scan 或 DT PHY node |
+
+##### 9.2.4 Kernel Subsystem
+
+不同 driver 控制硬體的方法不同，但同類硬體需要提供一致的介面。Kernel subsystem 就是 Linux 為某一類功能建立的共同架構。
+
+以溫度感測器為例：
+
+```text
+TMP75 driver ─────┐
+LM75 driver ──────┼──> hwmon subsystem ──> 共同的溫度介面
+PMBus driver ─────┘
+```
+
+TMP75、LM75 與 PMBus 裝置的讀取方式不同，因此各自需要 driver；但它們都可以把溫度註冊到 hwmon，讓 userspace 使用相同的命名與單位讀取資料。
+
+常見 subsystem：
+
+| Subsystem | 提供的共同功能 | Userspace 常見入口 |
+|---|---|---|
+| hwmon | 溫度、電壓、電流、功率、fan RPM | `/sys/class/hwmon/` |
+| IIO | ADC、DAC 與量測 channels | `/sys/bus/iio/devices/` |
+| GPIO | GPIO controller 與 lines | `/dev/gpiochipX` |
+| MTD | Raw flash 與 partitions | `/dev/mtdX`、`/proc/mtd` |
+| Net | Network interfaces | `ip link`、`/sys/class/net/` |
+| Watchdog | Hardware watchdog | `/dev/watchdogX` |
+| RTC | Real-time clock | `/sys/class/rtc/` |
+| Input | Button、key、switch | `/dev/input/eventX` |
+
+Driver 處理特定硬體的差異；subsystem 則把同類硬體整理成共同介面。
+
+##### 9.2.5 Class
+
+Class 是 sysfs 依功能整理裝置的方式。同一顆 TMP75 從 I2C bus 的角度可以出現在：
+
+```text
+/sys/bus/i2c/devices/5-0048
+```
+
+它註冊成 hwmon 後，從硬體監控功能的角度也會出現在：
+
+```text
+/sys/class/hwmon/hwmon2
+```
+
+兩條路徑可能指向同一個底層 device，只是分類方式不同。
+
+##### 9.2.6 Probe
+
+當 bus 判斷某個 driver 支援某個 device 時，kernel 會呼叫該 driver 的 `probe()`。
+
+`probe()` 會嘗試取得資源、確認硬體、完成初始化，並註冊 subsystem interface。
+
+```text
+Device 與 driver 配對成功
+        ↓
+Kernel 呼叫 probe()
+        ↓
+取得 clock、reset、GPIO、IRQ 等資源
+        ↓
 初始化硬體
-    ↓
-註冊 subsystem interface：hwmon / iio / gpiochip / netdev / mtd / watchdog / input / rtc / misc
-    ↓
-userspace service / OpenBMC daemon 讀取 sysfs / D-Bus / netlink / character device
+        ↓
+註冊 hwmon、netdev、MTD 等介面
 ```
 
+Probe 回傳 `0` 表示成功。若回傳負的 error code，表示初始化失敗；若回傳 `-EPROBE_DEFER`，表示必要資源尚未準備好，kernel 之後會再嘗試。
 
-| 角色 | 說明 | BMC 常見例子 | 檢查入口 |
-| --- | --- | --- | --- |
-| Bus | device 與 driver 的 match domain | platform、i2c、spi、pci、mdio、usb、mctp | /sys/bus、dmesg |
-| Device | kernel 看到的硬體實體或 logical device | i2c-5/5-0048、spi0.0、platform device、eth0 | /sys/bus/*/devices |
-| Driver | 支援一類 device 的 kernel driver | tmp75、pmbus、aspeed-gpio、aspeed-pwm-tacho | /sys/bus/*/drivers、lsmod |
-| Probe | driver 對 device 初始化 | 讀 DT、request IRQ、enable clock、register hwmon | dmesg、dynamic debug、trace |
-| Subsystem | driver 對 userspace 暴露的標準介面 | hwmon、iio、gpio、mtd、net、watchdog | /sys/class、debugfs |
+#### 9.3 從 Device Tree 到 Device
 
+在 probe 以前，kernel 必須先知道「有這個 device」。以 TMP75 為例：
 
-#### 9.2 Driver probe 典型流程
+```dts
+&i2c5 {
+    status = "okay";
 
-不同 bus 的 probe 細節不同，但 BMC driver 大多遵循下列順序：
+    temperature-sensor@48 {
+        compatible = "ti,tmp75";
+        reg = <0x48>;
+    };
+};
+```
+
+開機時大致發生：
+
+1. Kernel 解析 running DTB。
+2. Kernel 看到 I2C5 controller，建立對應的 platform device。
+3. I2C controller driver 成功 probe，註冊一個 I2C adapter。
+4. I2C core 讀取 controller 底下的 child nodes。
+5. Kernel 根據 `temperature-sensor@48` 建立 I2C client device。
+6. 該 device 在 sysfs 中通常以 bus number 與 address 表示，例如 `5-0048`。
+
+這個流程有明確的先後關係：
 
 ```text
-1. driver register
-2. bus match device 與 driver
-3. probe callback 被呼叫
-4. 讀取 DT / firmware node / platform data
-5. 取得 MMIO / I2C client / SPI device / PCI resource
-6. 取得 clock / reset / regulator / GPIO / IRQ / pinctrl
-7. 初始化硬體 register / mode / timing / calibration
-8. 註冊 subsystem interface，例如 hwmon、gpiochip、iio、netdev、mtd
-9. 建立 sysfs / debugfs / device attribute
-10. userspace daemon 開始讀取或監控
+I2C controller 先正常
+    ↓
+I2C bus 才存在
+    ↓
+Bus 下的 TMP75 device 才能建立
+    ↓
+TMP75 driver 才有機會 probe
 ```
 
-Probe function 內常見 resource：
+如果 `/sys/bus/i2c/devices/5-0048` 完全不存在，問題通常還沒走到 TMP75 driver 的 probe，應先檢查 running DTB、I2C controller、MUX 與 device 建立流程。
 
+##### 9.3.1 Device Tree 不是唯一來源
 
-| Resource | 常見 API / 來源 | probe 失敗常見現象 | 排查入口 |
-| --- | --- | --- | --- |
-| MMIO reg | platform resource、ioremap | driver probe fail、register read timeout | /proc/iomem、dmesg |
-| I2C client | DT child node、new_device | device 不存在或 driver 不綁定 | /sys/bus/i2c/devices |
-| SPI device | SPI child node、chip select | flash probe fail、JEDEC ID 錯 | dmesg spi-nor、/proc/mtd |
-| Clock | clocks / clock-names | -EPROBE_DEFER、baud / bus speed 異常 | clk_summary、dmesg |
-| Reset | resets / reset-names、reset-gpios | device timeout、link 不起 | debugfs reset、scope |
-| Regulator | vdd-supply、regulator-fixed | supply not found、device 無 ACK | /sys/class/regulator、dmesg |
-| GPIO | reset-gpios、enable-gpios、interrupt-gpios | GPIO busy、polarity 反相 | gpioinfo、debugfs gpio |
-| IRQ | interrupts、interrupt-parent | 事件不觸發、IRQ storm | /proc/interrupts、dmesg |
-| Pinctrl | pinctrl-0、pinctrl-names | bus 無波形、GPIO 不動 | pinctrl debugfs |
+不同 bus 建立 device 的方式不同：
 
+- Platform、I2C、SPI 裝置常由 Device Tree 描述。
+- PCI 與 USB 裝置通常由硬體自動枚舉。
+- MDIO PHY 可由 Device Tree 描述，也可能透過 PHY ID 偵測。
+- 某些開發或測試流程可由 userspace 明確建立 I2C device，但平台設定仍應有可追蹤來源。
 
-#### 9.3 Bus match：platform、I2C、SPI、PCI、MDIO
+`i2cdetect` 掃到 ACK，只能證明某個 address 有硬體回應；它不會自動告訴 kernel 那是 TMP75，也不代表 driver 已經綁定。
 
-不同 bus 的 match key 不同。排查 driver 不 probe 時，先確認 device 是否存在，再確認 match key 是否正確。
+#### 9.4 Kernel 怎麼決定要不要呼叫 Probe
 
+Probe 不是由 userspace 直接呼叫。正常開機流程中，是 bus core 在 device 與 driver 都註冊後，自動比較兩者是否相符；相符時才呼叫 driver 的 probe callback。
 
-| Bus | Device 來源 | Driver match key | BMC 常見例子 | 檢查入口 |
-| --- | --- | --- | --- | --- |
-| platform | DT SoC node / platform device | of_match_table compatible | GPIO、PWM、ADC、watchdog、LPC/eSPI | /sys/bus/platform/devices |
-| I2C | DT child node / new_device / detection daemon | i2c_device_id、of_match_table | temperature sensor、EEPROM、PMBus、CPLD | /sys/bus/i2c/devices |
-| SPI | DT child node / spi controller | of_match_table / spi id | SPI-NOR、SPI-NAND、TPM、ADC | /sys/bus/spi/devices |
-| PCI | PCI enumeration | vendor / device ID、class code | NIC、GPU、accelerator、PCIe switch | lspci、/sys/bus/pci/devices |
-| MDIO | MDIO scan 或 DT PHY node | PHY ID / compatible | Ethernet PHY | /sys/bus/mdio_bus/devices |
-| USB | USB enumeration | VID / PID / class | USB gadget / host debug devices | lsusb、/sys/bus/usb/devices |
+完整流程如下：
 
+```text
+Device 註冊到 bus
+        +
+Driver 註冊到同一個 bus
+        ↓
+Bus 執行 match 規則
+        ↓
+不相符：繼續找其他 driver
+相符：呼叫這個 driver 的 probe()
+        ↓
+Probe 成功：綁定 device 與 driver
+Probe 失敗：保留錯誤，介面通常不會出現
+```
 
-常見檢查：
+##### 9.4.1 Platform Driver 的 Probe 如何被呼叫
+
+DTS：
+
+```dts
+example@1e600000 {
+    compatible = "vendor,example-device";
+    reg = <0x1e600000 0x1000>;
+    status = "okay";
+};
+```
+
+Driver：
+
+```c
+static const struct of_device_id example_of_match[] = {
+    { .compatible = "vendor,example-device" },
+    { }
+};
+
+static int example_probe(struct platform_device *pdev)
+{
+    return 0;
+}
+
+static struct platform_driver example_driver = {
+    .probe = example_probe,
+    .driver = {
+        .name = "example-driver",
+        .of_match_table = example_of_match,
+    },
+};
+
+module_platform_driver(example_driver);
+```
+
+關鍵連結是：
+
+```text
+DTS compatible
+"vendor,example-device"
+        ↕
+Driver of_match_table
+"vendor,example-device"
+```
+
+`module_platform_driver()` 讓這份 platform driver 註冊到 platform bus。當 platform device 與 driver 的 `compatible` 相符，platform bus 便呼叫 `example_probe(pdev)`。
+
+##### 9.4.2 I2C Driver 的 Probe 如何被呼叫
+
+概念相同，但資料型態換成 I2C：
+
+```c
+static const struct of_device_id example_of_match[] = {
+    { .compatible = "vendor,example-sensor" },
+    { }
+};
+MODULE_DEVICE_TABLE(of, example_of_match);
+
+static int example_i2c_probe(struct i2c_client *client)
+{
+    /* client 內含 I2C adapter、address 與 struct device */
+    return 0;
+}
+
+static struct i2c_driver example_i2c_driver = {
+    .probe = example_i2c_probe,
+    .driver = {
+        .name = "example-sensor",
+        .of_match_table = example_of_match,
+    },
+};
+module_i2c_driver(example_i2c_driver);
+```
+
+當 I2C core 建立對應 client，且 match 成功，就會呼叫 `example_i2c_probe(client)`。
+
+Kernel 版本不同時，I2C probe callback 的欄位名稱與函式簽名可能略有差異，應以目前專案 kernel tree 的相似 driver 為準。
+
+##### 9.4.3 Built-in 與 Module 對 Probe 時機的影響
+
+- Built-in driver 在 kernel 開機期間註冊；device 與 driver 都 ready 後便可 match、probe。
+- Module driver 要等 module 載入並註冊 driver 後，才有機會 probe 先前已存在的 device。
+- Device 若比 driver 晚出現，例如 hot-plug，device 註冊時也會重新尋找已註冊 driver。
+
+所以不論「device 先、driver 後」或「driver 先、device 後」，driver core 都能在兩者同時存在時嘗試配對。
+
+##### 9.4.4 如何確認流程走到哪裡
 
 ```bash
-# platform
-ls -l /sys/bus/platform/devices
-ls -l /sys/bus/platform/drivers
+# 1. Device 是否存在
+ls -l /sys/bus/<bus>/devices/<device>
 
-# I2C
-ls -l /sys/bus/i2c/devices
-i2cdetect -l
+# 2. Driver 是否已註冊
+ls -l /sys/bus/<bus>/drivers/<driver>
 
-# SPI
-ls -l /sys/bus/spi/devices
+# 3. 是否完成綁定
+readlink -f /sys/bus/<bus>/devices/<device>/driver
 
-# PCI
-lspci -nn 2>/dev/null
-ls -l /sys/bus/pci/devices 2>/dev/null
-
-# MDIO / net
-find /sys/bus/mdio_bus/devices -maxdepth 2 -type f -print 2>/dev/null
-ip link
+# 4. Match / probe 是否有訊息
+dmesg | grep -Ei '<driver>|<device>|probe|fail|error|defer'
 ```
 
-#### 9.4 Deferred probe 與 dependency 排查
+若 device 與 driver 都存在，但沒有綁定，常見方向包括：
 
-Deferred probe 是 embedded / BMC 平台常見現象：device 已建立、driver 也找到，但某個必要 resource 尚未 ready，例如 regulator provider、clock provider、GPIO controller、I2C mux、reset controller、interrupt controller。driver 應回傳 `-EPROBE_DEFER`，kernel driver core 之後會重試。
+- `compatible` 或 bus-specific ID 不相符。
+- Module alias 不完整。
+- Probe 被呼叫但失敗。
+- Device 已被其他 driver 綁定。
+- Driver 主動判斷 chip ID 不支援。
+
+##### 9.4.5 如何在除錯時重新觸發 Probe
+
+部分 bus 可透過 unbind / bind 重新執行 remove 與 probe：
+
+```bash
+echo '<device-name>' > /sys/bus/<bus>/drivers/<driver>/unbind
+echo '<device-name>' > /sys/bus/<bus>/drivers/<driver>/bind
+```
+
+這不是一般產品啟動流程，只是除錯方法。使用前需確認：
+
+- 該裝置不是 boot flash、console、watchdog 或 power-control 關鍵裝置。
+- Driver 的 remove path 能安全停止 IRQ、timer、workqueue 與 DMA。
+- OpenBMC service 已停止或能處理裝置暫時消失。
+
+若 driver 是 module，也可在安全條件下用 `modprobe -r` 與 `modprobe` 重新載入，但同樣要先評估相依裝置與系統影響。
+
+#### 9.5 Probe 裡面實際做什麼
+
+在看程式前，##### 9.5.1 Resource 是什麼
+
+Resource 是 driver 控制硬體前必須取得的系統資源，例如：
+
+- MMIO address range。
+- Interrupt line。
+- Clock。
+- Reset controller。
+- GPIO。
+- Regulator / power supply。
+- DMA channel。
+
+Driver 不是直接看到 DTS 就任意使用資源，而是透過 kernel API 申請與取得。Kernel 由此避免兩個 driver 同時占用同一資源，並管理相依順序。
+
+##### 9.5.2 `devm_*` 是什麼
+
+`devm_*` 是 device-managed resource API。
+
+> Driver 向 kernel 取得資源時，把資源登記到目前 device 名下；如果 probe 後面失敗，或 device 日後被移除，kernel 會協助釋放已登記的資源。
+
+例如：
+
+```c
+data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+```
+
+它和一般 `kzalloc()` 的主要差異是：
+
+```text
+kzalloc()
+Driver 通常要在錯誤路徑與 remove 中自行 kfree()
+
+devm_kzalloc()
+記憶體跟著 device 的生命週期，由 devres 機制管理
+```
+
+常見 managed APIs：
+
+- `devm_kzalloc()`：配置並歸零記憶體。
+- `devm_platform_ioremap_resource()`：取得並映射 MMIO resource。
+- `devm_gpiod_get()`：取得 GPIO descriptor。
+- `devm_clk_get()`：取得 clock。
+- `devm_request_threaded_irq()`：申請 IRQ。
+- `devm_hwmon_device_register_with_info()`：註冊 hwmon device。
+
+`devm_*` 能減少清理程式，但不是所有資源都能只靠它安全處理。Timer、workqueue、DMA、硬體持續產生的 interrupt 與 asynchronous callback，仍需在 remove 或 shutdown 流程中先停止。
+
+##### 9.5.3 一個 Probe 的典型步驟
+
+```text
+收到 device
+    ↓
+配置 driver 自己的資料結構
+    ↓
+讀取 DTS / device properties
+    ↓
+取得 MMIO、clock、reset、GPIO、IRQ 等 resources
+    ↓
+確認 chip ID 或硬體狀態
+    ↓
+設定硬體 register
+    ↓
+註冊 hwmon / GPIO / netdev 等介面
+    ↓
+保存 driver data
+    ↓
+回傳 0
+```
+
+##### 9.5.4 逐行閱讀一個簡化 Probe
+
+```c
+static int example_probe(struct platform_device *pdev)
+{
+    struct device *dev = &pdev->dev;
+    struct example_data *data;
+    int ret;
+
+    data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+    if (!data)
+        return -ENOMEM;
+
+    data->base = devm_platform_ioremap_resource(pdev, 0);
+    if (IS_ERR(data->base))
+        return PTR_ERR(data->base);
+
+    data->clk = devm_clk_get_enabled(dev, NULL);
+    if (IS_ERR(data->clk))
+        return dev_err_probe(dev, PTR_ERR(data->clk),
+                             "failed to get clock\n");
+
+    data->reset = devm_reset_control_get_exclusive_deasserted(dev, NULL);
+    if (IS_ERR(data->reset))
+        return dev_err_probe(dev, PTR_ERR(data->reset),
+                             "failed to get reset\n");
+
+    ret = example_hw_init(data);
+    if (ret)
+        return dev_err_probe(dev, ret,
+                             "hardware init failed\n");
+
+    platform_set_drvdata(pdev, data);
+    return 0;
+}
+```
+
+逐段說明：
+
+1. `pdev` 是 platform bus 傳給 probe 的 device。
+2. `&pdev->dev` 取得通用的 `struct device`，後續 resource API 多以它為入口。
+3. `struct example_data` 保存這個 device 專用的 driver 狀態。
+4. `devm_kzalloc()` 配置 private data；失敗時回傳 `-ENOMEM`。
+5. `devm_platform_ioremap_resource(pdev, 0)` 取得 DTS `reg` 對應的第 0 組 MMIO resource，確認未被占用，並映射成 kernel 可以存取的位址。
+6. `IS_ERR()` 用來判斷 API 是否回傳 encoded error pointer；`PTR_ERR()` 取出負的 error code。
+7. `devm_clk_get_enabled()` 取得並啟用 clock。若 provider 尚未 ready，錯誤可能是 `-EPROBE_DEFER`。
+8. Reset API 取得並解除 reset。
+9. `example_hw_init()` 是此 driver 自己的硬體初始化，例如讀 chip ID、設定 register。
+10. `platform_set_drvdata()` 把 `data` 存到 `pdev`，remove、IRQ handler 或其他 callback 可以再取回。
+11. 回傳 `0` 表示 probe 成功。
+
+##### 9.5.5 為什麼常看到 `IS_ERR()` 與 `PTR_ERR()`
+
+許多 kernel resource APIs 不以 `NULL` 表示所有錯誤，而會回傳特殊的 error pointer。
+
+典型寫法：
+
+```c
+resource = devm_some_get(dev);
+if (IS_ERR(resource))
+    return PTR_ERR(resource);
+```
+
+因此不能只寫：
+
+```c
+if (!resource)
+    return -EINVAL;
+```
+
+否則可能漏掉 encoded error，也可能破壞 `-EPROBE_DEFER`。
+
+##### 9.5.6 `dev_err_probe()` 是什麼
+
+`dev_err_probe()` 同時處理錯誤訊息與錯誤碼，特別適合 probe resource failure：
+
+```c
+return dev_err_probe(dev, PTR_ERR(data->clk),
+                     "failed to get clock\n");
+```
+
+它的價值包括：
+
+- 保留原始 error code。
+- 對 `-EPROBE_DEFER` 使用較合適的記錄方式。
+- 訊息會包含 device context。
+- 讓 probe error path 較一致。
+
+##### 9.5.7 Probe 成功後還要註冊 Subsystem Interface
+
+如果這是一個溫度 driver，取得硬體資源並讀到溫度後，通常還要註冊 hwmon：
+
+```c
+hwmon = devm_hwmon_device_register_with_info(dev,
+                                              "example_temp",
+                                              data,
+                                              &example_chip_info,
+                                              NULL);
+if (IS_ERR(hwmon))
+    return PTR_ERR(hwmon);
+```
+
+只有註冊成功後，userspace 才會看到對應的 `/sys/class/hwmon/hwmonX/`。因此 probe 回傳 `0` 前，通常要把 userspace 需要的 kernel interface 準備好。
+
+##### 9.5.8 常見 Probe 回傳值
+
+| 回傳值 | 意義 | 常見方向 |
+|---|---|---|
+| `0` | 初始化成功 | Device 與 driver 完成綁定 |
+| `-ENODEV` | 不是支援的裝置或裝置不存在 | Chip ID 不符 |
+| `-EINVAL` | 提供的設定不合理 | DT property 或參數錯誤 |
+| `-ENOMEM` | 無法配置記憶體 | 系統資源不足 |
+| `-EBUSY` | 資源已被占用 | GPIO、IRQ、MMIO 衝突 |
+| `-ETIMEDOUT` | 等不到硬體回應 | Power、clock、reset、bus |
+| `-EPROBE_DEFER` | 相依資源暫時還沒準備好 | Provider driver 尚未完成 |
+
+##### 9.5.9 Probe 成功要怎麼確認
+
+不要只靠 driver 是否印出一行 log。建議確認：
+
+```bash
+# Device 與 driver 是否綁定
+readlink -f /sys/bus/<bus>/devices/<device>/driver
+
+# 預期 subsystem interface 是否出現
+find /sys/class/hwmon -maxdepth 2 -type f -print
+
+# 是否仍在 deferred list
+cat /sys/kernel/debug/devices_deferred 2>/dev/null
+
+# 是否有 probe error
+dmesg | grep -Ei '<driver>|probe|fail|error|defer'
+```
+
+如果 driver 完成綁定，但預期的 hwmon / netdev / MTD 介面沒有出現，需確認 driver 是否真的有註冊該 subsystem、註冊過程是否被條件跳過，以及 sysfs path 是否判讀錯誤。
+
+#### 9.6 Driver 如何向 Kernel 登記自己
+
+前面已經看到 `probe()`，但 kernel 必須先知道「系統裡有這份 driver」，才可能呼叫它。
+
+Driver 向 kernel 登記自己的動作稱為 register。這裡的 register 不是硬體暫存器，而是「把 driver 加入 kernel 的 driver 清單」。
+
+可以把流程理解成：
+
+```text
+Driver 載入
+    ↓
+向某一種 bus 登記
+    ↓
+告訴 bus：
+- 我的名稱
+- 我支援哪些 device
+- Match 後要呼叫哪個 probe
+- 移除時要呼叫哪個 remove
+```
+
+##### 9.6.1 Platform Driver 的基本結構
+
+```c
+static const struct of_device_id example_of_match[] = {
+    { .compatible = "vendor,example-device" },
+    { }
+};
+MODULE_DEVICE_TABLE(of, example_of_match);
+
+static int example_probe(struct platform_device *pdev)
+{
+    return 0;
+}
+
+static void example_remove(struct platform_device *pdev)
+{
+}
+
+static struct platform_driver example_driver = {
+    .probe = example_probe,
+    .remove = example_remove,
+    .driver = {
+        .name = "example-driver",
+        .of_match_table = example_of_match,
+    },
+};
+module_platform_driver(example_driver);
+```
+
+逐項說明：
+
+- `example_of_match[]`：列出這份 driver 支援的 Device Tree `compatible`。
+- `MODULE_DEVICE_TABLE()`：將 match 資訊輸出成 module alias，協助 module 自動載入。
+- `example_probe()`：Match 成功後執行初始化。
+- `example_remove()`：Device 與 driver 分離時執行清理。
+- `struct platform_driver`：把 callbacks、名稱與 match table 整理成一份 platform driver。
+- `module_platform_driver()`：產生 driver register / unregister 所需的 module init 與 exit 程式。
+
+##### 9.6.2 Built-in Driver 也需要 Register
+
+即使 driver 編進 kernel，而不是 `.ko` module，它仍需向對應 bus register。差別只在發生時間：
+
+```text
+Built-in driver
+Kernel 開機時 register
+
+Module driver
+Module 被載入時 register
+```
+
+Register 完成後，bus 才會拿這份 driver 去和目前已有的 devices 比對。
+
+##### 9.6.3 Remove 是什麼
+
+Remove 是 device 不再由 driver 管理時的清理動作。常見情況包括：
+
+- Module 被卸載。
+- Hot-plug device 被拔除。
+- 工程師從 sysfs 執行 unbind。
+- 某些 bus 重新建立 device。
+
+Remove 需要確保：
+
+1. 不再接受新的工作。
+2. 停止 timer、workqueue 與 DMA。
+3. 關閉硬體 interrupt source。
+4. 等待正在執行的 callback 完成。
+5. 移除非 managed 的 sysfs / debugfs 內容。
+6. 將硬體留在安全狀態。
+
+若 private data 已釋放，但 IRQ 或 workqueue 仍會使用它，就可能造成 use-after-free 與 kernel oops。
+
+#### 9.7 Driver 如何從 Device Tree 取得資料
+
+Driver 不會直接解析整份 DTS 文字。Kernel 已將 DTB 解析成 device nodes，driver 再透過 kernel API 取得目前 device 的 properties 與 resources。
+
+##### 9.7.1 Property 與 Resource 的差異
+
+Property 是 Device Tree 中的一筆設定，例如：
+
+```dts
+vendor,channel-count = <8>;
+```
+
+Driver 可透過 property API 讀取它。
+
+Resource 則是需要由 kernel 管理的硬體資源，例如 MMIO、IRQ、clock、GPIO。Driver 通常使用專用 subsystem API 取得，而不是自行解析原始 cells。
+
+##### 9.7.2 讀取一般 Property
+
+DTS：
+
+```dts
+example@1e600000 {
+    compatible = "vendor,example-device";
+    vendor,channel-count = <8>;
+};
+```
+
+Driver：
+
+```c
+u32 channels;
+int ret;
+
+ret = device_property_read_u32(dev,
+                               "vendor,channel-count",
+                               &channels);
+if (ret)
+    return dev_err_probe(dev, ret,
+                         "missing channel count\n");
+```
+
+這裡：
+
+- Property 名稱必須和 binding 一致。
+- Driver 應處理 property 缺少或數值超出範圍的情況。
+- 如果 property 不是硬體必要資訊，應考慮提供合理預設值。
+
+##### 9.7.3 取得 MMIO
+
+DTS：
+
+```dts
+reg = <0x1e600000 0x1000>;
+```
+
+Driver：
+
+```c
+base = devm_platform_ioremap_resource(pdev, 0);
+if (IS_ERR(base))
+    return PTR_ERR(base);
+```
+
+Kernel 會：
+
+1. 找到第 0 組 `reg` resource。
+2. 確認範圍是否有效、是否衝突。
+3. 將 physical address 映射成 kernel 可存取的 virtual address。
+
+Driver 後續通常透過 `readl()`、`writel()` 等 MMIO API 存取，不應把 physical address 當成一般指標直接解參照。
+
+##### 9.7.4 取得 GPIO
+
+DTS：
+
+```dts
+reset-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+```
+
+Driver：
+
+```c
+reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
+if (IS_ERR(reset))
+    return dev_err_probe(dev, PTR_ERR(reset),
+                         "failed to get reset GPIO\n");
+```
+
+名稱的對應規則是：
+
+```text
+Driver 使用 "reset"
+        ↕
+DTS 使用 reset-gpios
+```
+
+Driver 使用 GPIO descriptor API 時，set / get 的通常是 logical value；`GPIO_ACTIVE_LOW` 的反相會由 GPIO framework 處理。
+
+##### 9.7.5 取得 Clock、Reset、Regulator 與 IRQ
+
+常見對應：
+
+| Driver API 想取得的資源 | DTS 常見寫法 | 意義 |
+|---|---|---|
+| Clock 名稱 `core` | `clocks` + `clock-names = "core"` | 提供裝置時脈 |
+| Reset 名稱 `core` | `resets` + `reset-names = "core"` | 控制硬體 reset |
+| Supply 名稱 `vdd` | `vdd-supply = <&regulator>` | 提供 power rail |
+| IRQ | `interrupts`、`interrupt-parent` | 硬體事件通知 |
+
+實際 property 名稱、cell 數量與順序必須查 binding，不能只看 API 名稱猜測。
+
+#### 9.8 Deferred Probe：為什麼 Driver 會說「晚點再試」
+
+Deferred probe 的意思是：
+
+> 這個 device 看起來由我支援，但我現在缺少必要資源；缺少的資源可能稍後才出現，所以不要把它視為永久失敗。
+
+Driver 以 `-EPROBE_DEFER` 表達這個狀態。
+
+##### 9.8.1 為什麼資源會晚一點出現
+
+假設 sensor 的 enable GPIO 來自 I2C GPIO expander：
+
+```text
+Sensor driver
+需要 enable GPIO
+    ↓
+GPIO expander driver
+要先 probe
+    ↓
+I2C MUX driver
+要先建立下游 bus
+    ↓
+Parent I2C controller
+要先 probe
+```
+
+Kernel 會平行與分階段初始化許多 devices，不保證 consumer 第一次 probe 時 provider 已就緒。因此 deferred probe 是正常的 dependency 處理機制。
+
+##### 9.8.2 短暫 Deferred 與長期 Deferred
+
+開機初期短暫 deferred，後來重試成功，通常不表示有問題。
+
+開機完成後仍列在 `devices_deferred`，才需要排查：
+
+```bash
+cat /sys/kernel/debug/devices_deferred
+```
 
 常見原因：
 
-- `*-supply` 指向的 regulator node 尚未註冊。
-- `clocks` / `resets` phandle 指向的 provider 沒有 probe。
-- GPIO expander 在 I2C mux 後面，mux driver 尚未 ready。
-- interrupt controller 或 parent domain 未建立。
-- pinctrl provider 尚未 ready。
-- device link / power domain dependency 未完成。
+- Provider node 被設為 `disabled`。
+- Provider driver 的 kernel config 未啟用。
+- Provider 是 module，但 module 沒進 image。
+- Phandle 指錯節點。
+- Provider 自己 probe 失敗。
+- 必要硬體實際不存在。
 
-檢查指令：
+##### 9.8.3 Driver 中如何保留 Deferred Probe
 
-```bash
-mount | grep debugfs || mount -t debugfs debugfs /sys/kernel/debug
-cat /sys/kernel/debug/devices_deferred 2>/dev/null
+不應把所有 resource error 都改成 `-EINVAL`：
 
-dmesg | grep -Ei 'defer|probe|supply|regulator|clock|clk|reset|gpio|pinctrl|irq|interrupt|power domain'
-
-cat /sys/kernel/debug/clk/clk_summary 2>/dev/null | head -200
-find /sys/class/regulator -maxdepth 2 -type l -o -type d 2>/dev/null
-cat /sys/kernel/debug/gpio 2>/dev/null
+```c
+clk = devm_clk_get(dev, NULL);
+if (IS_ERR(clk))
+    return dev_err_probe(dev, PTR_ERR(clk),
+                         "failed to get clock\n");
 ```
 
-判讀建議：
+`PTR_ERR(clk)` 若是 `-EPROBE_DEFER`，應原樣回傳，driver core 才知道需要稍後重試。
 
-- `devices_deferred` 有內容時，不要只看最後一個錯誤；需順著 dependency 找 provider。
-- 若某 device 永遠 deferred，通常是 DT phandle、kernel config、provider driver 或 probe order 有問題。
-- 若 provider 是 module，但 rootfs 尚未載入 module，built-in consumer 可能卡在 deferred。
-- 若 dependency 來自可插拔裝置，需定義 absent 時是否應 deferred、fail 或標 unavailable。
+#### 9.9 Kernel Config、Built-in 與 Module
 
-#### 9.5 Kernel config、built-in、module 與 image 整合
+Driver source 存在於 kernel tree，不代表目前產品的 kernel 有包含它。Kconfig 決定一項功能是否進入本次 build。
 
-Driver source 存在不代表 image 有啟用。BMC porting 時需確認 kernel config、module package、device tree、userspace service 四者對齊。
-
-常用檢查：
-
-```bash
-# Target 端 kernel config
-zcat /proc/config.gz | grep -Ei 'HWMON|I2C|GPIO|PINCTRL|PWM|TACH|ADC|IIO|WATCHDOG|MTD|MCTP|PLDM' 2>/dev/null
-
-# module
-lsmod
-modinfo <driver> 2>/dev/null
-find /lib/modules/$(uname -r) -name '*<driver>*' 2>/dev/null
-
-# build 端
-bitbake -e virtual/kernel | grep '^S='
-bitbake -e virtual/kernel | grep '^B='
-```
-
-設計建議：
-
-- boot-critical driver 建議 built-in，例如 boot flash、rootfs storage、UART console、watchdog 或 early reset reason。
-- 可選 sensor / debug driver 可用 module，但需確保 package 加入 image 且 service dependency 正確。
-- 若 OpenBMC service 開機早期需要某 sysfs path，driver 若是 module 需確認載入時機。
-- kernel config fragment、defconfig、Yocto recipe append 與實際 `/proc/config.gz` 需一致。
-
-#### 9.6 sysfs / debugfs / hwmon / iio / input / net 常見介面
-
-Driver probe 成功後，通常會註冊一種或多種 subsystem interface。OpenBMC service 多半讀取這些標準介面，再轉成 D-Bus object。
-
-
-| Subsystem | 常見路徑 | BMC 用途 | 常見 consumer |
-| --- | --- | --- | --- |
-| hwmon | /sys/class/hwmon/hwmonX | temperature、voltage、current、power、fan RPM | dbus-sensors、psusensor、fansensor |
-| IIO | /sys/bus/iio/devices/iio:deviceX | ADC raw value、scale、channel | adcsensor、iio-hwmon |
-| GPIO | /dev/gpiochipX、gpioinfo | presence、reset、power enable、fault | gpio-monitor、Entity Manager、platform daemon |
-| MTD | /proc/mtd、/dev/mtdX | flash partition、update、rwfs | update service、storage scripts |
-| netdev | /sys/class/net、ip link | BMC network、NC-SI、RGMII | networkd、bmcweb、SSH |
-| watchdog | /dev/watchdog、/sys/class/watchdog | BMC recovery | systemd、watchdog daemon |
-| input | /dev/input/eventX | buttons、GPIO keys | button handler、power control |
-| rtc | /sys/class/rtc/rtcX | timekeeping | systemd-timesyncd、time service |
-| debugfs | /sys/kernel/debug | pinctrl、clk、gpio、tracing | debug only |
-
-
-檢查指令：
-
-```bash
-find /sys/class/hwmon -maxdepth 2 -type f -print | sort
-find /sys/bus/iio/devices -maxdepth 2 -type f -print 2>/dev/null | sort
-gpiodetect 2>/dev/null
-gpioinfo 2>/dev/null
-cat /proc/mtd 2>/dev/null
-ip link
-find /sys/class/watchdog -maxdepth 2 -type f -print 2>/dev/null
-```
-
-#### 9.7 OpenBMC service 與 kernel interface 銜接
-
-OpenBMC service 多數不是直接接硬體，而是讀 kernel 暴露的 interface。排查時需先確認 kernel 層，再確認 userspace。
+##### 9.9.1 三種常見狀態
 
 ```text
-Kernel driver / subsystem
-    ↓
-sysfs / device node / netlink / D-Bus provider
-    ↓
-OpenBMC daemon
-    ↓
-D-Bus object / property / signal
-    ↓
-Redfish / IPMI / policy / event
+CONFIG_FOO=y
+Driver 直接編入 kernel，稱為 built-in
+
+CONFIG_FOO=m
+Driver 編成 foo.ko，稱為 module
+
+# CONFIG_FOO is not set
+這次 kernel 沒有這個 driver
 ```
 
-常見對照：
+##### 9.9.2 何時使用 Built-in
 
+通常適合開機早期不可缺少的功能：
 
-| Kernel interface | OpenBMC service | D-Bus 目標 | 常見問題 |
-| --- | --- | --- | --- |
-| hwmon | dbus-sensors、psusensor、hwmontempsensor | /xyz/openbmc_project/sensors/... | hwmon label / scale / config 不匹配 |
-| IIO / iio-hwmon | adcsensor | voltage sensor | ADC channel / scale 不對 |
-| GPIO | gpio presence、power control、intrusion | inventory / state / event | line name / polarity / busy |
-| MTD / UBI | phosphor-bmc-code-mgmt、update scripts | software inventory | partition name 不一致 |
-| watchdog | systemd watchdog、platform watchdog | state / event | reset 範圍與 timeout 不明 |
-| netdev | systemd-networkd、phosphor-network | network config / Redfish EthernetInterface | link / MAC / DHCP / NC-SI |
+- Boot flash。
+- Root filesystem 所在 storage。
+- UART console。
+- Clock、reset、pinctrl 等基礎 provider。
+- Rootfs 依賴的 I2C / SPI / MMC controller。
 
+若 rootfs 要靠某 driver 才能讀取，那份 driver 不能只放在 rootfs 裡的 module，否則 kernel 會陷入「要先讀 rootfs 才拿得到讀 rootfs 的 driver」。
 
-#### 9.8 Driver 開發與修改流程
+##### 9.9.3 Module 是什麼
 
-BMC 專案常需要修改 kernel driver 或新增 platform quirk。建議流程：
-
-1. 先確認是否已有 upstream driver / binding。
-2. 在第 8 章補齊 DTS node 與 binding 檢查。
-3. 在 kernel tree 以最小 patch 修改 driver。
-4. 使用 Yocto `devtool modify virtual/kernel` 或 kernel recipe patch 管理。
-5. 只修改必要差異，避免把 board policy 寫死在通用 driver。
-6. 建立 target 驗證指令、dmesg pattern、sysfs output 與 D-Bus 對照。
-7. 若修改會影響共用 driver，需回查其他 machine / board。
-
-Patch 檢查重點：
-
-- 錯誤路徑是否釋放 resource。
-- 是否使用 managed resource，例如 devm_* API，降低 remove / error path 風險。
-- probe fail 是永久錯誤還是 `-EPROBE_DEFER`。
-- 是否支援 module unload / reprobe，至少不造成 kernel oops。
-- sysfs 屬性單位是否符合 kernel subsystem 慣例。
-- 是否把 board-specific policy 留在 DTS / userspace，而不是硬寫在 driver。
-- log level 是否合理，量產版不應大量 spam。
-
-#### 9.9 Dynamic debug、tracepoint 與 ftrace
-
-當 dmesg 資訊不夠時，可用 dynamic debug 或 ftrace 追 probe / driver 行為。使用前需確認 kernel config 是否啟用。
+Module 是可在 kernel 執行期間載入的 `.ko` 檔。載入後，它會執行 register；卸載時則 unregister。
 
 ```bash
-# dynamic debug
+modprobe <module>
+modprobe -r <module>
+lsmod
+modinfo <module>
+```
+
+Module 適合非開機必要或選配功能，但需同時確認：
+
+- `.ko` 有建出來。
+- Module package 有放入 image。
+- Module 相依關係完整。
+- Alias 能讓 module 自動載入，或系統有明確載入設定。
+- OpenBMC service 不會早於 module 啟動。
+
+##### 9.9.4 Target 與 Build 端檢查
+
+Target：
+
+```bash
+zcat /proc/config.gz | grep CONFIG_<OPTION>
+lsmod
+modinfo <module>
+find /lib/modules/$(uname -r) -name '*<module>*'
+```
+
+Build 端：
+
+```bash
+bitbake -e virtual/kernel | grep -E '^(S|B|WORKDIR)='
+bitbake -c configure -f virtual/kernel
+find tmp/work -path '*linux*' -name '.config' -print
+```
+
+要確認最終 `.config`，不能只看到 config fragment 就假設已成功套用。
+
+#### 9.10 Driver 如何把資料交給 Userspace
+
+Driver 完成硬體初始化後，通常不會要求每個 userspace service 都使用 driver 私有格式。它會註冊到適合的 kernel subsystem，取得共同介面。
+
+##### 9.10.1 Sysfs 是什麼
+
+Sysfs 是 kernel 將 devices、drivers、classes 與簡單 attributes 顯示成檔案樹的介面，通常掛載於 `/sys`。
+
+例如：
+
+```text
+/sys/bus/i2c/devices/5-0048/
+```
+
+從 I2C bus 角度表示這個 device。
+
+```text
+/sys/class/hwmon/hwmon2/
+```
+
+從硬體監控功能角度表示同一 device 提供的 hwmon 介面。
+
+Sysfs 檔案看起來像一般檔案，但內容通常是 kernel callback 即時產生或接收，不是儲存在磁碟上的普通檔案。
+
+##### 9.10.2 hwmon 是什麼
+
+Hwmon 是 hardware monitoring subsystem，統一溫度、電壓、電流、功率與 fan speed 的 naming 與單位。
+
+常見 attributes：
+
+```text
+temp1_input
+in1_input
+curr1_input
+power1_input
+fan1_input
+pwm1
+```
+
+`hwmonX` 的 X 可能因 probe 順序改變，OpenBMC service 應搭配 `name`、label 與 device path 找到正確裝置，不應只寫死 `hwmon2`。
+
+##### 9.10.3 IIO 是什麼
+
+IIO 是 Industrial I/O subsystem，常用於 ADC、DAC 與各類量測 channels。它可提供 raw value、scale、offset 等資訊。
+
+```text
+/sys/bus/iio/devices/iio:deviceX/
+```
+
+若 ADC 讀到 raw value，但最終電壓錯誤，需繼續確認：
+
+- IIO scale。
+- 電路分壓比例。
+- OpenBMC sensor 設定。
+- 單位轉換。
+
+##### 9.10.4 Device Node 是什麼
+
+有些 kernel interface 透過 `/dev` 提供：
+
+```text
+/dev/gpiochip0
+/dev/watchdog0
+/dev/mtd0
+/dev/input/event0
+```
+
+Userspace 透過 `read()`、`write()`、`ioctl()` 或 subsystem library 使用它。存取可能受到檔案權限、service user、Linux capability 與裝置使用狀態限制。
+
+##### 9.10.5 Debugfs 是什麼
+
+Debugfs 是 kernel 除錯介面，通常掛載於 `/sys/kernel/debug`。它提供大量內部狀態，但不保證穩定 ABI。
+
+常見項目：
+
+- `devices_deferred`
+- `clk/clk_summary`
+- `pinctrl/`
+- Dynamic debug control
+- Ftrace
+
+正式 OpenBMC service 不應把 debugfs 當成長期穩定介面。
+
+##### 9.10.6 常見 Subsystems 對照
+
+| Subsystem | 它統一什麼 | Userspace 入口 |
+|---|---|---|
+| hwmon | 溫度、電壓、電流、功率、RPM | `/sys/class/hwmon/` |
+| IIO | ADC、DAC、量測 channels | `/sys/bus/iio/devices/` |
+| GPIO | GPIO chips 與 lines | `/dev/gpiochipX` |
+| MTD | Raw flash 與 partitions | `/dev/mtdX`、`/proc/mtd` |
+| Net | Network interfaces | `ip link`、`/sys/class/net/` |
+| Watchdog | Hardware watchdog | `/dev/watchdogX` |
+| Input | Buttons、keys、switches | `/dev/input/eventX` |
+| RTC | Real-time clock | `/sys/class/rtc/` |
+
+#### 9.11 OpenBMC 如何使用 Kernel Interface
+
+OpenBMC service 通常位於 kernel 與 Redfish / IPMI 之間。它會讀取 kernel interface、套用平台設定，再建立 D-Bus objects。
+
+```text
+Kernel driver
+    ↓
+Kernel subsystem interface
+    ↓
+OpenBMC service
+    ↓
+D-Bus object
+    ↓
+Redfish / IPMI
+```
+
+##### 9.11.1 以溫度 Sensor 為例
+
+```text
+TMP75 driver
+    ↓
+/sys/class/hwmon/.../temp1_input
+    ↓
+OpenBMC sensor service
+    ↓
+/xyz/openbmc_project/sensors/temperature/...
+    ↓
+Redfish Thermal Sensor
+```
+
+每一層的責任：
+
+- Driver：正確讀取 TMP75。
+- Hwmon：用規定名稱與單位提供溫度。
+- Sensor 設定：決定名稱、threshold、power-state 條件等平台內容。
+- OpenBMC service：週期性讀取、更新 D-Bus、產生 threshold events。
+- Redfish / IPMI：向外提供管理介面。
+
+##### 9.11.2 為什麼 Sysfs 有值，D-Bus 還是可能沒有
+
+這表示 kernel 前半段大致可用，但 userspace 尚有其他條件：
+
+- Entity Manager 或 sensor config 沒匹配到裝置。
+- Hwmon label / channel 與設定不同。
+- Service 尚未啟動或反覆失敗。
+- Power-state gating 暫時不建立 sensor。
+- Service user 無權存取 device node。
+- D-Bus name 或 object path 與上層期待不同。
+
+此時不宜繼續修改 driver，應先看 service journal、設定檔與 D-Bus tree。
+
+##### 9.11.3 分層排查順序
+
+```text
+1. Running DTB 有 node 嗎？
+2. Kernel 建立 device 了嗎？
+3. Driver 綁定並 probe 成功了嗎？
+4. Subsystem interface 有正確資料嗎？
+5. OpenBMC service 有讀到嗎？
+6. D-Bus object 有建立嗎？
+7. Redfish / IPMI 有映射嗎？
+```
+
+這個順序可避免看到 Redfish 缺資料，就同時修改 DTS、driver、JSON 與 Web service。
+
+#### 9.12 如何判斷該改 DTS、Driver 或 OpenBMC 設定
+
+| 現象或需求 | 優先檢查位置 | 原因 |
+|---|---|---|
+| I2C address 寫錯 | DTS | 屬於板級接線資訊 |
+| GPIO polarity 寫錯 | DTS / schematic | 屬於硬體描述 |
+| Driver 不認識新 chip ID | Driver | 屬於硬體控制支援 |
+| 需要新增 DT property | Binding + driver + DTS | 三者必須同步 |
+| Sensor threshold 不同 | OpenBMC sensor config | 依產品需求決定 |
+| Fan curve 不同 | Fan / thermal service | 屬於控制規則 |
+| Service 太早啟動 | systemd dependencies | 屬於啟動順序 |
+| Kernel config 沒開 | Kernel fragment / recipe | Driver 未進入 build |
+
+判斷重點：
+
+```text
+固定硬體接線 → DTS
+硬體控制方法 → Driver
+共同介面 → Kernel subsystem
+平台名稱、threshold、控制規則 → OpenBMC userspace
+```
+
+#### 9.13 Driver 開發與 Yocto 流程
+
+##### 9.13.1 開始修改前
+
+1. 確認 kernel tree 是否已有對應 driver。
+2. 閱讀 binding、datasheet 與 schematic。
+3. 找同 subsystem 中相似的 driver。
+4. 確認目前問題位於 device 建立、match、probe 還是 userspace。
+5. 先保存未修改前的 dmesg、sysfs 與 D-Bus 狀態。
+
+##### 9.13.2 使用 Devtool
+
+```bash
+bitbake -e virtual/kernel | grep -E '^(PN|FILE|S|B)='
+devtool modify virtual/kernel
+```
+
+在 workspace 修改並建置：
+
+```bash
+devtool build virtual/kernel
+```
+
+收回平台 layer 前，確認實際 kernel recipe 與專案流程：
+
+```bash
+devtool finish virtual/kernel ../meta-my-platform
+```
+
+部分 branch 可能需使用實際 recipe 名稱，應以 `bitbake -e virtual/kernel` 與 `devtool --help` 為準。
+
+##### 9.13.3 驗證順序
+
+1. Driver 可編譯。
+2. Kernel / module 可部署。
+3. Device 與 driver 能綁定。
+4. Probe log 無錯誤。
+5. Subsystem interface 正確。
+6. 實體訊號與數值正確。
+7. OpenBMC service 與 D-Bus 正確。
+8. BMC reboot、AC cycle 與 service restart 正常。
+9. 其他共用此 driver 的 boards 完成回歸。
+
+##### 9.13.4 Patch Review 重點
+
+- Error code 是否保留，尤其 `-EPROBE_DEFER`。
+- 必要與 optional resources 是否區分。
+- Error path 是否完整。
+- Remove 前是否停止 IRQ、timer、workqueue、DMA。
+- Register access 是否使用適當 API 與 locking。
+- Sysfs 單位是否符合 subsystem ABI。
+- Board-specific 規則是否誤寫進通用 driver。
+- Log 是否會在每次 polling 時持續刷出。
+- Suspend、resume、shutdown、reboot 行為是否安全。
+
+#### 9.14 Dynamic Debug 與 Ftrace 是什麼
+
+一般 `dmesg` 只顯示 driver 主動輸出的訊息。若資訊不夠，可使用 kernel 提供的除錯機制。
+
+##### 9.14.1 Dynamic Debug
+
+Dynamic debug 可在不重編 driver 的情況下，開啟原始碼中的 `pr_debug()` 或 `dev_dbg()` 訊息。
+
+```bash
 mount | grep debugfs || mount -t debugfs debugfs /sys/kernel/debug
-cat /sys/kernel/debug/dynamic_debug/control 2>/dev/null | grep <driver>
 
-echo 'file drivers/hwmon/<driver>.c +p' > /sys/kernel/debug/dynamic_debug/control
-# 或依 function
-echo 'func <function_name> +p' > /sys/kernel/debug/dynamic_debug/control
+grep '<driver>' /sys/kernel/debug/dynamic_debug/control
 
-# function trace，請謹慎使用，避免大量輸出
+echo 'file drivers/hwmon/<driver>.c +p' \
+    > /sys/kernel/debug/dynamic_debug/control
+```
+
+完成後關閉：
+
+```bash
+echo 'file drivers/hwmon/<driver>.c -p' \
+    > /sys/kernel/debug/dynamic_debug/control
+```
+
+若 driver 原始碼沒有 `pr_debug()` / `dev_dbg()` callsites，開啟 dynamic debug 也不會產生額外內容。
+
+##### 9.14.2 Ftrace
+
+Ftrace 可記錄 kernel functions 的呼叫。它的用途不是「顯示更多 printk」，而是觀察函式是否被呼叫、呼叫順序與執行時間。
+
+```bash
 cd /sys/kernel/debug/tracing
+
 echo 0 > tracing_on
-echo function > current_tracer
+echo function_graph > current_tracer
 echo '<function_name>' > set_ftrace_filter
 echo 1 > tracing_on
 sleep 3
@@ -274,160 +1243,268 @@ echo 0 > tracing_on
 cat trace > /tmp/ftrace-driver.txt
 ```
 
-注意事項：
+清理設定：
 
-- tracing 可能影響 timing，排查 race / timeout 時需註明是否啟用。
-- dynamic debug 設定通常重開機後消失，debug package 需保存設定與 log。
-- 不要在量產環境長時間開啟大量 trace。
+```bash
+echo nop > current_tracer
+: > set_ftrace_filter
+```
 
-#### 9.10 Kernel panic、oops、lockdep 與 crash 排查
+Tracing 本身會改變 timing。應限縮 functions 與時間，避免在量產環境長時間開啟。
 
-Kernel issue 可能是 driver probe、interrupt handler、workqueue、runtime PM、sysfs store callback 或 remove path 造成。需要保存完整 panic / oops 前後文。
+#### 9.15 Kernel Oops、Panic 與 Race 是什麼
 
-建議保存：
+##### 9.15.1 Oops 與 Panic
+
+Kernel oops 表示 kernel 偵測到嚴重錯誤並輸出診斷資訊；系統有時仍能繼續執行，但狀態可能不再可靠。
+
+Kernel panic 表示 kernel 無法安全繼續，通常會停止或依設定重新啟動。
+
+##### 9.15.2 Race Condition
+
+Race condition 是結果取決於兩個執行流程先後順序的問題。例如 remove 正在釋放 private data，但 workqueue 同時仍使用它。
+
+常見 driver 問題：
+
+| 現象 | 白話說明 | 常見方向 |
+|---|---|---|
+| Null pointer | 使用尚未取得或已清空的指標 | Optional resource、error path |
+| Use-after-free | 資料釋放後仍被 callback 使用 | IRQ、timer、workqueue、remove |
+| IRQ storm | Interrupt 持續高速觸發 | Trigger / status clear 錯誤 |
+| Sleeping in atomic | 不可睡眠的 context 呼叫會睡眠的 API | IRQ、spinlock |
+| Lockdep warning | Lock 取得順序可能造成 deadlock | Locking design |
+| Hung task | Task 長時間無法前進 | I/O timeout、mutex、workqueue |
+
+##### 9.15.3 需要保存的資料
 
 ```bash
 dmesg -T > /tmp/dmesg.txt
-journalctl -k -b --no-pager > /tmp/journal-kernel-current.txt
-journalctl -k -b -1 --no-pager > /tmp/journal-kernel-previous.txt 2>&1
-cat /proc/modules > /tmp/proc-modules.txt
-cat /proc/interrupts > /tmp/proc-interrupts.txt
-cat /proc/iomem > /tmp/proc-iomem.txt
-cat /proc/slabinfo > /tmp/proc-slabinfo.txt 2>/dev/null
+journalctl -k -b --no-pager > /tmp/journal-current.txt
+journalctl -k -b -1 --no-pager > /tmp/journal-previous.txt 2>&1
+cat /proc/modules > /tmp/modules.txt
+cat /proc/interrupts > /tmp/interrupts.txt
 ```
 
-排查方向：
+符號分析還需要：kernel commit、config、未 strip 的 `vmlinux`、modules、toolchain 與完整 oops 前後文。
 
-- Null pointer dereference：probe error path / optional resource 未檢查。
-- Use-after-free：remove / hotplug / module unload / workqueue 競爭。
-- IRQ storm：interrupt trigger type、status clear、shared IRQ。
-- Sleeping in atomic：IRQ handler 或 spinlock 內呼叫 sleep API。
-- Lockdep warning：driver lock order 或 subsystem callback 互相等待。
-- Kernel panic after rootfs mount：driver 註冊 userspace 可見介面後被 service 觸發。
+#### 9.16 Target 端完整排查流程
 
-#### 9.11 Target 端 kernel driver debug log 收集
+##### 9.16.1 確認 Running DTB
 
 ```bash
-mkdir -p /tmp/kernel-driver-debug
-cat /etc/os-release > /tmp/kernel-driver-debug/os-release.txt
-uname -a > /tmp/kernel-driver-debug/uname.txt
-cat /proc/cmdline > /tmp/kernel-driver-debug/proc-cmdline.txt
-zcat /proc/config.gz > /tmp/kernel-driver-debug/proc-config.txt 2>&1
-
-dmesg -T > /tmp/kernel-driver-debug/dmesg.txt
-journalctl -k -b --no-pager > /tmp/kernel-driver-debug/journal-kernel-current.txt
-journalctl -k -b -1 --no-pager > /tmp/kernel-driver-debug/journal-kernel-previous.txt 2>&1
-journalctl -b --no-pager > /tmp/kernel-driver-debug/journal-current.txt
-systemctl --failed > /tmp/kernel-driver-debug/systemctl-failed.txt 2>&1
-
-# bus / devices
-find /sys/bus/platform/devices -maxdepth 1 -print > /tmp/kernel-driver-debug/platform-devices.txt 2>&1
-find /sys/bus/i2c/devices -maxdepth 2 -print > /tmp/kernel-driver-debug/i2c-devices.txt 2>&1
-find /sys/bus/spi/devices -maxdepth 2 -print > /tmp/kernel-driver-debug/spi-devices.txt 2>&1
-find /sys/class/hwmon -maxdepth 3 -type f -print > /tmp/kernel-driver-debug/hwmon-files.txt 2>&1
-find /sys/bus/iio/devices -maxdepth 3 -type f -print > /tmp/kernel-driver-debug/iio-files.txt 2>&1
-
-# debugfs
-mount | grep debugfs || mount -t debugfs debugfs /sys/kernel/debug
-cat /sys/kernel/debug/devices_deferred > /tmp/kernel-driver-debug/devices-deferred.txt 2>&1
-cat /sys/kernel/debug/gpio > /tmp/kernel-driver-debug/debug-gpio.txt 2>&1
-cat /sys/kernel/debug/clk/clk_summary > /tmp/kernel-driver-debug/clk-summary.txt 2>&1
-find /sys/kernel/debug/pinctrl -maxdepth 3 -type f -print > /tmp/kernel-driver-debug/pinctrl-files.txt 2>&1
-
-# system state
-cat /proc/interrupts > /tmp/kernel-driver-debug/proc-interrupts.txt
-cat /proc/iomem > /tmp/kernel-driver-debug/proc-iomem.txt
-cat /proc/modules > /tmp/kernel-driver-debug/proc-modules.txt
-lsmod > /tmp/kernel-driver-debug/lsmod.txt 2>&1
-
-tar czf /tmp/kernel-driver-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp kernel-driver-debug
+tr '\0' '\n' < /proc/device-tree/compatible
+cp /sys/firmware/fdt /tmp/running.dtb
 ```
 
-#### 9.12 常見問題與排查入口
+確認實際 node、compatible、address 與 resources，不只看 source DTS。
 
+##### 9.16.2 確認 Driver 有進 Kernel
 
-| 現象 | 可能方向 | 第一輪檢查 |
-| --- | --- | --- |
-| driver 完全沒有 probe log | device 未建立、compatible 不匹配、kernel config 未開、module 未載入 | DTS、/sys/bus、dmesg、/proc/config.gz |
-| probe 回傳 -EPROBE_DEFER | clock / regulator / reset / GPIO / pinctrl provider 未 ready | devices_deferred、dmesg、clk / regulator / gpio |
-| I2C driver 沒綁定 | address 錯、DT node 缺、id_table 不匹配、device 已被其他 driver 綁定 | /sys/bus/i2c/devices、driver symlink、i2cdetect |
-| hwmonX 每次不同 | hwmon index 動態分配 | 用 name / label / device path，不要寫死 hwmonX |
-| sysfs 有值但 D-Bus 沒值 | OpenBMC config / service / label / power state gating 問題 | journal、busctl、Entity Manager config |
-| GPIO busy | GPIO hog、driver consumer、另一個 daemon 已 request | gpioinfo consumer、debugfs gpio |
-| IRQ storm | trigger type 錯、status 未 clear、level interrupt 仍 asserted | /proc/interrupts、scope、driver log |
-| network link 不起 | PHY driver、MDIO、reset、clock、phy-mode | dmesg、ethtool、MDIO sysfs、scope |
-| watchdog 非預期 reset | timeout 太短、feed service fail、reset target 不明 | journal previous boot、reset reason、watchdog sysfs |
-| kernel oops | driver bug、error path、race、IRQ / workqueue 問題 | 完整 oops log、symbol、kernel commit |
+```bash
+zcat /proc/config.gz | grep CONFIG_<OPTION>
+modinfo <module> 2>/dev/null
+find /lib/modules/$(uname -r) -name '*<module>*' 2>/dev/null
+```
 
+##### 9.16.3 確認 Device 已建立
 
-#### 9.13 Bring-up 建議流程
+```bash
+find /sys/bus/platform/devices -maxdepth 1 -print
+find /sys/bus/i2c/devices -maxdepth 1 -print
+find /sys/bus/spi/devices -maxdepth 1 -print
+```
 
-- 確認 kernel config 與 driver 是否 built-in / module。
-- 確認 Device Tree node、compatible、reg、interrupt、clock、reset、GPIO、supply 與 binding 一致。
-- 開機後先看 dmesg，再看 `/sys/bus/*/devices` 是否出現 device。
-- 確認 driver symlink 是否建立，並保存 probe log。
-- 檢查 `devices_deferred`，逐項解 dependency。
-- 確認 subsystem interface 是否出現：hwmon、iio、gpiochip、mtd、watchdog、netdev。
-- 再檢查 OpenBMC service 是否讀到對應 sysfs / device node。
-- 建立 kernel interface → D-Bus object → Redfish / IPMI 的對照表。
-- 做 service restart、BMC reboot、AC cycle、host power transition、hot-plug、fault injection。
-- 保存 kernel-driver-debug log、DTS / kernel commit、image version 與實測結果。
+Device 不存在時，先回查 parent controller、DT node、bus enumeration，而不是先修改 probe。
 
-#### 9.14 當前平台 Kernel Driver 實測表
+##### 9.16.4 確認 Driver 已綁定
 
+```bash
+readlink -f /sys/bus/<bus>/devices/<device>/driver
+cat /sys/bus/<bus>/devices/<device>/modalias
+```
+
+##### 9.16.5 確認 Probe 與 Dependencies
+
+```bash
+dmesg | grep -Ei '<driver>|<device>|probe|defer|fail|error'
+cat /sys/kernel/debug/devices_deferred 2>/dev/null
+```
+
+##### 9.16.6 確認 Subsystem Interface
+
+```bash
+find /sys/class/hwmon -maxdepth 2 -type f -print | sort
+find /sys/bus/iio/devices -maxdepth 2 -type f -print 2>/dev/null | sort
+gpioinfo 2>/dev/null
+cat /proc/mtd 2>/dev/null
+ip link
+find /sys/class/watchdog -maxdepth 2 -type f -print 2>/dev/null
+```
+
+##### 9.16.7 確認 OpenBMC Service 與 D-Bus
+
+```bash
+systemctl --failed
+journalctl -b --no-pager | grep -Ei '<service>|sensor|entity|inventory'
+busctl tree
+```
+
+#### 9.17 常見現象如何判讀
+
+| 現象 | 流程大約停在哪裡 | 優先檢查 |
+|---|---|---|
+| `/sys/bus/.../devices` 沒有 device | Device 建立以前 | Running DTB、parent controller |
+| Device 有但沒有 `driver` symlink | Match 或 probe | Compatible、module、dmesg |
+| 長期 deferred | Probe 缺 provider | `devices_deferred`、provider config |
+| Driver 綁定但沒有 hwmon | Subsystem 註冊 | Driver code、probe condition |
+| Hwmon 有值但 D-Bus 沒值 | OpenBMC service | JSON、label、journal、power state |
+| GPIO busy | Resource 已被其他 consumer 使用 | `gpioinfo`、hog、其他 driver |
+| IRQ count 不增加 | Interrupt 到不了 driver | Pinctrl、IRQ type、硬體波形 |
+| IRQ count 快速增加 | Interrupt 未清或 type 錯 | Status clear、level signal |
+| Network device 有但 link down | MAC 後半段 | MDIO、PHY、reset、clock、NC-SI |
+| Watchdog reset | Feed 或系統執行卡住 | Previous boot journal、reset reason |
+| Kernel oops | Driver 存取非法資料 | 完整 oops、symbols、race |
+
+#### 9.18 Kernel Driver Debug Log 收集
+
+以下腳本以讀取狀態為主，不主動 unbind driver 或改寫硬體：
+
+```bash
+#!/bin/sh
+
+OUT=/tmp/kernel-driver-debug
+mkdir -p "$OUT"
+
+cat /etc/os-release > "$OUT/os-release.txt" 2>&1
+uname -a > "$OUT/uname.txt"
+cat /proc/cmdline > "$OUT/proc-cmdline.txt"
+zcat /proc/config.gz > "$OUT/proc-config.txt" 2>&1
+
+dmesg -T > "$OUT/dmesg.txt"
+journalctl -k -b --no-pager > "$OUT/journal-kernel-current.txt" 2>&1
+journalctl -k -b -1 --no-pager > "$OUT/journal-kernel-previous.txt" 2>&1
+journalctl -b --no-pager > "$OUT/journal-current.txt" 2>&1
+systemctl --failed > "$OUT/systemctl-failed.txt" 2>&1
+
+find /sys/bus/platform/devices -maxdepth 1 -print > "$OUT/platform.txt" 2>&1
+find /sys/bus/i2c/devices -maxdepth 2 -print > "$OUT/i2c.txt" 2>&1
+find /sys/bus/spi/devices -maxdepth 2 -print > "$OUT/spi.txt" 2>&1
+find /sys/class/hwmon -maxdepth 3 -type f -print > "$OUT/hwmon.txt" 2>&1
+find /sys/bus/iio/devices -maxdepth 3 -type f -print > "$OUT/iio.txt" 2>&1
+
+mount | grep debugfs >/dev/null 2>&1 || \
+    mount -t debugfs debugfs /sys/kernel/debug
+
+cat /sys/kernel/debug/devices_deferred > "$OUT/deferred.txt" 2>&1
+cat /sys/kernel/debug/gpio > "$OUT/gpio.txt" 2>&1
+cat /sys/kernel/debug/clk/clk_summary > "$OUT/clocks.txt" 2>&1
+find /sys/kernel/debug/pinctrl -maxdepth 3 -type f -print > "$OUT/pinctrl.txt" 2>&1
+
+cat /proc/interrupts > "$OUT/interrupts.txt"
+cat /proc/iomem > "$OUT/iomem.txt"
+cat /proc/modules > "$OUT/modules.txt"
+lsmod > "$OUT/lsmod.txt" 2>&1
+
+tar czf "/tmp/kernel-driver-debug-$(date +%Y%m%d-%H%M%S).tar.gz" \
+    -C /tmp kernel-driver-debug
+```
+
+執行前應確認儲存空間與專案資料管理要求；journal、MAC address、裝置名稱等內容可能包含平台資訊。
+
+#### 9.19 建議 Bring-up 順序
+
+1. 確認 running DTB。
+2. 確認 kernel config。
+3. 確認 parent controller。
+4. 確認 device 已建立。
+5. 確認 driver 已 register 並完成 match。
+6. 確認 probe 成功。
+7. 清查 deferred probes。
+8. 確認 subsystem interface 與實際數值。
+9. 再檢查 OpenBMC service。
+10. 確認 D-Bus、Redfish、IPMI。
+11. 測試 service restart、BMC reboot、AC cycle、host state transition。
+12. 保存 DTS、kernel、image 版本與 log。
+
+#### 9.20 平台實測紀錄表
 
 | 項目 | 指令 / 來源 | 實測值 | 備註 |
-| --- | --- | --- | --- |
-| Kernel version | uname -a | [待填] | 需對應 kernel commit |
-| Kernel config | zcat /proc/config.gz | [待填] | 關鍵 driver config |
-| Boot driver log | dmesg -T | [待填] | 保存完整 log |
-| Deferred probe | /sys/kernel/debug/devices_deferred | [待填] | 需逐項說明原因 |
-| Platform devices | /sys/bus/platform/devices | [待填] | SoC controller |
-| I2C devices | /sys/bus/i2c/devices | [待填] | sensor / FRU / PMBus |
-| SPI devices | /sys/bus/spi/devices | [待填] | flash / TPM |
-| hwmon mapping | /sys/class/hwmon | [待填] | 不要只記 hwmonX |
-| IIO mapping | /sys/bus/iio/devices | [待填] | ADC channel |
-| GPIO chips | gpioinfo | [待填] | line name / consumer |
-| Clock summary | clk_summary | [待填] | key controller clock |
-| Regulator state | /sys/class/regulator | [待填] | supply dependency |
-| Watchdog | /sys/class/watchdog | [待填] | timeout / nowayout |
-| Network driver | ip link / ethtool | [待填] | MAC / PHY / NC-SI |
-| OpenBMC consumer | busctl / journal | [待填] | D-Bus object 對照 |
+|---|---|---|---|
+| Kernel version | `uname -a` | [待填] | 對應 commit |
+| Kernel config | `/proc/config.gz` | [待填] | Driver 為 y / m / disabled |
+| Running DTB | `/sys/firmware/fdt` | [待填] | SHA-256 |
+| Device path | `/sys/bus/*/devices` | [待填] | Bus 與 device name |
+| Bound driver | `driver` symlink | [待填] | Driver name |
+| Modalias | Device `modalias` | [待填] | Module match |
+| Probe log | `dmesg -T` | [待填] | 完整錯誤碼 |
+| Deferred probe | `devices_deferred` | [待填] | Provider / owner |
+| Subsystem | hwmon / IIO / net / MTD | [待填] | Interface path |
+| GPIO | `gpioinfo` | [待填] | Line / consumer |
+| IRQ | `/proc/interrupts` | [待填] | Idle / event count |
+| Clock | `clk_summary` | [待填] | Rate / enable count |
+| OpenBMC service | systemd / journal | [待填] | Service state |
+| D-Bus object | `busctl tree` | [待填] | Object / interface |
+| Redfish / IPMI | API / command | [待填] | 與 D-Bus 對照 |
 
+#### 9.21 驗收 Checklist
 
-#### 9.15 回查結果
+基本流程：
 
-本章已回查前後文並補齊下列銜接點：
+- [ ] 能說明 device、driver、bus、subsystem、class、probe 的差異。
+- [ ] Running DTB 包含預期 node。
+- [ ] Kernel config 包含 driver。
+- [ ] Device 出現在正確 bus。
+- [ ] Driver 已 register、match 並成功 probe。
+- [ ] Device 的 `driver` symlink 正確。
+- [ ] Deferred probe 已清空或有明確原因。
 
-- 第 4 章 Reset / Clock / Power Domain 已描述 dependency，本章補上 probe、deferred probe 與 resource provider 排查。
-- 第 5 章周邊匯流排已描述各 bus，本章補上 platform / I2C / SPI / PCI / MDIO driver match 與 sysfs 對照。
-- 第 8 章 Device Tree 已描述 DTS，本章補上 DT node 如何進入 bus match / probe / subsystem interface。
-- 第 10 章 I2C / PMBus 會依本章的 I2C driver、hwmon、deferred probe 方法進一步展開。
-- 第 12 章 Sensor 抽象層會使用本章的 hwmon / IIO / GPIO interface 轉成 D-Bus sensor。
-- 第 16 章 Logging / Event / Telemetry 可引用本章 panic、oops、driver log 與 kernel-driver-debug 套件。
-- 第 27～28 章 Debug Methodology / Toolkit 可引用本章的 dynamic debug、ftrace、debugfs 與 log package。
+資源與介面：
 
-#### 9.16 驗收 Checklist
+- [ ] MMIO、IRQ、clock、reset、GPIO、regulator 與 binding / schematic 一致。
+- [ ] Probe error code 與 resource failure 已釐清。
+- [ ] Subsystem interface 已出現。
+- [ ] Hwmon / IIO 單位與數值合理。
+- [ ] 沒有寫死會變動的 `hwmonX` / `iio:deviceX`。
+- [ ] 正式 service 不依賴 debugfs。
 
--  Kernel config、driver built-in / module、Yocto recipe 與 image package 已確認。
--  DTS node 與 driver binding、compatible、resource、interrupt、clock、reset、GPIO、supply 一致。
--  Target 上 device 已出現在正確 bus，例如 platform、i2c、spi、pci、mdio。
--  Driver symlink 已建立，probe log 清楚，沒有未解釋的 probe fail。
--  `/sys/kernel/debug/devices_deferred` 為空，或每一項都有合理原因與追蹤 owner。
--  hwmon / IIO / GPIO / MTD / watchdog / netdev 等 subsystem interface 已出現且數值合理。
--  OpenBMC service 能讀取 kernel interface 並建立 D-Bus object。
--  GPIO consumer、IRQ、pinctrl、clock、regulator 狀態與設計表一致。
--  Service restart、BMC reboot、AC cycle、host power transition 後 driver 狀態穩定。
--  Fault injection / hot-plug / timeout 測試已保存 kernel log 與 D-Bus / Redfish 對照。
--  dynamic debug / ftrace 使用方式已驗證，且不會長時間留在量產設定。
--  kernel oops / panic / watchdog reset 能收集到 previous boot journal、reset reason 與版本資訊。
--  kernel-driver-debug log 套件、DTS / kernel commit、image version 已保存。
+OpenBMC：
 
-#### 9.17 本章參考資料
+- [ ] Service 能讀取 kernel interface。
+- [ ] D-Bus object 與 properties 正確。
+- [ ] Redfish / IPMI 與 D-Bus 一致。
+- [ ] Power-state gating、presence 與 service restart 已測試。
 
-- Linux kernel documentation - Driver Model: [https://docs.kernel.org/driver-api/driver-model/index.html](https://docs.kernel.org/driver-api/driver-model/index.html)
-- Linux kernel documentation - Device Drivers: [https://www.kernel.org/doc/html/latest/driver-api/driver-model/driver.html](https://www.kernel.org/doc/html/latest/driver-api/driver-model/driver.html)
-- Linux kernel documentation - Device drivers infrastructure: [https://www.kernel.org/doc/html/v4.14/driver-api/infrastructure.html](https://www.kernel.org/doc/html/v4.14/driver-api/infrastructure.html)
-- Linux kernel driver core `drivers/base/dd.c`: [https://github.com/torvalds/linux/blob/master/drivers/base/dd.c](https://github.com/torvalds/linux/blob/master/drivers/base/dd.c)
-- Linux kernel documentation - Dynamic debug: [https://docs.kernel.org/admin-guide/dynamic-debug-howto.html](https://docs.kernel.org/admin-guide/dynamic-debug-howto.html)
-- Linux kernel documentation - ftrace: [https://docs.kernel.org/trace/ftrace.html](https://docs.kernel.org/trace/ftrace.html)
+Driver 品質：
+
+- [ ] `devm_*` 與手動清理責任清楚。
+- [ ] Remove 會停止 IRQ、timer、workqueue 與 DMA。
+- [ ] `-EPROBE_DEFER` 沒被錯誤改寫。
+- [ ] Board-specific 規則未塞入通用 driver。
+- [ ] Dynamic debug / ftrace 測試後已關閉。
+- [ ] Oops / panic 所需 symbols 與 logs 可取得。
+
+#### 9.22 本章重點
+
+1. Driver 是 kernel 中知道如何控制某類硬體的程式。
+2. Device 是 kernel 為一個裝置建立的管理物件。
+3. Bus 提供 device 與 driver 的管理及 match 規則。
+4. Subsystem 把不同 drivers 提供的同類功能整理成共同介面。
+5. Probe 是 match 成功後，由 kernel 呼叫 driver 初始化 device 的動作。
+6. `devm_*` 將資源生命週期與 device 綁定，但 asynchronous 工作仍需先停止。
+7. Device 不存在、match 不成立、probe 失敗與 subsystem 未註冊是四個不同階段。
+8. Deferred probe 表示 provider 暫時未 ready，需沿 dependency 排查。
+9. Kernel interface 正常後，才進一步檢查 OpenBMC service、D-Bus 與 Redfish / IPMI。
+10. 排查時每個名詞都要對應到 target 上可確認的路徑或 log。
+
+#### 9.23 本章參考資料
+
+- Linux kernel documentation - Driver Model: https://docs.kernel.org/driver-api/driver-model/index.html
+- Linux kernel documentation - Device Drivers: https://docs.kernel.org/driver-api/driver-model/driver.html
+- Linux kernel documentation - Platform Devices and Drivers: https://docs.kernel.org/driver-api/driver-model/platform.html
+- Linux kernel documentation - Devres: https://docs.kernel.org/driver-api/driver-model/devres.html
+- Linux kernel documentation - I2C and SMBus Subsystem: https://docs.kernel.org/i2c/
+- Linux kernel documentation - HWMON Subsystem: https://docs.kernel.org/hwmon/
+- Linux kernel documentation - GPIO: https://docs.kernel.org/driver-api/gpio/
+- Linux kernel documentation - Dynamic Debug: https://docs.kernel.org/admin-guide/dynamic-debug-howto.html
+- Linux kernel documentation - Ftrace: https://docs.kernel.org/trace/ftrace.html
+- Yocto Project Kernel Development Manual: https://docs.yoctoproject.org/kernel-dev/

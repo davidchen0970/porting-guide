@@ -1,145 +1,167 @@
-### 3. Pinmux / GPIO 通用設計模式
+### 3. Pinmux 與 GPIO 通用設計模式
 
-本章整理 BMC 平台中 Pinmux、GPIO、pinctrl、GPIO expander、CPLD GPIO-like bit、presence / fault / interrupt / reset / power signal 的共用設計與排查方法。Pinmux / GPIO 是 bring-up 中最容易造成跨部門理解落差的區塊之一：硬體 schematic 使用的是 net name，SoC datasheet 使用的是 ball / pad / alternate function，Linux 使用 pinctrl state、gpiochip / line offset、gpio-line-names，OpenBMC 則常再映射到 D-Bus object、inventory、Redfish、IPMI 或 power control policy。
+Pinmux 決定 SoC pin 要連接 GPIO、I2C、UART、PWM 或其他硬體功能；GPIO 則讓 Linux 與 OpenBMC 讀取或控制單一數位訊號。BMC 平台的 power、reset、presence、fault、LED、button、write protect 與 mux select 都常經過這兩層。
 
-本章目標是建立一份可追蹤的對照方式，讓每一條會影響 power、reset、boot strap、write protect、presence、fault、LED、button、interrupt、mux select 的訊號，都能回答下列問題：
+本章從 pin、pinmux 與 GPIO 的關係開始，接著說明 Device Tree、active level、reset default、GPIO expander、interrupt、OpenBMC mapping，以及如何從 schematic 一路追到 D-Bus 與 Redfish。
 
-- 這條訊號接到哪一個 SoC pin / ball？
-- 它在 SoC 上是 GPIO 還是 alternate function？若是 alternate function，pinctrl 是否已選對？
-- Linux 中的 gpiochip、line offset、line name 是什麼？
-- active high / active low 是從硬體訊號角度、Linux logical value 角度，還是 OpenBMC inventory 狀態角度定義？
-- reset 後預設值由誰決定：SoC reset default、strap、external pull resistor、CPLD、GPIO hog、driver probe、userspace daemon？
-- 這條訊號的 owner 是 BMC、CPLD、BIOS、Host、PSU、front panel 還是共享？
-- 若訊號狀態錯誤，會造成哪一類開機、更新、power sequence 或現場問題？
+#### 3.1 Pin、Pad、Ball 與 Net
 
-#### 3.1 名詞與資料流
+同一條硬體訊號在不同文件中會使用不同名稱。
 
-| 名詞 | 說明 | Bring-up 關注點 |
-| --- | --- | --- |
-| Pin / Pad / Ball | SoC 封裝上的實體腳位 | schematic、layout、datasheet 名稱要對齊 |
-| Pinmux | 同一實體 pin 在多個功能間切換，例如 GPIO / I2C / PWM / UART | DTS pinctrl state、strap、register default |
-| Pinconf | pin 的電氣設定，例如 pull-up、pull-down、drive strength、open drain、topology | 是否能由 software 設定，是否與外部電路衝突 |
-| GPIO controller | Linux 中提供 GPIO lines 的控制器，例如 SoC GPIO bank、I2C expander | gpiochip index 可能會變，建議依 line name 查找 |
-| GPIO line offset | gpiochip 內部 line 編號 | 不等於 SoC ball name，也不一定等於舊 sysfs GPIO number |
-| gpio-line-names | DTS 中給每條 GPIO line 的人類可讀名稱 | gpioinfo / gpiofind / OpenBMC config 常依賴此名稱 |
-| GPIO consumer | 使用某條 GPIO 的 driver / service，例如 reset-gpios、enable-gpios、presence-gpios | consumer name 可在 gpioinfo 中看到，便於判斷是否已被占用 |
-| GPIO hog | kernel early 階段固定要求某條 GPIO 為 input / output high / output low | 適合早期固定狀態，不適合後續需由 service 動態控制的訊號 |
-| Active level | 有效電位，可能是 active-high 或 active-low | 必須分清楚 pin 電位與 logical state |
-| Owner | 訊號狀態由誰決定 | 避免 BMC / CPLD / BIOS 同時控制同一條線 |
+| 名稱 | 所在位置 | 用途 |
+|---|---|---|
+| Net name | Schematic | 描述板上訊號，例如 `PSU0_PRSNT_N` |
+| Ball / Pin | SoC package | 描述封裝腳位，例如 `A12` |
+| Pad | SoC 內部 I/O cell | Pinmux 與 pin configuration 的對象 |
+| GPIO line | Linux GPIO controller | 描述 gpiochip 中的 line offset |
+| Line name | Device Tree / driver | 提供人類可讀的功能名稱 |
+| D-Bus object | OpenBMC | 描述 inventory、sensor 或 control |
 
-Linux pinctrl subsystem 涵蓋 pin enumeration、pin multiplexing，以及 pull-up / pull-down、open drain、drive strength 等 pin configuration；GPIO mapping 則建議在 Device Tree consumer node 使用 `<function>-gpios` 命名，例如 `reset-gpios`、`enable-gpios`、`led-gpios`。GPIO property 的 active-low / active-high 會影響 gpiod API 看到的 logical value，因此文件內需同時記錄 physical level 與 logical state。
-
-典型資料流：
+完整追蹤路徑：
 
 ```text
-Schematic net / CPLD bit / expander pin
-    ↓
-SoC ball / expander port / CPLD register bit
-    ↓
-Pinmux / pinconf / GPIO controller driver
-    ↓
-Linux gpiochip + line offset + gpio-line-name
-    ↓
-Kernel consumer driver 或 OpenBMC service
-    ↓
-D-Bus inventory / sensor / power state / event
-    ↓
-Redfish / IPMI / WebUI / SEL / policy
+Schematic net
+        ↓
+SoC ball / Expander port / CPLD bit
+        ↓
+Pinmux 與電氣設定
+        ↓
+GPIO controller
+        ↓
+gpiochip + line offset + line name
+        ↓
+Kernel driver / OpenBMC service
+        ↓
+D-Bus / Redfish / IPMI / Event
 ```
 
-#### 3.2 訊號分類與風險等級
+例如：
 
-| 類型 | 範例 | 錯誤時常見現象 | 建議風險等級 |
-| --- | --- | --- | --- |
-| Boot strap / reset strap | boot source、secure boot、debug mode | 無 UART、BootROM 讀錯媒體、secure boot policy 不符 | Critical |
-| Power enable | MAIN_PWR_EN、VR_EN、PSU_ON_N | Host 無法上電、反覆 power fault、rail 提早啟動 | Critical |
-| Reset | BMC_RST_N、PLTRST_N、PERST_N、FPGA_RST_N | 裝置不 probe、Host boot hang、PCIe device 不見 | Critical |
-| Power good / fault | PGOOD、VR_FAULT_N、THERMTRIP_N | power sequence timeout、誤觸發 fault、event log 錯誤 | High |
-| Write protect | BIOS_WP_N、BMC_FLASH_WP_N、CPLD_WP | 更新失敗、保護失效、安全風險 | High |
-| Presence | FAN_PRSNT_N、PSU_PRSNT_N、RISER_PRSNT_N | inventory 錯、fan / PSU / riser 不顯示 | High |
-| Intrusion | CHASSIS_INTRUSION_N | SEL / Redfish event 錯、rearm policy 錯 | Medium |
-| Interrupt | ALERT_N、IRQ_N、PMBUS_ALERT_N | driver 無事件、輪詢壓力增加、fault 延遲 | Medium～High |
-| LED | UID_LED、FAULT_LED、STATUS_LED | 外部狀態顯示錯 | Medium |
-| Button | PWRBTN_N、RSTBTN_N、IDBTN_N | 按鈕無效、誤觸發、長按策略錯 | High |
-| Mux select | I2C_MUX_SEL、SPI_MUX_SEL | bus 掃不到 device、燒錄路徑錯 | High |
-| Debug / manufacturing | JTAG_EN、UART_SEL、RECOVERY_N | 現場 debug 不可用或量產安全設定錯 | Medium～High |
+```text
+PSU0_PRSNT_N
+        ↓
+SoC ball A12
+        ↓
+GPIO function
+        ↓
+gpiochip0 line 24，line name psu0-present-n
+        ↓
+PSU presence service
+        ↓
+Inventory Present=true / false
+```
 
-建議所有 Critical / High 訊號都建立量測紀錄，至少包含：reset 後 default、BMC Linux 起來後狀態、Host off / on 狀態、AC cycle 後狀態、BMC reboot 後是否保持預期。
+每一條重要訊號都應保留這份對照，避免只記錄 GPIO number。
 
-#### 3.3 GPIO 欄位範本
+#### 3.2 Pinmux 是什麼
 
-| 欄位 | 說明 |
-| --- | --- |
-| Signal | schematic net name，建議與硬體文件一致 |
-| Functional name | 軟體語意，例如 host-reset、psu0-present、bios-wp |
-| SoC pin / ball | SoC datasheet 腳位名稱 |
-| Pin function | GPIO / I2C / PWM / UART / strap / alternate function |
-| GPIO controller | SoC gpio、I2C expander、CPLD、MCU、PCH sideband |
-| gpiochip / line | Linux 中的 gpiochip 與 line offset；若可能變動，需補 line name |
-| gpio-line-name | DTS 或 driver 暴露的 line name |
-| Active level | active-high / active-low；務必註明 physical 與 logical 角度 |
-| Reset default | SoC reset 後方向、輸出值、Hi-Z、pull state |
-| HW pull | pull-up / pull-down 電阻值與電源域 |
-| Owner | BMC / CPLD / BIOS / Host / shared |
-| Consumer | kernel driver、OpenBMC service、Entity Manager、power daemon |
-| Purpose | 訊號用途 |
-| Boot risk | 若狀態錯誤，對 boot / power / update 的影響 |
-| Debounce | 是否需要 debounce、時間、由 kernel / daemon / CPLD 處理 |
-| Event policy | 是否產生 SEL / Redfish event / phosphor-logging |
-| Test method | gpioinfo、gpioget、scope、LA、CPLD register、service log |
-| Status | [待確認] / [量測值] / 已驗證 |
+一個 SoC pin 通常支援多種功能，例如：
 
-平台表格範本：
+```text
+Pin A12
+├── GPIOA3
+├── UART5_RX
+├── I2C8_SDA
+└── PWM2
+```
 
-| Signal | Functional name | SoC Pin | Pin function | GPIO line / name | Active | Default | HW pull | Owner | Consumer | Purpose | Boot risk | Status |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PWRBTN_N | host-power-button | [待填] | GPIO | [待填] / pwrbtn-n | Low | input / High-Z [待填] | Pull-up [待填] | BMC/CPLD | x86-power-control | Host power button pulse | Critical | [待確認] |
-| PLTRST_N | host-platform-reset | [待填] | GPIO input | [待填] / pltrst-n | Low | input | Pull-up [待填] | Host/PCH | x86-power-control / state monitor | Host reset state | High | [待確認] |
-| BIOS_WP_N | bios-write-protect | [待填] | GPIO output | [待填] / bios-wp-n | Low | output high [待填] | Pull-up [待填] | BMC/Security | BIOS update service | SPI flash write protect | High | [待確認] |
-| PSU0_PRSNT_N | psu0-present | [待填] | GPIO input | [待填] / psu0-present-n | Low | input | Pull-up [待填] | BMC/CPLD | Entity Manager / PSU service | PSU presence | High | [待確認] |
-| FAN0_PRESENT_N | fan0-present | [待填] | GPIO input | [待填] / fan0-present-n | Low | input | Pull-up [待填] | BMC | fan presence service | Fan tray detection | High | [待確認] |
-| CHASSIS_INTRUSION_N | chassis-intrusion | [待填] | GPIO input | [待填] / chassis-intrusion-n | Low | input | Pull-up [待填] | BMC/Security | intrusion sensor | Chassis open event | Medium | [待確認] |
+Pinmux 選擇其中一種功能。若硬體將 A12 接成 I2C SDA，但 software 選成 GPIO，I2C controller 即使 probe 成功，也無法在外部 pin 上送出正確訊號。
 
-#### 3.4 命名規則
+##### 3.2.1 Alternate Function
 
-命名規則是後續排查效率的關鍵。建議同一條訊號保留三種名稱，但不要混用：
+GPIO 是 pin 的其中一種功能；I2C、UART、PWM、SPI 等則是 alternate functions。Peripheral driver 通常透過 pinctrl state 要求正確功能。
 
-| 名稱類型 | 來源 | 範例 | 用途 |
-| --- | --- | --- | --- |
-| Hardware net name | schematic | `PSU0_PRSNT_N` | 與 HW / CPLD / LA 量測對齊 |
-| GPIO line name | DTS `gpio-line-names` | `psu0-present-n` | `gpioinfo`、`gpiofind`、service config |
-| D-Bus / inventory name | OpenBMC config | `psu0`、`fan0`、`chassis_intrusion` | Redfish / IPMI / policy |
+```text
+I2C driver probe
+        ↓
+套用 pinctrl default state
+        ↓
+Pinmux 選擇 I2C function
+        ↓
+Controller 驅動 SDA / SCL
+```
 
-建議：
+##### 3.2.2 Pinmux 衝突
 
-- Line name 使用小寫與 hyphen，例如 `psu0-present-n`、`bios-wp-n`、`pwrbtn-n`。
-- 若硬體訊號本身帶 `_N` 或 `#`，line name 可保留 `-n`，但 active level 必須另外記錄，不要只靠名稱推論。
-- 同一類訊號需序號一致，例如 `fan0-present-n` 對應 `fan0-tach`、`fan0-pwm`。
-- 不建議使用 `gpio123`、`signal1`、`misc-gpio` 之類無語意名稱。
-- shared line 或 wired-OR line 必須在備註標示所有 driver / sink / source。
-- 若使用 expander，line name 仍應描述功能，不要只寫 `pca9555-p00`。
+同一個 pin 同一時間只能提供一組互斥功能。常見衝突：
 
-#### 3.5 Device Tree：pinctrl、gpio-line-names 與 consumer gpios
+- GPIO 與 UART 共用。
+- GPIO 與 PWM 共用。
+- I2C 與專用 sideband signal 共用。
+- Boot strap 與 runtime GPIO 共用。
+- JTAG 與一般 GPIO 共用。
 
-##### 3.5.1 pinctrl state 範本
+Device Tree 中同時啟用兩個使用相同 pin group 的 peripherals，可能造成 probe failure、後套用的 state 覆蓋前者，或硬體輸出異常。
 
-以下範本用來表達 client device 需要的 pinmux state。實際 pins / function / groups / bias / drive-strength 屬性需依 SoC binding 調整。
+#### 3.3 Pin Configuration
+
+Pin configuration 描述 pin 的電氣行為，常見項目包括：
+
+- Bias pull-up。
+- Bias pull-down。
+- Bias disable。
+- Drive strength。
+- Open-drain。
+- Input enable。
+- Output enable。
+- Schmitt trigger。
+- Slew rate，依 SoC 支援。
+
+##### 3.3.1 Pull-up 與 Pull-down
+
+Input 或 Hi-Z pin 需要穩定的預設電位。電位來源可能是：
+
+- 板上的外部 resistor。
+- SoC 內部 pull。
+- CPLD 或其他 device 的 output。
+- Level shifter 的預設狀態。
+
+關鍵訊號應優先確認 schematic 上的 external pull，不能只依 DTS 的 `bias-pull-up` 推測實體狀態。部分 SoC pull 很弱，也可能在 reset 階段尚未生效。
+
+##### 3.3.2 Drive Strength
+
+Drive strength 影響 output 能提供的電流與 edge rate。設定過小可能無法在負載下達到有效電位；設定過大可能增加 overshoot、EMI 與 ringing。
+
+I2C open-drain line 的上升時間主要由 pull-up 與 bus capacitance 決定，不應以 push-pull drive strength 取代正確的 I2C 電氣設計。
+
+##### 3.3.3 Open-drain
+
+Open-drain output 可主動拉低，High state 則由 pull-up 提供。常見於：
+
+- I2C SDA / SCL。
+- Shared interrupt。
+- Wired-OR fault。
+- Reset / alert sideband。
+
+文件需記錄 pull-up voltage domain，尤其跨 power domain 時要確認 back-powering 與 power-off leakage。
+
+#### 3.4 Linux Pinctrl Framework
+
+Linux pinctrl framework 管理：
+
+- Pin enumeration。
+- Pin groups。
+- Pinmux functions。
+- Pin configuration。
+- Device 的 pinctrl states。
+
+##### 3.4.1 Pinctrl State
+
+常見 state：
+
+- `default`：device 正常工作時使用。
+- `sleep`：suspend 或低功耗時使用。
+- `idle`：device 暫時閒置時使用。
+
+實際 state 由 driver 與 binding 決定。
+
+Device Tree 範例：
 
 ```dts
 &pinctrl {
     pinctrl_i2c5_default: i2c5-default {
         function = "I2C5";
         groups = "I2C5";
-    };
-
-    pinctrl_uart5_default: uart5-default {
-        function = "UART5";
-        groups = "UART5";
-    };
-
-    pinctrl_gpio_debug_default: gpio-debug-default {
-        pins = "A1", "A2";
-        bias-pull-up;
     };
 };
 
@@ -150,35 +172,283 @@ Redfish / IPMI / WebUI / SEL / policy
 };
 ```
 
-檢查重點：
+`function`、`groups`、`pins` 與 pinconf properties 依 SoC binding 定義，不可直接把其他 SoC 的範例複製過來。
 
-- pinctrl state 名稱應包含 peripheral 與狀態，例如 `i2c5-default`、`uart5-default`。
-- 同一 pin 不應同時被設為 I2C / UART / PWM / GPIO 等互斥功能。
-- 若 peripheral probe 失敗，除了 driver 與 clock，也要查 pinctrl 是否套用。
-- 部分 SoC 有 strap / OTP / secure mode 影響 pin function，DTS 正確仍可能被硬體條件限制。
+##### 3.4.2 Pinctrl 何時套用
 
-##### 3.5.2 gpio-line-names 範本
+Device driver probe 時，driver core 通常會選擇 `default` state。若 device 未啟用、driver 尚未 probe 或 state reference 錯誤，pin 可能保持 bootloader 或 reset default。
+
+排查 peripheral 時需同時確認：
+
+- Running DTB 中有正確 pinctrl node。
+- Consumer node 使用正確 `pinctrl-0`。
+- Pinctrl driver 已 probe。
+- Pin 未被其他 function 使用。
+- Secure mode / strap 沒有限制該 function。
+
+#### 3.5 GPIO Controller、Chip 與 Line
+
+GPIO controller 向 Linux 註冊一組 GPIO lines，例如：
+
+- SoC GPIO bank。
+- I2C GPIO expander。
+- SPI GPIO expander。
+- FPGA / CPLD GPIO controller driver。
+
+Linux character device 通常顯示為：
+
+```text
+/dev/gpiochip0
+/dev/gpiochip1
+```
+
+##### 3.5.1 Line Offset
+
+Line offset 是該 gpiochip 內的編號：
+
+```text
+gpiochip0 line 0
+gpiochip0 line 1
+...
+```
+
+Line offset 與 SoC ball name、schematic pin number或舊式 global GPIO number 分屬不同表示方式。
+
+##### 3.5.2 gpiochip 編號
+
+`gpiochip0`、`gpiochip1` 可能受 driver probe 順序影響。加入 expander、改成 module 或調整 kernel 後，chip number 可能改變。
+
+腳本與 service 應優先使用：
+
+- Line name。
+- Chip label + offset。
+- Device path。
+
+##### 3.5.3 Line Name
+
+`gpio-line-names` 為每條 line 提供功能名稱：
 
 ```dts
 &gpio0 {
     gpio-line-names =
-        /* A0-A7 */
         "pwrbtn-n", "pltrst-n", "host-pgood", "bios-wp-n",
-        "psu0-present-n", "psu1-present-n", "fan0-present-n", "fan1-present-n",
-        /* B0-B7 */
-        "chassis-intrusion-n", "uid-button-n", "uid-led", "fault-led",
-        "i2c-mux-sel0", "i2c-mux-sel1", "bmc-ready", "host-ready";
+        "psu0-present-n", "psu1-present-n", "fan0-present-n", "fan1-present-n";
 };
 ```
 
-檢查重點：
+名稱順序必須和 controller 的 line offsets 完全一致。
 
-- 每個 bank 的 line name 順序必須與 SoC GPIO driver 的 line offset 順序一致。
-- 沒使用的 line 可留空字串，但未接腳位、保留腳位、strap 腳位建議加註，例如 `reserved-gpio-a3`、`strap-boot0`。
-- 若 bootloader 與 kernel 使用不同 DTB，需確認 running kernel 看到的 line name 是最新版本。
-- 若同名 line 出現在多個 gpiochip，`gpiofind` 可能找到第一個匹配；重要訊號建議確認 gpiochip 與 line offset。
+#### 3.6 libgpiod 工具
 
-##### 3.5.3 GPIO expander 範本
+現代 Linux GPIO userspace 介面使用 GPIO character device 與 libgpiod。
+
+##### 3.6.1 列出 Controllers
+
+```bash
+gpiodetect
+```
+
+##### 3.6.2 查看 Lines
+
+```bash
+gpioinfo
+gpioinfo gpiochip0
+```
+
+輸出可包含：
+
+- Line offset。
+- Line name。
+- Direction。
+- Active-low flag。
+- Consumer。
+- Bias，依 kernel / driver 支援。
+
+##### 3.6.3 尋找 Line
+
+```bash
+gpiofind psu0-present-n
+```
+
+不同 libgpiod versions 的 command syntax 與輸出格式可能不同，正式腳本需依 target 版本驗證。
+
+##### 3.6.4 讀取 Input
+
+libgpiod v1 常見形式：
+
+```bash
+gpioget gpiochip2 3
+```
+
+新版工具可提供不同參數形式。執行前應查看：
+
+```bash
+gpioget --help
+```
+
+##### 3.6.5 監看 Edge
+
+```bash
+gpiomon --num-events=5 gpiochip2 3
+```
+
+適合 presence、button、intrusion 與 interrupt bring-up。若 line 已由 kernel driver接管，userspace 可能無法再次要求該 line。
+
+##### 3.6.6 設定 Output
+
+`gpioset` 會要求 line 並設定 output。不同版本對 line 保持時間與 daemonize mode 的行為不同。
+
+只應對已核准的低風險測試線使用。Power enable、reset、write protect、strap 與 mux select 需要先確認 owner、active level 與副作用。
+
+#### 3.7 GPIO Consumer
+
+Consumer 是要求 GPIO line 的 kernel driver 或 userspace process。
+
+Device Tree 常使用：
+
+```dts
+some_device@40 {
+    compatible = "vendor,some-device";
+    reg = <0x40>;
+
+    reset-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+    enable-gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+};
+```
+
+Driver 透過 descriptor-based GPIO API 取得 `reset` 與 `enable` lines。`gpioinfo` 通常可顯示 consumer name，協助確認 line 已由誰使用。
+
+##### 3.7.1 Property 命名
+
+GPIO Device Tree property 通常使用：
+
+```text
+<function>-gpios
+```
+
+例如：
+
+- `reset-gpios`
+- `enable-gpios`
+- `presence-gpios`
+- `power-gpios`
+
+Property 名稱、cell 數量與 flags 需依該 device binding。
+
+##### 3.7.2 Line Busy
+
+當 line 已被 driver、GPIO hog 或 userspace process 要求，再使用 `gpioget` / `gpioset` 可能收到 busy error。此時應先查看 consumer，不應透過強制解除 driver 來繞過正常 ownership。
+
+#### 3.8 Active Level 與 Logical Value
+
+Active level 描述訊號在何種 physical level 下具有功能意義。
+
+以 `PSU0_PRSNT_N` 為例：
+
+```text
+Physical Low
+        ↓
+PSU presence asserted
+        ↓
+GPIO_ACTIVE_LOW 轉換
+        ↓
+Logical active = 1
+        ↓
+Inventory Present = true
+```
+
+##### 3.8.1 Physical 與 Logical
+
+| 層級 | `PSU0_PRSNT_N` 插入時 |
+|---|---|
+| Pin voltage | Low |
+| Hardware signal | Asserted |
+| DTS flag | `GPIO_ACTIVE_LOW` |
+| gpiod logical value | Active / 1，依工具是否採 logical mode |
+| OpenBMC | `Present=true` |
+
+工具版本與 options 可能決定顯示 raw 或 logical value，因此測試紀錄應直接寫出：
+
+- Pin 實測電壓。
+- DTS active flag。
+- Tool command 與輸出。
+- OpenBMC property。
+
+##### 3.8.2 名稱中的 `_N`
+
+`_N`、`#` 或 `L` 通常表示 Low active，但最終仍需以 schematic、datasheet 與實測確認。External inverter、level shifter 或 CPLD logic 都可能改變 BMC pin 看到的 polarity。
+
+#### 3.9 Reset Default 與控制權交接
+
+一條 output signal 在系統啟動期間可能經過多個 owner：
+
+```text
+SoC reset default
+        ↓
+External pull
+        ↓
+Bootloader pinmux / GPIO
+        ↓
+Kernel pinctrl / GPIO hog
+        ↓
+Kernel driver
+        ↓
+OpenBMC service
+```
+
+每次交接都可能產生短暫 glitch。Power enable、reset、write protect 與 flash mux 需量測完整時間線。
+
+##### 3.9.1 Safe Default
+
+| 訊號 | 常見安全預設 |
+|---|---|
+| `VR_EN` | Disable |
+| `PSU_ON_N` | Deassert / PSU off |
+| `PERST_N` | Assert reset，直到條件滿足 |
+| `BIOS_WP_N` | Write protection enabled |
+| Flash mux | Boot owner / protected owner |
+
+實際安全狀態由平台設計決定。文件需記錄 physical level，而不是只寫 high / low 的功能推測。
+
+##### 3.9.2 BMC Reboot
+
+若產品要求 BMC reboot 時 Host 繼續運作，需確認：
+
+- SoC GPIO reset default。
+- External pull。
+- CPLD 是否維持 output。
+- Kernel handoff gap。
+- Power-control service重新啟動行為。
+- Line ownership 是否會短暫釋放。
+
+#### 3.10 GPIO Hog
+
+GPIO hog 讓 kernel 在 GPIO controller 註冊時立即要求 line 並設定 input 或 output。
+
+```dts
+&gpio0 {
+    bios_wp_default: bios-wp-default-hog {
+        gpio-hog;
+        gpios = <10 GPIO_ACTIVE_HIGH>;
+        output-high;
+        line-name = "bios-wp-default";
+    };
+};
+```
+
+適合：
+
+- Kernel early boot 必須保持的安全線。
+- 不需要後續動態變更的 strap / mux default。
+- Driver 尚未 probe 前要維持的固定狀態。
+
+若後續 driver 或 userspace 需要控制同一 line，hog 會造成 ownership conflict。這類訊號通常更適合由正式 consumer driver 從 early boot 接管。
+
+`output-high` / `output-low` 描述 physical output level；功能上的 enabled / disabled 仍需依電路判斷。
+
+#### 3.11 GPIO Expander
+
+GPIO expander 透過 I2C、SPI 或其他 bus 增加 GPIO lines。例如 PCA9555 提供 16-bit GPIO。
 
 ```dts
 &i2c7 {
@@ -191,414 +461,503 @@ Redfish / IPMI / WebUI / SEL / policy
         #gpio-cells = <2>;
 
         gpio-line-names =
-            "psu0-present-n", "psu1-present-n", "riser0-present-n", "riser1-present-n",
-            "fanboard0-present-n", "fanboard1-present-n", "cable0-present-n", "cable1-present-n",
-            "fault-led", "uid-led", "reserved-exp0-10", "reserved-exp0-11",
+            "psu0-present-n", "psu1-present-n",
+            "riser0-present-n", "riser1-present-n",
+            "fanboard0-present-n", "fanboard1-present-n",
+            "cable0-present-n", "cable1-present-n",
+            "fault-led", "uid-led",
+            "reserved-exp0-10", "reserved-exp0-11",
             "wp-enable", "mux-sel0", "mux-sel1", "expander-int-n";
     };
 };
 ```
 
-Bring-up 重點：
+##### 3.11.1 Bring-up 順序
 
-- Expander 的 I2C bus / mux channel / address 需先驗證，再驗 GPIO line。
-- 若 expander 有 INT pin，需確認 interrupt-parent、interrupts 與 active level。
-- Expander 上的 output reset default 常由 expander datasheet 決定，未必等同 SoC GPIO default。
-- Expander 供電若依賴 host rail，BMC standby 階段可能讀不到，service 需配合 PowerState / availability。
-
-##### 3.5.4 GPIO hog 範本
-
-GPIO hog 適合用於早期固定狀態，例如在 driver probe 前就需要維持 disable / reset / mux select。若 userspace 後續要改變狀態，需避免 hog 長期占用該 line。
-
-```dts
-&gpio0 {
-    bios_wp_default: bios-wp-default-hog {
-        gpio-hog;
-        gpios = <10 GPIO_ACTIVE_HIGH>;
-        output-high;
-        line-name = "bios-wp-default";
-    };
-
-    mux_sel_default: mux-sel-default-hog {
-        gpio-hog;
-        gpios = <11 GPIO_ACTIVE_HIGH>;
-        output-low;
-        line-name = "mux-sel-default";
-    };
-};
+```text
+I2C root adapter
+        ↓
+Mux child adapter，若有
+        ↓
+Expander address ACK
+        ↓
+Expander driver probe
+        ↓
+新的 gpiochip 出現
+        ↓
+Line names 與方向驗證
 ```
 
-使用前需確認：
+##### 3.11.2 Reset 與 Supply
 
-- 這條 line 是否會被 kernel driver 或 OpenBMC service 重新要求。
-- hog 的 output-high / output-low 是 physical level，不是一定等同功能上的 enable / disable。
-- 若安全相關，例如 write protect，需確認 GPIO hog 是否足以涵蓋從 reset 到 userspace ready 的時間窗。
+Expander outputs 的 power-on default 由 expander datasheet、reset pin 與 external pull 決定。若 expander 位於 Host power domain，Host off 時可能整顆 GPIO controller 消失，OpenBMC service 需要處理 unavailable 與重新 probe。
 
-##### 3.5.5 Consumer GPIO 範本
+##### 3.11.3 Interrupt
+
+部分 expander 提供 INT output，通知 input 發生變更。需確認：
+
+- INT active level。
+- Interrupt parent。
+- Trigger type。
+- Shared interrupt behavior。
+- Read input register後如何清除 interrupt。
+
+#### 3.12 Interrupt GPIO
+
+GPIO input 可作為 interrupt source，但 GPIO value 與 interrupt configuration 是不同設定。
 
 ```dts
 some_device@40 {
     compatible = "vendor,some-device";
     reg = <0x40>;
-    reset-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
-    enable-gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+
     interrupt-parent = <&gpio0>;
     interrupts = <14 IRQ_TYPE_LEVEL_LOW>;
 };
 ```
 
-建議：
+##### 3.12.1 Edge 與 Level
 
-- 新 binding 使用 `<function>-gpios`，例如 `reset-gpios`、`enable-gpios`、`presence-gpios`。
-- 不同功能的 GPIO 不要包在同一個大陣列中，除非它們是同一功能的多條資料線。
-- active level 使用 `GPIO_ACTIVE_LOW` / `GPIO_ACTIVE_HIGH` 巨集，避免裸數值造成閱讀困難。
-- interrupt line 不等同 GPIO input，需要同時檢查 interrupt controller / trigger type / debounce。
+- Rising edge：Low → High 時觸發。
+- Falling edge：High → Low 時觸發。
+- Both edges：兩種轉換都觸發。
+- Level high / low：電位維持有效時持續視為 asserted。
 
-#### 3.6 Active level、pull resistor 與安全預設值
+Level interrupt handler 必須清除 device 內部 status source，否則 IRQ 會持續觸發。
 
-Active level 需同時站在 hardware 與 software 角度描述。以下表格可避免「讀值 0 是 present 還是 absent」的溝通落差。
+##### 3.12.2 Shared Interrupt
 
-| 欄位 | 說明 | 範例 |
-| --- | --- | --- |
-| Physical level | 針腳實際電位 | 0V / 3.3V |
-| Signal assert level | 硬體訊號有效電位 | `PSU_PRSNT_N` 為 Low 有效 |
-| DTS flag | Device Tree GPIO flag | `GPIO_ACTIVE_LOW` |
-| gpiod logical value | userspace 依 active flag 看到的邏輯值 | active low line assert 時 logical 1 |
-| Inventory state | OpenBMC 對外狀態 | Present = true |
-| Redfish/IPMI state | 外部介面狀態 | Present / Absent / Enabled / Warning |
+Wired-OR / open-drain interrupt 可能由多顆 devices 共用。Handler 需要讀取所有可能 sources 的 status，並清除真正的來源。
 
-建議每條關鍵 GPIO 都填：
+##### 3.12.3 `/proc/interrupts`
 
-| Signal | Physical assert | DTS flag | gpioget raw / logical 說明 | OpenBMC state | 備註 |
-| --- | --- | --- | --- | --- | --- |
-| PSU0_PRSNT_N | Low | GPIO_ACTIVE_LOW | pin low 表示 logical active | PSU0 Present=true | [待填] |
-| BIOS_WP_N | Low | 視 driver binding | pin low 表示 write protect enabled | WriteProtected=true | 需確認外部 inverter |
-| UID_LED | High | GPIO_ACTIVE_HIGH | pin high 表示 LED on | Identify=true | 若 LED driver 另有 polarity 需補充 |
+```bash
+cat /proc/interrupts
+watch -n 1 cat /proc/interrupts
+```
 
-Pull resistor 與 reset default 建議：
+配合 scope / logic analyzer 判斷：
 
-- 會影響 host power 的 line，reset default 必須落在安全狀態，例如 VR enable 預設 disable。
-- open drain / wired-OR line 必須確認外部 pull-up 電源域與上電時序。
-- 若 BMC GPIO reset 後為 input / Hi-Z，實際電位由外部 pull 決定；文件需記錄 pull resistor 值。
-- 若 CPLD 在 BMC ready 前接管訊號，需記錄 CPLD default 與 BMC 交接條件。
-- 若 GPIO 跨電源域，需確認 back-powering、level shifter、power-off leakage、hot-plug 狀況。
+- Pin 是否真的跳變。
+- IRQ count 是否增加。
+- Driver 是否進入 handler。
+- Status 是否被清除。
 
-#### 3.7 Kernel config、驅動與 userspace 工具
+#### 3.13 Debounce
 
-常見 kernel config：
+Mechanical button、presence switch 與 hot-plug connector 可能在變化時快速抖動。
+
+Debounce 可由：
+
+- RC circuit。
+- CPLD。
+- GPIO controller hardware。
+- Kernel driver。
+- Userspace service。
+
+使用哪一層應有單一清楚 owner。多層 debounce 疊加可能造成反應過慢，沒有 debounce 則可能產生 event storm。
+
+需記錄：
+
+- Debounce time。
+- Rising / falling 是否相同。
+- Short pulse 是否被忽略。
+- 插入 / 拔除事件的穩定條件。
+- BMC reboot 後初始狀態是否產生假 event。
+
+#### 3.14 Boot Strap 與 Runtime Function
+
+部分 pin 在 reset deassert 附近被 SoC 當成 boot strap，之後再切換為 GPIO 或 peripheral function。
 
 ```text
-CONFIG_GPIOLIB=y
-CONFIG_GPIO_CDEV=y
-CONFIG_PINCTRL=y
-CONFIG_PINMUX=y
-CONFIG_PINCONF=y
-CONFIG_GPIO_SYSFS=n 或依舊工具需求保留
-CONFIG_GPIO_PCA953X=y/m
-CONFIG_GPIO_ASPEED=y
-CONFIG_GPIO_GENERIC=y
-CONFIG_DEBUG_FS=y
+Reset asserted
+External pull 決定 strap level
+        ↓
+Reset deassert
+SoC latch strap
+        ↓
+BootROM 選擇 boot mode
+        ↓
+Bootloader / Kernel 改成 runtime pinmux
 ```
 
-注意事項：
+檢查 strap 時應量測 reset 釋放附近的電位。Linux 啟動後的 `gpioinfo` 只能顯示 runtime state，無法證明 boot-time strap 正確。
 
-- 新平台建議使用 GPIO character device 與 libgpiod 工具，不建議新流程依賴舊 sysfs GPIO 介面。
-- `gpiochipN` 編號可能因 driver probe 順序改變，腳本與 config 應優先使用 line name 或固定 chip label。
-- 若 I2C expander driver 以 module 形式載入，使用該 expander 的 service 需有 systemd dependency 或 retry。
-- pinctrl debugfs 依 kernel config 與 mount 狀態而定；若可用，對排查 pinmux 很有幫助。
+另外需要確認：
 
-#### 3.8 Target 端檢查指令與 log 收集
+- CPLD / buffer 是否在 strap sampling 時驅動該 line。
+- Runtime output 是否會影響下一次 warm reset。
+- Strap pin 共用 LED / button 時的 pull 與負載。
+- Secure boot、recovery、JTAG 相關 strap 具有適當保護。
 
-##### 3.8.1 GPIO chip 與 line name
+#### 3.15 常見訊號設計
 
-```sh
-# 列出 GPIO controller
-gpiodetect
+##### 3.15.1 Presence
 
-# 列出所有 GPIO line 狀態
-gpioinfo
-
-# 查特定 line name
-gpiofind psu0-present-n
-gpiofind pwrbtn-n
-
-# 只看某個 gpiochip
-gpioinfo gpiochip0
-gpioinfo /dev/gpiochip0
+```text
+Physical connector presence pin
+        ↓
+GPIO / CPLD debounce
+        ↓
+OpenBMC presence service
+        ↓
+Inventory Present
+        ↓
+Sensor availability / Redfish inventory
 ```
 
-應保存的資訊：
+存在來源可能是 GPIO、FRU EEPROM、PMBus response或多種來源組合。平台需定義 priority 與 conflict handling。
 
-```sh
-mkdir -p /tmp/gpio-debug
-gpiodetect > /tmp/gpio-debug/gpiodetect.txt 2>&1
-gpioinfo > /tmp/gpio-debug/gpioinfo.txt 2>&1
-find /sys/kernel/debug/pinctrl -maxdepth 3 -type f -print > /tmp/gpio-debug/pinctrl-files.txt 2>&1
-cat /sys/kernel/debug/gpio > /tmp/gpio-debug/debug-gpio.txt 2>&1
-cat /proc/device-tree/model > /tmp/gpio-debug/model.txt 2>&1
-cat /proc/cmdline > /tmp/gpio-debug/cmdline.txt 2>&1
-dmesg -T > /tmp/gpio-debug/dmesg.txt
-journalctl -b --no-pager > /tmp/gpio-debug/journal.txt
-tar czf /tmp/gpio-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp gpio-debug
+##### 3.15.2 Fault
+
+Fault pin 可能是 live status，也可能經 CPLD latch。若事件需要保留，應分開 current fault 與 latched fault，不應只輪詢瞬時 GPIO。
+
+##### 3.15.3 Reset
+
+Reset output 需要確認：
+
+- Active level。
+- Minimum pulse width。
+- Power-state gating。
+- Reset target。
+- BMC reboot behavior。
+- External pull 與 CPLD override。
+
+##### 3.15.4 Power Enable
+
+Power enable 需由 power sequence owner 控制。一般 debug script 不應直接切換，因為 rail sequencing、PGOOD 與 fault interlock 可能位於 CPLD 或 power-control service。
+
+##### 3.15.5 Write Protect
+
+Write-protect line 通常預設為 protected。解除流程需包含：
+
+- Authorization。
+- Target firmware / flash owner確認。
+- Host / BMC power state。
+- Update window。
+- Failure / reboot recovery。
+- 更新後恢復保護。
+
+##### 3.15.6 LED
+
+LED 需要記錄 polarity、owner、blink pattern 與 priority。BMC、CPLD 與 front-panel hardware 同時可控制時，需要明確 arbitration。
+
+##### 3.15.7 Button
+
+Button 需要 debounce、short / long press 判斷與 event owner。Power button 與 reset button 可能由 CPLD直接產生 pulse，也可能交給 OpenBMC service 決策。
+
+#### 3.16 OpenBMC Integration
+
+##### 3.16.1 Inventory Presence
+
+Presence GPIO 最終常映射為：
+
+```text
+xyz.openbmc_project.Inventory.Item.Present
 ```
 
-##### 3.8.2 pinctrl debugfs
+可插拔元件還需同步處理：
 
-```sh
-# 依平台 debugfs 路徑可能不同
-mount | grep debugfs || mount -t debugfs debugfs /sys/kernel/debug
+- Inventory lifecycle。
+- Sensor availability。
+- FRU rescan。
+- Associations。
+- Insert / remove event。
+
+##### 3.16.2 Present、Available 與 Functional
+
+| 狀態 | 意義 |
+|---|---|
+| Present | 實體是否存在 |
+| Available | 目前資料或服務是否可取得 |
+| Functional | 元件是否能正常提供功能 |
+
+例如 PSU 插入但 PMBus 暫時 timeout：
+
+```text
+Present=true
+Available=false
+Functional 尚不一定立即變成 false
+```
+
+##### 3.16.3 LED
+
+GPIO-controlled LED 可由 Linux LED class、phosphor-led-manager 或 platform service控制。Redfish identify state、D-Bus LED group 與 physical LED 必須一致。
+
+##### 3.16.4 Power Control
+
+Power-control service可能讀取：
+
+- `PWRBTN_N`
+- `PLTRST_N`
+- `SLP_Sx`
+- `PSU_PGOOD`
+- `VR_PGOOD`
+- `SYS_PWROK`
+
+並控制：
+
+- Power button pulse。
+- Reset pulse。
+- Rail enable，依平台架構。
+
+這些訊號的 owner、active level、time constraint 與 reset behavior 都需實測。
+
+#### 3.17 SoC GPIO、Expander 與 CPLD 的邊界
+
+| 類型 | 存取方式 | 需要記錄 |
+|---|---|---|
+| SoC GPIO | `/dev/gpiochip*` | Pinctrl、line offset、line name |
+| I2C GPIO expander | GPIO cdev + I2C device | Bus path、address、reset、supply |
+| CPLD bit | I2C / LPC / MMIO / driver | Register、bit、access、latch、clear |
+| MCU state | Mailbox / I2C / UART / D-Bus | Protocol、firmware、timeout |
+| Host sideband | eSPI / LPC / GPIO passthrough | Owner、host power state、BIOS config |
+
+CPLD fault latch 即使被 driver暴露成 GPIO-like state，仍要保留 read-clear、W1C、sticky 與 reset domain 等 register 語意。
+
+#### 3.18 Kernel 與 Yocto
+
+常見 kernel functions：
+
+- GPIOLIB。
+- GPIO character device。
+- Pinctrl / pinmux / pinconf。
+- SoC GPIO driver。
+- GPIO expander driver。
+- DebugFS，若開發映像需要。
+
+Target：
+
+```bash
+zcat /proc/config.gz | grep -Ei 'GPIO|GPIOLIB|PINCTRL|PINMUX|PINCONF'
+ls -l /dev/gpiochip*
+```
+
+Build：
+
+```bash
+bitbake -e virtual/kernel | grep '^S='
+find tmp/work -path '*linux*' -name '.config' -print
+```
+
+若 expander driver 編成 module，依賴該 gpiochip 的 service 需要處理 module load 與 probe timing。
+
+#### 3.19 Target 端排查流程
+
+##### 3.19.1 Schematic 與 DTB
+
+先確認：
+
+- Net name 與 SoC ball。
+- Pin function。
+- External pull。
+- Level shifter / buffer。
+- Power domain。
+- Running DTB。
+
+不能只看 source DTS；bootloader 可能載入另一份 DTB。
+
+##### 3.19.2 Pinctrl
+
+```bash
+mount | grep debugfs >/dev/null || \
+    mount -t debugfs debugfs /sys/kernel/debug
+
 find /sys/kernel/debug/pinctrl -maxdepth 2 -type f -print
-
-# 常見檔案
 cat /sys/kernel/debug/pinctrl/*/pins 2>/dev/null
 cat /sys/kernel/debug/pinctrl/*/pinmux-pins 2>/dev/null
 cat /sys/kernel/debug/pinctrl/*/pinconf-pins 2>/dev/null
 cat /sys/kernel/debug/pinctrl/*/gpio-ranges 2>/dev/null
 ```
 
-排查重點：
+檢查目標 pin 的 function、owner 與 GPIO range。
 
-- 目標 pin 是否已被 mux 到預期 function。
-- 同一 pin 是否顯示被其他 consumer 占用。
-- GPIO range 是否能把 gpio line 映射回 pinctrl pin。
-- pinconf 是否有預期 pull-up / pull-down / drive strength。
+##### 3.19.3 GPIO
 
-##### 3.8.3 讀取與短期測試 GPIO
-
-```sh
-# 讀值：建議先用 gpiofind 找到 chip 與 line
-gpiofind psu0-present-n
-# 假設輸出 gpiochip2 3
-gpioget gpiochip2 3
-
-# 監看 edge event，適合 presence / intrusion / button
-gpiomon --num-events=5 gpiochip2 3
-
-# 短時間設定 output，請只在確認安全的測試 line 上使用
-gpioset --mode=time --sec=2 gpiochip2 10=1
+```bash
+gpiodetect
+gpioinfo
+gpiofind <line-name>
 ```
 
-安全提醒：
+確認 chip label、offset、name、direction、active flag 與 consumer。
 
-- 不要在未確認前對 power enable、reset、write protect、strap、mux select line 執行 `gpioset`。
-- 若 line 已被 kernel driver 或 daemon 占用，`gpioset` 可能失敗或造成狀態競爭；先看 `gpioinfo` consumer。
-- 對 host power / reset 訊號做測試時，需同步 LA / scope、BMC journal、host log 與 CPLD register。
+##### 3.19.4 Physical Level
 
-#### 3.9 OpenBMC 整合：Presence、Intrusion、LED、Power Control
+以電表、示波器或 logic analyzer確認：
 
-##### 3.9.1 Entity Manager GPIODeviceDetect
+- Input voltage。
+- Output transition。
+- Reset / boot 時間線。
+- Glitch。
+- Edge / debounce。
+- BMC reboot 與 Host power transition。
 
-Entity Manager 可用 GPIO presence daemon 將多條 presence pin 組合成硬體識別結果，並在 D-Bus 上暴露 `xyz.openbmc_project.Inventory.Source.DevicePresence`，後續其他 Entity Manager config 可用 Probe 匹配此 presence 狀態。
+##### 3.19.5 OpenBMC
 
-GPIODeviceDetect JSON 範本：
+```bash
+systemctl --failed
+journalctl -b --no-pager | \
+    grep -Ei 'gpio|presence|power|reset|intrusion|led|button'
 
-```json
-{
-  "Name": "My Chassis",
-  "Probe": "xyz.openbmc_project.FruDevice({'BOARD_PRODUCT_NAME': 'MYBOARDPRODUCT*'})",
-  "Type": "Board",
-  "Exposes": [
-    {
-      "Name": "com.example.Hardware.fanboard0",
-      "PresencePinNames": ["fanboard0-present-n"],
-      "PresencePinValues": [0],
-      "Type": "GPIODeviceDetect"
-    },
-    {
-      "Name": "com.example.Hardware.riser0-type-a",
-      "PresencePinNames": ["riser0-id0", "riser0-id1"],
-      "PresencePinValues": [1, 0],
-      "Type": "GPIODeviceDetect"
-    }
-  ]
-}
+busctl tree xyz.openbmc_project.ObjectMapper | \
+    grep -Ei 'inventory|sensor|state|led'
 ```
 
-後續板卡 config 可用 DevicePresence 作為 Probe：
+#### 3.20 常見問題與判讀
 
-```json
-{
-  "Name": "My Fan Board 0",
-  "Probe": "xyz.openbmc_project.Inventory.Source.DevicePresence({'Name': 'com.example.Hardware.fanboard0'})",
-  "Type": "Board",
-  "Exposes": [
-    {
-      "Name": "fanboard_air_inlet",
-      "Bus": 5,
-      "Address": "0x28",
-      "Type": "NCT7802"
-    }
-  ]
-}
+| 現象 | 流程大約停在哪裡 | 優先檢查 |
+|---|---|---|
+| `gpioinfo` 沒有 line name | DTB / controller | Running DTB、line order、driver probe |
+| gpiochip number 改變 | Probe order | Line name、chip label、device path |
+| Peripheral 沒有訊號 | Pinmux | Pinctrl state、function、conflict |
+| GPIO 讀值和電壓相反 | Active level | DTS flag、inverter、logical / raw mode |
+| Output 設定後 pin 不變 | Pinmux / ownership | Alternate function、consumer、CPLD override |
+| `gpioset` 顯示 busy | Line 已被要求 | `gpioinfo` consumer、hog、driver |
+| Presence 反相 | Mapping | Physical level、active flag、service config |
+| Presence event 抖動 | Debounce | Scope、gpiomon、CPLD / service debounce |
+| Interrupt count 不增加 | IRQ config | Trigger、parent、pinmux、scope |
+| IRQ storm | Level source 未清除 | Device status、handler、shared IRQ |
+| BMC reboot 造成 Host 掉電 | Safe default / handoff | Pull、hog、driver、power service、CPLD |
+| Write protect 無法解除 | Polarity / owner | WP pin、mux、update state、security policy |
+| LED 顯示反相 | Polarity / owner | LED class、GPIO、CPLD pattern |
+| Button 誤動作 | Pull / debounce | Floating pin、RC、edge、service policy |
+
+#### 3.21 Debug Log 收集
+
+以下腳本只收集狀態，不要求或切換 GPIO output：
+
+```bash
+#!/bin/sh
+
+OUT=/tmp/pinmux-gpio-debug
+mkdir -p "$OUT"
+
+cat /etc/os-release > "$OUT/os-release.txt" 2>&1
+uname -a > "$OUT/uname.txt"
+cat /proc/cmdline > "$OUT/proc-cmdline.txt"
+cat /proc/device-tree/model > "$OUT/model.txt" 2>&1
+
+dmesg -T > "$OUT/dmesg.txt"
+journalctl -b --no-pager > "$OUT/journal.txt" 2>&1
+systemctl --failed > "$OUT/systemctl-failed.txt" 2>&1
+
+command -v gpiodetect >/dev/null 2>&1 && \
+    gpiodetect > "$OUT/gpiodetect.txt" 2>&1
+command -v gpioinfo >/dev/null 2>&1 && \
+    gpioinfo > "$OUT/gpioinfo.txt" 2>&1
+
+mount | grep debugfs >/dev/null 2>&1 || \
+    mount -t debugfs debugfs /sys/kernel/debug
+
+cat /sys/kernel/debug/gpio > "$OUT/debug-gpio.txt" 2>&1
+find /sys/kernel/debug/pinctrl -maxdepth 3 -type f -print \
+    > "$OUT/pinctrl-files.txt" 2>&1
+
+for f in /sys/kernel/debug/pinctrl/*/pins \
+         /sys/kernel/debug/pinctrl/*/pinmux-pins \
+         /sys/kernel/debug/pinctrl/*/pinconf-pins \
+         /sys/kernel/debug/pinctrl/*/gpio-ranges; do
+    [ -f "$f" ] || continue
+    name=$(echo "$f" | tr '/' '_')
+    cat "$f" > "$OUT/$name.txt" 2>&1
+done
+
+tar czf "/tmp/pinmux-gpio-debug-$(date +%Y%m%d-%H%M%S).tar.gz" \
+    -C /tmp pinmux-gpio-debug
 ```
 
-檢查：
+#### 3.22 Bring-up 順序
 
-```sh
-systemctl status xyz.openbmc_project.EntityManager.service --no-pager
-systemctl status xyz.openbmc_project.gpiopresence.service --no-pager 2>/dev/null
-journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager | tail -200
-journalctl -u xyz.openbmc_project.gpiopresence.service -b --no-pager | tail -200
-busctl tree xyz.openbmc_project.EntityManager
-busctl tree xyz.openbmc_project.Inventory.Manager 2>/dev/null
-busctl tree xyz.openbmc_project.ObjectMapper | grep -i DevicePresence
-```
+1. 建立 schematic net、SoC ball、expander port與 CPLD bit 清單。
+2. 標示 power、reset、strap、write-protect、fault、presence 與 mux 等高風險訊號。
+3. 確認每個 pin 的 reset state、external pull 與 power domain。
+4. 驗證 pinctrl nodes、functions、groups 與 consumer states。
+5. 使用 `gpiodetect` / `gpioinfo` 建立 gpiochip、offset 與 line name 對照。
+6. 以實測電壓確認 active level 與 logical value。
+7. 確認 kernel driver、hog 或 userspace service 的 line ownership。
+8. 驗證 GPIO expander 的 bus、address、reset、supply 與 INT。
+9. 驗證 interrupt trigger、debounce 與 clear flow。
+10. 將 presence、fault、LED、button 與 power signal 接到 OpenBMC services。
+11. 比對 D-Bus、Redfish、IPMI 與 physical level。
+12. 測試 AC cycle、BMC reboot、Host power cycle、service restart與 hot-plug。
+13. 保存 waveform、DTB、kernel / service logs與版本資訊。
 
-##### 3.9.2 Presence、Functional、Available 的差異
+#### 3.23 平台訊號紀錄表
 
-| 狀態 | 意義 | 範例 |
-| --- | --- | --- |
-| Present | 物理上存在 | PSU 插入、fan tray 插入、riser 插入 |
-| Functional | 存在且自我狀態正常 | PSU present 但 fault 為 false |
-| Available | 值可取得或服務可使用 | device powered、bus 可讀、daemon ready |
-| Fault | 裝置報錯或監控到 fault | PSU fault、fan tach fail、VR fault |
+| Signal | Hardware Pin | Linux Line | Active Level | Reset Default | Pull / Domain | Owner | Consumer | 風險 |
+|---|---|---|---|---|---|---|---|---|
+| `PWRBTN_N` | [待填] | [待填] | Low | [待填] | [待填] | BMC / CPLD | Power control | Critical |
+| `PLTRST_N` | [待填] | [待填] | Low | Input | [待填] | Host / PCH | State monitor | High |
+| `BIOS_WP_N` | [待填] | [待填] | Low | Protected | [待填] | BMC / Security | Update service | High |
+| `PSU0_PRSNT_N` | [待填] | [待填] | Low | Input | [待填] | BMC / CPLD | Inventory | High |
+| `FAN0_PRESENT_N` | [待填] | [待填] | Low | Input | [待填] | BMC | Fan service | High |
+| `VR_FAULT_N` | [待填] | [待填] | Low | Input | [待填] | CPLD / HW | Fault service | High |
+| `CHASSIS_INTRUSION_N` | [待填] | [待填] | Low | Input | [待填] | BMC / Security | Intrusion | Medium |
+| `UID_LED` | [待填] | [待填] | [待填] | Off | [待填] | BMC / CPLD | LED manager | Medium |
+| `I2C_MUX_SEL0` | [待填] | [待填] | [待填] | Safe channel | [待填] | BMC / CPLD | Bus owner | High |
 
-設計提醒：
+每列再補充：
 
-- `Present=false` 不應同時報 sensor critical threshold，通常應將 sensor 設為 unavailable 或移除 inventory association。
-- `Present=true` 但 `Functional=false` 適合表示 PSU 插著但 AC lost / fault，或 fan 插著但 tach 為 0。
-- Hot-swap 類訊號需處理 debounce 與 event storm，避免插拔瞬間產生大量 SEL。
-- 若 presence 來源有多種，例如 GPIO + EEPROM + PMBus ACK，需定義優先順序與衝突處理。
+- Schematic revision。
+- DTS node / property。
+- gpiochip label / offset。
+- Physical inactive / active voltage。
+- Debounce / interrupt type。
+- OpenBMC object。
+- 已驗證情境與 waveform location。
 
-##### 3.9.3 Intrusion / Button / LED
+#### 3.24 驗收 Checklist
 
-| 功能 | 常見 OpenBMC 對應 | 注意事項 |
-| --- | --- | --- |
-| Chassis intrusion | intrusion sensor / inventory / logging | rearm mode、latch clear、SEL / Redfish event |
-| UID button | button monitor / identify control | short press / long press policy、debounce |
-| Power button | power control service | pulse width、owner、host state dependency |
-| Reset button | reset control service / CPLD | debounce、host reset vs BMC reset |
-| Fault LED | LED group / fault manager | LED polarity、blink pattern、CPLD takeover |
-| UID LED | identify service / Redfish IndicatorLED | BMC / CPLD / front panel owner |
+Pinmux：
 
-#### 3.10 與 CPLD / FPGA / Board Glue Logic 的邊界
+- [ ] Schematic net、SoC ball、pin group 與 function 已對齊。
+- [ ] Running DTB 包含正確 pinctrl states。
+- [ ] 沒有互斥 peripheral 同時要求相同 pins。
+- [ ] Pull、drive strength、open-drain 與 power domain符合電路需求。
+- [ ] Boot straps 在 reset sampling 時間點已量測。
 
-很多平台會把 power sequence、reset mux、presence latch、fault latch、LED pattern、write protect、SKU ID 放在 CPLD。這些 bit 對 OpenBMC 來說可能長得像 GPIO，但排查方式不同。
+GPIO：
 
-建議區分：
+- [ ] GPIO controller、chip label、line offset 與 line name 已記錄。
+- [ ] 自動化流程不依賴可能變動的 gpiochip number。
+- [ ] Active level 已由 physical voltage、DTS flag與 OpenBMC state交叉驗證。
+- [ ] Kernel consumer、GPIO hog 與 userspace owner 沒有衝突。
+- [ ] GPIO expander 的 bus、address、reset、supply 與 interrupt 已驗證。
 
-| 類型 | Linux 視角 | 需要補的資訊 |
-| --- | --- | --- |
-| SoC GPIO | `/dev/gpiochip*` | pinmux、gpio-line-names、active level |
-| I2C GPIO expander | `/dev/gpiochip*` + I2C device | bus / address / expander reset / INT |
-| CPLD register bit | I2C / LPC / MMIO / sysfs / custom tool | register offset、bit、R/W、W1C、latch clear |
-| MCU-reported GPIO | D-Bus / UART / I2C protocol | polling / event / timeout / firmware version |
-| PCH sideband | eSPI / LPC / GPIO pass-through | BIOS / chipset owner、host state dependency |
+關鍵訊號：
 
-CPLD bit 表格範本：
+- [ ] Power enable、reset、write protect與 mux select具有安全 reset default。
+- [ ] BMC reboot 不會造成非預期 Host power / reset。
+- [ ] Presence、fault、button與 intrusion已驗證 debounce。
+- [ ] Interrupt trigger、count、handler與 clear flow正確。
+- [ ] LED polarity、pattern與 BMC / CPLD ownership正確。
 
-| Signal | CPLD offset | Bit | R/W | Active | Default | Clear rule | Mirrors GPIO? | Owner | 備註 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| VR_FAULT_N | [待填] | [待填] | RO/W1C | Low | [待填] | W1C | 否 | CPLD/HW | Fault latch |
-| PSU0_PRSNT_N | [待填] | [待填] | RO | Low | [待填] | N/A | 是 | CPLD/BMC | 與 GPIO line 對照 |
-| BIOS_WP_EN | [待填] | [待填] | RW | High | [待填] | RW | 否 | BMC/Security | 更新流程需控管 |
+OpenBMC：
 
-#### 3.11 Boot / Power / Reset 特別注意事項
+- [ ] Inventory Present、Available、Functional語意正確。
+- [ ] D-Bus、Redfish、IPMI與 physical signal一致。
+- [ ] Hot-plug、service restart、AC cycle與 Host power transition已測試。
+- [ ] Debug log與 waveforms已保存，且收集腳本不會切換高風險 outputs。
 
-##### 3.11.1 Boot strap 與 pinmux 共用 pin
+#### 3.25 本章重點
 
-部分 SoC pin 可能同時是 strap pin 與後續 GPIO / alternate function。此類 pin 要分成兩個時間點記錄：
+1. Pinmux 選擇 SoC pin 的硬體功能；GPIO 是其中一種可選功能。
+2. Schematic net、SoC ball、GPIO line與 D-Bus object需要完整對照。
+3. Pinctrl 同時管理 pinmux states與 pull、drive、open-drain等電氣設定。
+4. GPIO line offset屬於特定 gpiochip；gpiochip number可能隨 probe順序改變。
+5. Active-low訊號需要同時記錄 physical level與 logical value。
+6. Reset default由 SoC、external pull、bootloader、hog、driver與 service共同形成時間線。
+7. GPIO hog適合固定 early-boot狀態；需要動態控制的 line應由正式 consumer接管。
+8. GPIO expander必須先完成 bus與driverbring-up，才會出現對應 gpiochip。
+9. Presence、fault、reset、power enable與 write protect需要明確的 owner與安全流程。
+10. 排查應從 schematic與 physical level開始，再依序檢查 pinctrl、gpiochip、consumer與 OpenBMC。
 
-| 時間點 | 需要確認 |
-| --- | --- |
-| Reset deassert 附近 | strap latch 值、外部 pull、CPLD / buffer 是否干擾 |
-| Linux probe 後 | pinmux 是否改成預期功能、line 狀態是否安全 |
+#### 3.26 本章參考資料
 
-注意：
-
-- 不要只看 Linux 中的 `gpioinfo` 判斷 strap 是否正確；strap 是 reset 釋放附近被 latch。
-- 若 Linux 重新配置 pin 造成後續 reset / recovery path 改變，需在風險欄標示。
-- Strap pin 上若有按鈕、LED 或 shared net，需檢查上電時的電位與 timing。
-
-##### 3.11.2 Power enable / reset output
-
-Power enable 與 reset output 必須建立「安全預設值」：
-
-| 訊號 | Reset default 建議 | Driver / service ready 後 | 測試 |
-| --- | --- | --- | --- |
-| VR_EN | disable | power sequence 才 assert | AC on、BMC reboot、host off |
-| PERST_N | assert reset | PCIe power good 後 release | host boot、BMC reboot |
-| BIOS_WP_N | write protect enabled | authorized update 時短暫改變 | update success/fail、AC loss |
-| PSU_ON_N | off / deassert | power on request 才改變 | power on/off/cycle |
-
-##### 3.11.3 Interrupt / debounce
-
-Interrupt 類 GPIO 需確認：
-
-- Edge-trigger 還是 level-trigger。
-- Active low / active high 是否與硬體一致。
-- 是否需要 debounce；由硬體 RC、CPLD、kernel driver 或 daemon 處理。
-- 是否為 latched interrupt，需要讀特定 register clear。
-- 是否為 shared line；shared line 需每個 device 都讀 status 才能判斷來源。
-
-#### 3.12 常見問題與排查入口
-
-| 現象 | 可能方向 | 第一輪檢查 |
-| --- | --- | --- |
-| gpioinfo 看不到 line name | DTB 未更新、gpio-line-names 順序錯、GPIO controller 未 probe | `/proc/device-tree`、dmesg、gpioinfo |
-| gpiochip 編號與文件不同 | probe 順序改變、expander 有時不出現 | 使用 gpiofind line name、確認 chip label |
-| peripheral 不 probe | pinmux 未切到 alternate function、clock/reset 未就緒 | pinctrl debugfs、dmesg、DTS pinctrl-0 |
-| gpioget 讀值與電表不同 | active logical value vs physical value 混淆、外部 inverter | scope、DTS flag、gpioinfo active-low |
-| presence 反相 | PresencePinValues 錯、GPIO_ACTIVE_LOW 誤用 | gpioinfo、gpioget、Entity Manager JSON |
-| gpioset 失敗 busy | line 已被 driver / daemon / hog 占用 | gpioinfo consumer、systemctl status |
-| output 設了但硬體不變 | pinmux 還在 alternate function、level shifter 未上電、CPLD override | pinctrl、scope、CPLD register |
-| BMC reboot 時 host 掉電 | power enable default 不安全、GPIO hog / driver handoff gap | AC / BMC reset 量測、scope、CPLD owner |
-| BIOS / CPLD update 失敗 | write protect line polarity / owner 錯 | WP pin 量測、fw log、security policy |
-| interrupt 沒觸發 | trigger type 錯、line 未 mux、IRQ parent 錯、status 未 clear | `/proc/interrupts`、dmesg、scope |
-| LED 反相或不亮 | polarity、LED driver、CPLD pattern owner | gpioinfo consumer、LED sysfs、scope |
-| button 誤觸發 | debounce 不足、active level 錯、floating input | scope、pull resistor、event log |
-| Hot-swap 時 event storm | debounce / latch / service retry 不足 | journal、gpiomon、CPLD latch |
-
-#### 3.13 Bring-up 建議流程
-
-1. 建立 schematic net → SoC ball / expander port / CPLD bit 對照表。
-2. 標示所有 Critical / High 風險訊號：power、reset、strap、write protect、presence、fault、mux。
-3. 確認 pinmux：DTS pinctrl state、SoC alternate function、driver binding、DTB deploy。
-4. 確認 gpio-line-names：使用 `gpioinfo` 與 schematic 表逐條比對。
-5. 確認 active level：對每條 presence / fault / reset / enable 線進行 physical level 與 logical value 對照。
-6. 確認 default：AC on、BMC reset、Linux boot 前後、service restart 前後都需量測關鍵線。
-7. 確認 owner：BMC / CPLD / Host / BIOS / service 不可互相競爭。
-8. 導入 OpenBMC config：Entity Manager、power control、fan presence、intrusion、LED group 等。
-9. 驗證 D-Bus / Redfish / IPMI / SEL：確認外部狀態與硬體一致。
-10. 做異常測試：AC cycle、BMC reboot、Host power cycle、hot-swap、fault injection、update WP、factory reset。
-
-#### 3.14 當前平台 Pinmux / GPIO 實測表
-
-| 類別 | Signal | Linux line | Physical inactive | Physical active | Logical active | Owner | 已驗證情境 | 備註 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Power | PWRBTN_N | [待填] | [待填] | [待填] | [待填] | BMC/CPLD | power on/off/cycle | [待填] |
-| Reset | PLTRST_N | [待填] | [待填] | [待填] | [待填] | Host/PCH | host boot/BMC reboot | [待填] |
-| WP | BIOS_WP_N | [待填] | [待填] | [待填] | [待填] | BMC/Security | BIOS update | [待填] |
-| Presence | PSU0_PRSNT_N | [待填] | [待填] | [待填] | [待填] | BMC/CPLD | plug/unplug | [待填] |
-| Presence | FAN0_PRESENT_N | [待填] | [待填] | [待填] | [待填] | BMC | plug/unplug | [待填] |
-| Fault | VR_FAULT_N | [待填] | [待填] | [待填] | [待填] | CPLD/HW | fault injection | [待填] |
-| Intrusion | CHASSIS_INTRUSION_N | [待填] | [待填] | [待填] | [待填] | BMC/Security | open/rearm | [待填] |
-| LED | UID_LED | [待填] | [待填] | [待填] | [待填] | BMC/CPLD | Redfish identify | [待填] |
-| Mux | I2C_MUX_SEL0 | [待填] | [待填] | [待填] | [待填] | BMC/CPLD | bus scan | [待填] |
-
-#### 3.15 驗收 Checklist
-
-- [ ] Schematic net、SoC pin、GPIO line、gpio-line-name、OpenBMC object 已建立對照表。
-- [ ] Critical / High 訊號標示 owner、active level、reset default、pull resistor、boot risk。
-- [ ] DTS pinctrl state 與實際 peripheral 功能一致，沒有互斥 pinmux 衝突。
-- [ ] `gpioinfo` 顯示的 line name 與表格一致。
-- [ ] 不依賴不穩定的 gpiochipN 編號；重要腳本 / config 可用 line name 或固定 chip label。
-- [ ] active-low / active-high 已用實測電位驗證，並對應到 OpenBMC logical state。
-- [ ] GPIO hog 僅用於固定安全狀態，且不與後續 service 控制衝突。
-- [ ] power enable / reset / write protect 的 AC on、BMC reboot、Host power cycle 狀態已量測。
-- [ ] GPIO expander 的 I2C bus / address / reset / INT / supply 已驗證。
-- [ ] CPLD GPIO-like bit 已記錄 register offset、bit、R/W、default、clear rule。
-- [ ] Presence / Functional / Available / Fault 狀態定義已對齊 inventory、sensor、Redfish、IPMI。
-- [ ] Intrusion / button 類訊號已驗證 debounce、rearm、event log。
-- [ ] LED 類訊號已驗證 polarity、blink pattern、CPLD/BMC owner。
-- [ ] OpenBMC service、D-Bus object、Redfish / IPMI 顯示與硬體狀態一致。
-- [ ] AC cycle、BMC reboot、service restart、hot-swap、fault injection 測試已保存 log。
-
-#### 3.17 本章參考資料
-
-- Linux kernel documentation - GPIO mappings: https://www.kernel.org/doc/html/latest/driver-api/gpio/board.html
-- Linux kernel documentation - GPIO Device Tree bindings: https://www.kernel.org/doc/Documentation/devicetree/bindings/gpio/gpio.txt
-- Linux kernel documentation - PINCTRL subsystem: https://www.kernel.org/doc/html/latest/driver-api/pin-control.html
-- libgpiod documentation - gpioinfo: https://libgpiod.readthedocs.io/en/master/gpioinfo.html
+- Linux kernel documentation - GPIO mappings: https://docs.kernel.org/driver-api/gpio/board.html
+- Linux kernel documentation - GPIO character device userspace API: https://docs.kernel.org/userspace-api/gpio/chardev.html
+- Linux kernel documentation - PINCTRL subsystem: https://docs.kernel.org/driver-api/pin-control.html
+- Linux kernel Device Tree bindings - GPIO: https://github.com/torvalds/linux/tree/master/Documentation/devicetree/bindings/gpio
+- libgpiod documentation: https://libgpiod.readthedocs.io/
 - OpenBMC entity-manager: https://github.com/openbmc/entity-manager
-- OpenBMC entity-manager gpio-presence README: https://github.com/openbmc/entity-manager/blob/master/src/gpio-presence/README.md

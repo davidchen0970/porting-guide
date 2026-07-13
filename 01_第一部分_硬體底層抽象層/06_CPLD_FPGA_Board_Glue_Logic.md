@@ -1,433 +1,651 @@
-### 6. CPLD / FPGA / Board Glue Logic
+### 6. CPLD、FPGA 與 Board Glue Logic
 
-本章整理 BMC 平台中 CPLD、FPGA、board glue logic、platform controller、small MCU、hot-swap / fault latch、reset / power sequencing logic 與 GPIO-like register 的共用設計模式與排查方法。相較第 3 章的 Pinmux / GPIO、第 4 章的 Reset / Clock / Power Domain、第 5 章的周邊匯流排，本章聚焦「板級邏輯如何把多個訊號、時序、狀態、保護條件與 BMC / Host / BIOS / PSU / VR / slot 串接起來」。
+CPLD、FPGA 與 board glue logic 用來連接、判斷或控制板上的多個硬體訊號。它們常負責 power sequence、reset、fault latch、presence、LED、board ID、flash write protect 與 bus mux，並在 BMC Linux 尚未啟動前維持安全狀態。
 
-CPLD / FPGA 在伺服器平台中常見職責包含 power sequence、reset mux、watchdog reset target、LED pattern、board ID / SKU ID、fault latch、presence detect、write protect、BIOS / BMC flash mux、host sideband、front panel button、slot power enable、hot-swap retry、debug strap、manufacturing mode、security strap、firmware update gate。若文件只記錄 register offset 與 bit name，通常不足以排查問題；需同時記錄訊號來源、active level、default、clear rule、owner、讀寫副作用、與 OpenBMC 對外狀態的關係。
+本章先說明 CPLD、FPGA 與 glue logic 的差異，再介紹 register、state machine、fault latch、reset、presence、LED、write protect、firmware update，以及 OpenBMC 如何讀取與控制這些功能。
 
-本章的目標是讓每一個 CPLD / FPGA bit 都能回答下列問題：
+#### 6.1 CPLD、FPGA 與 Board Glue Logic 是什麼
 
-- 這個 bit 代表 raw pin 電位、latched fault、debounced state、derived state，還是 BMC 寫入的 control request？
-- 讀取該 bit 是否有副作用？寫入該 bit 是否會清除 latch、觸發 pulse、切 mux、關 power、放 reset？
-- power-on default 由誰決定：CPLD image、外部 pull、reset pin、strap、NVM 設定，還是 BMC service？
-- 這個 bit 的 owner 是 CPLD、BMC、BIOS、Host、Security、Manufacturing，還是多方共享？
-- bit 狀態如何映射到 Linux sysfs / D-Bus / Redfish / IPMI / SEL？
-- CPLD image 更新、BMC reboot、AC cycle、Host reset、watchdog reset 後，該狀態是否符合預期？
+##### 6.1.1 CPLD
 
-#### 6.1 角色與邊界
+CPLD（Complex Programmable Logic Device）是可程式化邏輯元件。它通常用來處理腳位數量較多、反應時間固定，且在上電後必須立即運作的板級控制邏輯。
 
-CPLD / FPGA / board glue logic 不是單純的「I/O expander」。在許多平台中，它負責在 BMC Linux 尚未啟動前維持安全狀態，並在 host power transition 中執行即時時序控制。因此排查時需把 CPLD 視為一個獨立 controller，而不是只看成幾個 GPIO。
+伺服器主板上的 CPLD 常負責：
 
-| 類型 | 常見職責 | 與 BMC 的關係 | Bring-up 重點 |
-| --- | --- | --- | --- |
-| CPLD | power sequence、reset mux、fault latch、LED、board ID、WP | BMC 透過 I2C / LPC / MMIO / GPIO 讀寫 register | register map、default、clear rule、image version |
-| FPGA | 高速板級邏輯、bridge、custom protocol、debug capture | BMC 可能負責 config、status、firmware update | configuration source、bitstream、done / init 狀態 |
-| Board glue logic | level shift、simple latch、mux、wired-OR、RC delay | BMC 只能量測或間接控制 | schematic、時序、pull、owner |
-| Platform MCU | power / thermal / security co-controller | BMC 透過 I2C / UART / mailbox 溝通 | protocol、firmware version、timeout、recovery |
-| Hot-swap / eFuse / supervisor | slot power、fault protection、PGOOD | BMC 讀 status、下 reset / retry | fault status、retry policy、clear rule |
+- Host power on / off sequence。
+- PSU、VR 與 slot power enable。
+- PGOOD 與 fault 判斷。
+- Reset signal 的產生、延遲與切換。
+- Front panel button 與 LED。
+- Board ID、SKU ID 與 cable ID。
+- BIOS / BMC flash write protect。
+- Flash、UART 或 JTAG mux。
+- Watchdog reset target。
+- Fault latch 與 debug status。
 
-建議先界定邊界：
+CPLD 通常在 BMC 開機前就已工作，因此不能只把它視為 BMC 後面的 I/O 裝置。部分 power、reset 與安全功能即使 BMC 當機，也必須由 CPLD繼續維持。
 
-- CPLD 自主決定的狀態，例如 power sequence step、fault latch、debounce state。
-- BMC request 類狀態，例如 power on request、LED mode、write protect enable。
-- Host / BIOS / PCH 決定的狀態，例如 PLTRST、SLP_Sx、RSMRST、POST complete。
-- 硬體 raw input，例如 presence pin、AC_OK、VR_PGOOD、PSU_PRESENT。
-- CPLD derived output，例如 SYS_PWROK、PERST_N、PSU_ON_N、RESET_OUT_N。
+##### 6.1.2 FPGA
 
-#### 6.2 系統架構與資料流
+FPGA（Field-Programmable Gate Array）也是可程式化邏輯元件，但通常具有更多邏輯資源、記憶體與高速 I/O，適合較複雜的資料處理或自訂介面。
 
-典型 CPLD / BMC / Host 資料流如下：
+BMC 平台可能使用 FPGA 處理：
+
+- 高速 bridge 或 protocol conversion。
+- 自訂 sideband protocol。
+- 大量訊號聚合。
+- Timestamp 或 debug capture。
+- PCIe、SerDes 或高速資料路徑。
+- 動態載入 bitstream 的可變硬體功能。
+
+FPGA 是否在上電後立即可用，取決於 configuration source。它可能從 SPI flash 自行載入，也可能由 BMC、host 或 JTAG tool 載入 bitstream。
+
+##### 6.1.3 Board Glue Logic
+
+Board glue logic 是把多個元件與訊號「接起來」的板級邏輯。它不一定是 CPLD 或 FPGA，也可能由簡單元件組成，例如：
+
+- Logic gate。
+- Latch 或 flip-flop。
+- Mux / demux。
+- Wired-OR。
+- Level shifter。
+- RC delay。
+- Supervisor 或 reset IC。
+
+這些電路未必有 software register。排查時需要看 schematic、量測波形，並確認 pull-up、active level、propagation delay 與 power domain。
+
+##### 6.1.4 Platform MCU
+
+有些平台使用小型 MCU 執行 power、thermal、security 或 hot-swap 控制。它和 CPLD 的差異是：MCU 執行 firmware 指令，CPLD / FPGA 則以硬體邏輯平行運作。
+
+BMC 通常透過 I2C、UART、mailbox 或 custom protocol 與 MCU 溝通，需要另外管理：
+
+- Firmware version。
+- Command / response protocol。
+- Timeout 與 retry。
+- Firmware update。
+- MCU 無回應時的 recovery。
+
+#### 6.2 為什麼伺服器主板需要 CPLD
+
+BMC 可以執行複雜的管理程式，但 Linux boot 需要時間，排程延遲也不固定。部分硬體功能不能等待 userspace service：
+
+- AC 上電後立即保持 rail 與 reset 的安全狀態。
+- 在指定時間內判斷 PGOOD。
+- Fault 發生時立即關閉 power enable。
+- 產生固定寬度的 reset pulse。
+- BMC reboot 時維持 host power。
+- 防止兩個 flash owners 同時驅動 bus。
+
+因此常見分工是：
+
+| 功能 | CPLD / FPGA | BMC / OpenBMC |
+|---|---|---|
+| 即時 power sequence | 執行時序與硬體保護 | 發出 power request、記錄結果 |
+| Fault shutdown | 立即停止危險輸出 | 建立 event、決定後續處理 |
+| Presence debounce | 過濾訊號 | 更新 inventory |
+| LED pattern | 產生固定 blink pattern | 選擇 LED mode |
+| Reset pulse | 產生固定 pulse | 發出 reset request |
+| Board ID | 讀取 strap 並保存狀態 | 選擇平台設定 |
+| Write protect | 維持安全預設與 mux interlock | 經授權流程要求解除 |
+
+#### 6.3 訊號從硬體到 OpenBMC 的流程
+
+一個外部訊號通常不會直接變成 Redfish 或 IPMI 狀態。以 PSU fault 為例：
 
 ```text
-Raw hardware signal
-    PSU / VR / slot / button / strap / presence / fault
+PSU_FAULT_N 實體腳位
         ↓
-CPLD sampling / debounce / latch / state machine
+CPLD sampling / debounce
         ↓
-CPLD register map
-    status / control / latch / version / scratch / security
+Current status bit
         ↓
-BMC access layer
-    I2C / LPC / MMIO / GPIO / UART / mailbox / JTAG tool
+Fault latch bit
         ↓
-Linux driver / userspace tool / OpenBMC daemon
+BMC 透過 I2C / MMIO 讀取 register
         ↓
-D-Bus state / sensor / inventory / event
+OpenBMC fault service
         ↓
-Redfish / IPMI / WebUI / SEL / service policy
+D-Bus state / logging entry
+        ↓
+Redfish EventLog / IPMI SEL
 ```
 
-排查時需分清楚 raw signal、latched signal、derived state 與 outward state：
+這條路徑中常見五種不同狀態。
 
-| 名稱 | 意義 | 典型例子 | 排查方式 |
-| --- | --- | --- | --- |
-| Raw input | CPLD 腳位目前電位 | `VR_FAULT_N`、`PSU0_PRESENT_N` | scope / LA、CPLD raw status bit |
-| Debounced state | CPLD 過濾後狀態 | button pressed、presence stable | CPLD status、debounce 設定 |
-| Latched fault | 曾經發生且等待清除 | VR fault latch、power sequence timeout | latch register、clear rule、fault timestamp |
-| Control request | BMC / Host 寫入的要求 | power on request、LED mode、WP enable | register write log、owner policy |
-| Derived output | CPLD state machine 產生的輸出 | `SYS_PWROK`、`PERST_N`、`PSU_ON_N` | waveform、state machine debug bit |
-| External state | OpenBMC 對外呈現 | Redfish PowerState、SEL、Functional | D-Bus、bmcweb、ipmid |
+##### 6.3.1 Raw Input
 
-#### 6.3 CPLD / FPGA 必填資料
+Raw input 是 CPLD 腳位目前的實體電位，例如：
 
-平台 bring-up 前，至少需填完下表，並在每次更換 CPLD image、BMC image、BIOS、power sequence、schematic revision、board rework 後更新。
+- `PSU0_PRESENT_N`
+- `VR_FAULT_N`
+- `AC_OK`
+- `POWER_BUTTON_N`
+
+Raw bit 適合和示波器或 logic analyzer 波形比對，但可能包含雜訊或接點彈跳。
+
+##### 6.3.2 Debounced State
+
+Debounced state 是 CPLD 確認訊號持續穩定一段時間後的結果，常用於 button、presence 與 mechanical switch。
+
+```text
+Raw input 抖動
+    ↓
+連續穩定 N ms
+    ↓
+Debounced state 改變
+```
+
+OpenBMC inventory 通常應使用 debounced state，而不是 raw pin。
+
+##### 6.3.3 Latched State
+
+Latch 用來記住「曾經發生過」的事件。即使 raw fault 已恢復，latch 仍保持，直到符合 clear rule。
+
+```text
+VR_FAULT_N 短暫拉低
+        ↓
+Raw status 回復正常
+        ↓
+VR_FAULT_LATCH 仍為 1
+```
+
+因此，raw status 表示「現在是否異常」，fault latch 表示「之前是否發生過異常」。
+
+##### 6.3.4 Control Request
+
+Control request 是 BMC、host 或其他 controller 寫入的要求，例如：
+
+- Host power on request。
+- Host reset request。
+- UID LED mode。
+- Flash mux select。
+- Write protect request。
+
+Request 不一定等於實際 output。例如 BMC 寫入 power-on request 後，CPLD 仍可能因 interlock 或 fault 拒絕進入下一個 state。
+
+##### 6.3.5 Derived Output
+
+Derived output 是 CPLD 綜合多個輸入、狀態與時序後產生的結果，例如：
+
+- `SYS_PWROK`
+- `PERST_N`
+- `PSU_ON_N`
+- `VR_EN`
+- `HOST_RESET_N`
+
+排查 derived output 時，需要知道它的完整 assertion condition，而不能只看單一 control bit。
+
+#### 6.4 Register Map
+
+BMC 通常透過 I2C、LPC、eSPI、MMIO、UART 或 mailbox 讀寫 CPLD / FPGA register。Register map 不只要列 offset，也要描述每個 bit 的來源、生命週期與副作用。
+
+##### 6.4.1 Register 基本欄位
 
 | 欄位 | 說明 |
-| --- | --- |
-| Device name | CPLD / FPGA / MCU 名稱，與 schematic 一致 |
-| Vendor / part number | Lattice、Intel、AMD/Xilinx、Microchip 等，填實際料號 |
-| Board location | Silkscreen、I2C bus、JTAG chain、connector |
-| Firmware / image version | 版本 register、build id、git commit、date code |
-| Access bus | I2C、LPC、eSPI sideband、MMIO、UART、JTAG、SPI |
-| I2C address / BAR / port | 存取位址與 bus path |
-| Register width | 8-bit、16-bit、32-bit，endianness |
-| Address auto-increment | multi-byte 讀寫是否支援 auto-increment |
-| Reset source | POR、BMC reset、Host reset、CPLD reset pin、watchdog |
-| Power rail | standby rail、host rail、slot rail |
-| Clock source | internal oscillator、external clock、host clock |
-| Default policy | AC applied 後的安全預設狀態 |
-| Update method | JTAG、I2C、SPI、BMC tool、factory tool |
-| Fallback / recovery | golden image、dual image、JTAG recovery、manual strap |
-| Security / WP | 更新授權、write protect、field mode、manufacturing mode |
-| Owner | HW、CPLD、BMC、BIOS、Security、Manufacturing |
+|---|---|
+| Offset | Register address |
+| Name | Register 名稱 |
+| Width | 8、16 或 32 bit |
+| Access | RO、RW、W1C、Pulse 等 |
+| Default | Reset 後初始值 |
+| Reset domain | POR、CPLD reset、BMC reset 或 live |
+| Description | Register 功能 |
+| Owner | CPLD、BMC、host、security 等 |
+| Side effect | Read / write 是否改變狀態 |
 
-#### 6.4 Register map 設計與填寫規則
+##### 6.4.2 常見存取語意
 
-CPLD register map 不只列 offset，更應描述 bit 的生命週期與副作用。建議每個 register 分成 status、control、latch、clear、version、scratch、debug 類別，不要把不同語意混在同一個欄位。
+| 縮寫 | 意義 | 注意事項 |
+|---|---|---|
+| RO | Read only | Read 不應改變狀態 |
+| RW | Read / write | 需說明 reset default |
+| WO | Write only | Read value 可能無意義 |
+| W1C | Write one to clear | 寫 1 清除對應 bit |
+| W1S | Write one to set | 寫 1 設定對應 bit |
+| RC | Read clear | Read 後自動清除 |
+| Pulse | 寫入後產生固定寬度 pulse | 需記錄 pulse width |
+| Sticky | Reset 後仍可能保留 | 需說明何種 reset 會清除 |
+| Live | 即時反映 pin 或 internal state | 可能隨時改變 |
+| Shadow | 先保存設定，之後才套用 | 需有 apply / commit 規則 |
 
-##### 6.4.1 Register map 總表
+##### 6.4.3 Register Map 範例
 
-| Offset | Register | Width | R/W | Default | Reset domain | Description | Owner | 備註 |
-| ---: | --- | ---: | --- | --- | --- | --- | --- | --- |
-| `0x00` | `CPLD_ID` | 8 | RO | [待填] | POR | device / board CPLD ID | CPLD | 需與 BOM 對齊 |
-| `0x01` | `CPLD_VER_MAJOR` | 8 | RO | [待填] | POR | CPLD major version | CPLD | image 版本 |
-| `0x02` | `CPLD_VER_MINOR` | 8 | RO | [待填] | POR | CPLD minor version | CPLD | image 版本 |
-| `0x10` | `RAW_PRESENCE` | 8 | RO | pin state | live | raw presence inputs | HW/CPLD | 不含 debounce |
-| `0x11` | `DEBOUNCE_PRESENCE` | 8 | RO | [待填] | live | debounced presence | CPLD | 給 BMC service 使用 |
-| `0x20` | `FAULT_LATCH` | 8 | RO | `0x00` | sticky | latched fault | CPLD/HW | 搭配 clear register |
-| `0x21` | `FAULT_CLEAR` | 8 | W1C | `0x00` | live | clear selected latch | BMC/CPLD | 清除前先保存 log |
-| `0x30` | `POWER_CTRL` | 8 | RW | safe off | BMC reset / POR | power request bits | BMC/CPLD | policy owner 需明確 |
-| `0x31` | `POWER_STATE` | 8 | RO | [待填] | live | state machine state | CPLD | power sequence debug |
-| `0x40` | `RESET_CTRL` | 8 | RW/Pulse | safe reset | [待填] | reset pulse / mux | BMC/CPLD | 寫入可能觸發 pulse |
-| `0x50` | `LED_CTRL` | 8 | RW | default pattern | [待填] | LED mode | BMC/CPLD | BMC / CPLD owner 切換 |
-| `0x60` | `SECURITY_STATUS` | 8 | RO | [待填] | sticky/live | WP / field mode / strap | Security | 不可由一般 service 修改 |
-| `0x70` | `SCRATCH` | 8 | RW | `0x00` | BMC reset? | debug scratch | BMC | bring-up 用 |
+| Offset | Register | Access | Default | 說明 |
+|---:|---|---|---:|---|
+| `0x00` | `CPLD_ID` | RO | [待填] | CPLD / board ID |
+| `0x01` | `VERSION_MAJOR` | RO | [待填] | Major version |
+| `0x02` | `VERSION_MINOR` | RO | [待填] | Minor version |
+| `0x10` | `RAW_PRESENCE` | RO / Live | Pin state | Raw presence inputs |
+| `0x11` | `PRESENCE_STATUS` | RO | [待填] | Debounced presence |
+| `0x20` | `FAULT_LATCH` | RO | `0x00` | Latched faults |
+| `0x21` | `FAULT_CLEAR` | W1C | `0x00` | Clear selected faults |
+| `0x30` | `POWER_REQUEST` | RW | Safe off | BMC power requests |
+| `0x31` | `POWER_STATE` | RO | [待填] | State machine state |
+| `0x40` | `RESET_CONTROL` | WO / Pulse | `0x00` | Reset requests |
+| `0x50` | `LED_CONTROL` | RW | [待填] | LED mode |
+| `0x60` | `SECURITY_STATUS` | RO | [待填] | WP / mode / strap |
+| `0x70` | `SCRATCH` | RW | `0x00` | Non-critical access test |
 
-##### 6.4.2 Bit 欄位範本
+##### 6.4.4 Bit 欄位
 
-| Register | Bit | Name | R/W | Active | Default | Meaning | Clear rule | Side effect | Owner | Test method |
-| --- | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `FAULT_LATCH` | 0 | `VR_FAULT_LATCH` | RO | High=latched | 0 | VR fault 曾發生 | 寫 `FAULT_CLEAR[0]=1` | clear 後 fault 證據消失 | CPLD/HW | fault injection |
-| `FAULT_LATCH` | 1 | `PSU_PGOOD_TIMEOUT` | RO | High=latched | 0 | PSU power good timeout | W1C | 需先保存 waveform | CPLD/HW | power cycle |
-| `POWER_CTRL` | 0 | `HOST_PWR_ON_REQ` | RW | High=request | 0 | BMC 要求 host power on | BMC 寫 0 清除 | 觸發 power sequence | BMC/CPLD | host on/off |
-| `RESET_CTRL` | 0 | `HOST_RESET_PULSE` | WO/Pulse | write 1 | 0 | 觸發 host reset pulse | auto clear | 會 reset host | BMC/CPLD | LA / host log |
-| `SECURITY_STATUS` | 0 | `BIOS_WP_EN` | RO/RW | High=WP | safe on | BIOS flash write protect | 依 policy | 可能影響 BIOS update | Security/BMC | update flow |
+一個 bit 至少應記錄：
 
-##### 6.4.3 Register 語意規則
+- Bit number。
+- Name。
+- Access type。
+- Active level。
+- Default。
+- Raw、debounced、latched、request 或 derived state。
+- Clear rule。
+- Read / write side effect。
+- Owner。
+- Test method。
 
-建議在 register map 中固定使用下列語意：
-
-- `RO`：純讀取，不因 read 改變狀態。
-- `RW`：讀寫暫存狀態，需說明 reset 後 default。
-- `W1C`：write one clear，清除前需保存狀態。
-- `W1S`：write one set，常用於 request 或 latch。
-- `RC`：read clear，讀取會清除，需在表格中清楚標示。
-- `Pulse`：寫入後 CPLD 產生固定寬度 pulse，需記錄 pulse width。
-- `Sticky`：跨 warm reset 保留，直到 AC cycle 或 clear。
-- `Live`：即時反映 pin 或 internal state。
-- `Shadow`：BMC 寫入但 CPLD 延後套用，需有 apply / commit 位元。
-
-#### 6.5 存取通道與驅動策略
-
-CPLD / FPGA register 可透過多種通道暴露給 BMC。不同通道的 timeout、atomicity、endianness、multi-byte read 行為與安全邊界不同，需在文件中記錄。
-
-| Access path | 常見形式 | 優點 | 注意事項 |
-| --- | --- | --- | --- |
-| I2C / SMBus | `i2c-X` + address | 簡單、常見、工具完整 | bus hang、byte/word order、read side effect |
-| LPC / eSPI sideband | I/O port、mailbox、KCS-like | 與 host sideband 接近 | host state dependency、安全邊界 |
-| MMIO | memory mapped register | 快速、可做 driver | address range、endianness、devmem 風險 |
-| GPIO-like | gpiochip / line | 可整合 libgpiod | 不適合複雜 clear / latch 語意 |
-| SPI | register protocol 或 flash image path | 可支援較大資料量 | CS、mode、flash / config 區分 |
-| UART / mailbox | custom command | 彈性高 | protocol、timeout、版本相容性 |
-| JTAG | factory / recovery | 最後救援路徑 | 現場可用性、安全限制 |
-
-##### 6.5.1 I2C register access 注意事項
-
-```sh
-# 先確認 bus 與 address
- i2cdetect -l
- i2cdetect -y <bus>
-
-# 讀單一 register，請先確認該 register 不是 read-clear
- i2cget -y <bus> <addr> <offset>
-
-# 寫 register 前需確認副作用
- i2cset -y <bus> <addr> <offset> <value>
-```
-
-安全提醒：
-
-- read-clear / W1C register 不可用一般輪詢工具反覆讀取。
-- multi-byte version / counter 若不是 atomic read，需記錄讀取順序。
-- 若同一 CPLD 同時由 kernel driver 與 userspace tool 存取，需有鎖定機制或管理流程。
-- 若 CPLD register 使用 bank / page，raw tool 使用後需恢復預設 page。
-
-##### 6.5.2 Linux driver 與 userspace tool
-
-常見整合方式：
-
-| 方式 | 適用情境 | 注意事項 |
-| --- | --- | --- |
-| userspace raw tool | bring-up、factory、debug | 需保護高風險寫入、記錄版本 |
-| hwmon driver | 電壓、電流、溫度、fan 類狀態 | channel label 與 scale 需對齊 |
-| gpio-regmap / GPIO driver | CPLD bit 暴露成 GPIO line | active level、latch / clear 不適合簡化為 GPIO |
-| regmap-based custom driver | register map 較完整 | 可集中處理 endianness、locking、sysfs |
-| OpenBMC daemon | 平台狀態、power control、LED、fault manager | service dependency、policy、event log |
-
-#### 6.6 Power sequence 與 state machine
-
-CPLD 常負責 host power sequence、slot power、PSU on/off、VR enable、PGOOD timeout、fault shutdown。文件中需要記錄 state machine，而不是只記錄 power enable bit。
-
-##### 6.6.1 Power sequence 狀態範本
-
-| State ID | State name | Entry condition | CPLD outputs | Wait signal | Timeout | Failure latch | Next state |
-| ---: | --- | --- | --- | --- | --- | --- | --- |
-| 0 | `S0_IDLE_OFF` | AC present, host off | PSU_ON_N deassert | power request | N/A | N/A | `S1_PSU_ON` |
-| 1 | `S1_PSU_ON` | BMC host on request | PSU_ON_N assert | PSU_PGOOD | [待填] | PSU_PGOOD_TIMEOUT | `S2_VR_ENABLE` |
-| 2 | `S2_VR_ENABLE` | PSU_PGOOD true | VR_EN assert | VR_PGOOD | [待填] | VR_PGOOD_TIMEOUT | `S3_SYS_PWROK` |
-| 3 | `S3_SYS_PWROK` | all VR_PGOOD true | SYS_PWROK assert | PCH ready | [待填] | SYS_PWROK_TIMEOUT | `S4_RELEASE_RESET` |
-| 4 | `S4_RELEASE_RESET` | PCH ready | release PLTRST / PERST | POST complete | [待填] | POST_TIMEOUT | `S5_HOST_ON` |
-| 5 | `S5_HOST_ON` | Host running | monitor faults | power off request / fault | N/A | fault latch | `S6_SHUTDOWN` |
-| 6 | `S6_SHUTDOWN` | request or fault | deassert enables by policy | rails off | [待填] | SHUTDOWN_TIMEOUT | `S0_IDLE_OFF` |
-
-##### 6.6.2 Power sequence 需記錄的訊號
-
-| 類型 | 範例 | 需記錄 |
-| --- | --- | --- |
-| Request | BMC power on、front panel button、AC restore | requester、debounce、priority |
-| Enable | PSU_ON_N、VR_EN、slot power enable | active level、default、owner |
-| Good | PSU_PGOOD、VR_PGOOD、PCH_PWROK | timeout、fault latch、是否 debounced |
-| Reset | RSMRST_N、PLTRST_N、PERST_N | release 條件、pulse width |
-| Fault | UV/OV/OC/OT、hot-swap fault | latch、clear rule、shutdown policy |
-| Policy | AC restore、fault retry、watchdog reset target | BMC / CPLD / BIOS 協調 |
-
-##### 6.6.3 Power sequence 排查
-
-```sh
-# CPLD register dump，依平台工具調整
-# cpldtool dump > /tmp/cpld-dump.txt
-
-# OpenBMC state
-busctl tree xyz.openbmc_project.State.Host 2>/dev/null
-busctl tree xyz.openbmc_project.State.Chassis 2>/dev/null
-journalctl -b --no-pager | grep -Ei 'power|pgood|pwrok|vr|psu|cpld|fault|timeout' | tail -300
-```
-
-建議 scope / LA 同步量測：
-
-- `AC_OK`
-- standby rail
-- `BMC_READY`
-- `PSU_ON_N`
-- `PSU_PGOOD`
-- `VR_EN`
-- `VR_PGOOD`
-- `SYS_PWROK`
-- `RSMRST_N`
-- `PLTRST_N`
-- `PERST_N`
-- `POST_COMPLETE`
-
-#### 6.7 Reset mux、reset pulse 與 watchdog target
-
-CPLD 常負責 reset mux 與 reset target selection。BMC reboot、host reset、watchdog reset、external reset、button reset、CPLD reset 的影響範圍必須明確記錄。
-
-| Reset source | 產生者 | Target | Pulse width | 是否影響 host | 是否影響 BMC | 備註 |
-| --- | --- | --- | --- | --- | --- | --- |
-| BMC watchdog | SoC / systemd | BMC reset or full board | [待填] | [待填] | 是 | 需確認 CPLD policy |
-| Host reset button | front panel / CPLD | Host reset | [待填] | 是 | 否 | debounce |
-| BMC request host reset | BMC → CPLD | Host reset | [待填] | 是 | 否 | power state gating |
-| AC cycle | external power | Full board | N/A | 是 | 是 | fault latch reset policy |
-| CPLD internal fault | CPLD state machine | rail shutdown / reset | [待填] | 是 | 視設計 | fault latch |
-
-Reset mux 欄位範本：
-
-| Signal | Source A | Source B | Mux select | Default | Owner | Safe state | 實測 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `HOST_RESET_N` | front panel button | BMC request | CPLD bit [待填] | front panel enabled | CPLD/BMC | deassert unless request | [待填] |
-| `BMC_SPI_SEL` | BMC SPI controller | Host / factory path | strap / CPLD bit | BMC boot path | Security/HW | boot flash protected | [待填] |
-| `UART_MUX_SEL` | BMC console | Host console | CPLD bit [待填] | BMC console | BMC/HW | debug available | [待填] |
-
-#### 6.8 Fault latch、event 與 clear policy
-
-Fault latch 是 CPLD 最常見但也最容易誤解的功能。Fault latch 表示「曾經發生」，不一定代表目前仍然存在；raw status 表示「現在狀態」。兩者必須分開寄存器與文件欄位。
-
-| Fault type | Raw bit | Latch bit | Clear rule | Event policy | 備註 |
-| --- | --- | --- | --- | --- | --- |
-| VR fault | `VR_FAULT_RAW` | `VR_FAULT_LATCH` | W1C after dump | SEL / Redfish event | 需保存 PMBus status |
-| PSU PGOOD timeout | `PSU_PGOOD_RAW` | `PSU_PGOOD_TIMEOUT` | W1C | power sequence failure | 需 waveform |
-| Thermal trip | `THERMTRIP_RAW` | `THERMTRIP_LATCH` | AC cycle or W1C | critical event | 可能需硬體 latch |
-| Chassis intrusion | `INTRUSION_RAW` | `INTRUSION_LATCH` | user rearm | security event | rearm policy 需明確 |
-| Slot overcurrent | `SLOT_OC_RAW` | `SLOT_OC_LATCH` | clear after slot power off | slot fault | retry 次數需記錄 |
-
-Clear policy 建議：
-
-1. 先保存 CPLD dump、PMBus / PMIC status、BMC journal、SEL / EventLog。
-2. 確認 raw fault 是否已解除。
-3. 依 owner 與安全政策執行 clear。
-4. clear 後立即再次 dump，確認 latch 是否清除且未重現。
-5. 將 clear 時間與執行者寫入測試紀錄。
-
-#### 6.9 Presence、Board ID、SKU ID 與 strap
-
-CPLD 常彙整 presence、board ID、SKU ID、riser type、cable ID、factory mode、debug strap。這些 bit 可能由 raw pin、resistor strap、EEPROM、GPIO expander 或 CPLD NVM 設定而來，需要記錄來源。
-
-| 類型 | 範例 | 來源 | OpenBMC 對應 | 注意事項 |
-| --- | --- | --- | --- | --- |
-| Presence | PSU、fan、riser、NVMe backplane | raw GPIO / CPLD debounce | inventory present | active level、debounce、hot-swap |
-| Board ID | mainboard revision | strap resistor / CPLD register | Entity Manager Probe | boot 前需穩定 |
-| SKU ID | feature set | resistor / EEPROM / CPLD NVM | config selection | 與 BOM / product name 對齊 |
-| Cable ID | front panel / riser cable | GPIO ID pins | inventory / topology | 插拔時 event policy |
-| Manufacturing mode | factory strap | jumper / CPLD bit | factory service enable | 量產後需關閉 |
-| Security strap | secure boot / debug enable | strap / OTP / CPLD | security policy | 不可被一般流程改變 |
-
-Presence 與 inventory 對齊：
+Fault bit 範例：
 
 ```text
-CPLD raw presence bit
-    ↓
-CPLD debounced presence status
-    ↓
-OpenBMC service / Entity Manager Probe
-    ↓
-Inventory Present=true/false
-    ↓
-Sensor availability / Redfish chassis / IPMI SDR
+Register    FAULT_LATCH
+Bit         0
+Name        VR_FAULT_LATCH
+Access      RO
+Active      1 = fault occurred
+Default     0
+Source      VR_FAULT_N after qualification
+Clear       Write FAULT_CLEAR[0] = 1
+Side effect Fault evidence disappears after clear
 ```
 
-#### 6.10 LED、button、front panel 與 user visible state
+#### 6.5 如何安全讀寫 Register
 
-CPLD 常負責 front panel LED pattern 與 button debounce。LED 類訊號需確認 owner：有些平台由 BMC 控制 LED group，有些由 CPLD 自主根據 fault state 控制，有些支援 BMC override。
+在讀寫 CPLD register 前，需先確認：
 
-| 功能 | CPLD 角色 | BMC 角色 | 需確認 |
-| --- | --- | --- | --- |
-| UID LED | blink / on / off pattern | Redfish IndicatorLED / identify service | polarity、blink frequency、override |
-| Fault LED | 根據 fault latch 或 BMC request | fault manager / event policy | CPLD autonomous vs BMC controlled |
-| Power LED | host power state pattern | state manager | host off / on / standby pattern |
-| UID button | debounce、short/long press | identify toggle / event | debounce time、long press policy |
-| Power button | debounce、pulse / pass-through | host power request | owner、pulse width、host state gating |
-| Reset button | debounce、reset request | reset policy | host reset vs BMC reset |
+- Access bus 與 address。
+- Register map / CPLD image version。
+- Register width 与 endianness。
+- Bank / page selection。
+- Address auto-increment。
+- Read 是否有 clear side effect。
+- Write 是否會切 power、reset、mux 或 write protect。
+- Kernel driver 與 userspace tool 是否同時存取。
 
-LED pattern 表格範本：
+##### 6.5.1 I2C 存取
 
-| LED | Mode | Pattern | Source | Priority | Redfish / IPMI 對應 |
-| --- | --- | --- | --- | --- | --- |
-| UID | Off | off | BMC/CPLD | normal | IndicatorLED=Off |
-| UID | Identify | blink [待填] Hz | BMC request | user request | IndicatorLED=Blinking |
-| Fault | Critical | solid / blink [待填] | CPLD fault latch | fault high priority | Health=Critical |
-| Power | Standby | slow blink / amber [待填] | CPLD state | platform policy | PowerState=Standby |
+```bash
+# 列出 adapters
+i2cdetect -l
 
-#### 6.11 Write protect、flash mux 與更新保護
+# 掃描前先確認該 bus 是否允許掃描
+i2cdetect -y <bus>
 
-CPLD 常控制 BIOS flash WP、BMC flash WP、CPLD image WP、flash mux、recovery strap。這類功能屬於安全與維修邊界，需比一般 GPIO 更嚴格記錄。
+# Read 前先確認 register 不是 read-clear
+i2cget -y <bus> <addr> <offset>
 
-| 項目 | 需記錄 |
-| --- | --- |
-| BIOS flash WP | active level、default、授權流程、BIOS update service owner |
-| BMC flash WP | boot flash保護、field update 是否可解除、recovery policy |
-| CPLD image WP | factory / field mode、JTAG enable、update authorization |
-| Flash mux | BMC / host / factory programmer 誰可存取，mux default |
-| Recovery strap | 手動 / 自動進入條件、退出條件 |
-| Anti-rollback | CPLD 是否參與 version / policy 判斷 |
-
-BIOS update / CPLD update 前建議保存：
-
-```sh
-mkdir -p /tmp/cpld-security-debug
-# cpldtool dump > /tmp/cpld-security-debug/cpld-dump-before.txt
-# flashrom --wp-status > /tmp/cpld-security-debug/flash-wp-before.txt 2>&1
-journalctl -b --no-pager > /tmp/cpld-security-debug/journal-before.txt
+# Write 前確認完整副作用
+i2cset -y <bus> <addr> <offset> <value>
 ```
 
-注意：write protect 相關訊號不建議由一般 debug script 自動解除；需經過授權流程與測試窗口。
+不建議直接對未知 register 讀寫。部分 register 可能：
 
-#### 6.12 CPLD / FPGA firmware update 與 recovery
+- Read 後清除 fault。
+- Write 1 後觸發 reset pulse。
+- 切換 flash owner。
+- 關閉 power rail。
+- 解除 write protect。
+- 改變 bank，使後續工具讀錯位置。
 
-CPLD / FPGA image 更新風險通常高於一般 service 更新，因為失敗可能造成 power sequence、reset、flash mux、debug path 都不可用。需建立更新前檢查、更新中斷處理與 recovery path。
+##### 6.5.2 Scratch Register
 
-| 項目 | 建議定義 |
-| --- | --- |
-| Image format | jed / svf / bit / bin / vendor package / signed package |
-| Version source | register、image manifest、build id、git commit |
-| Update path | JTAG、I2C bridge、SPI config flash、BMC driver、factory fixture |
-| Power requirement | host off、standby rail stable、slot power off、AC stable |
-| Write protect | field mode / manufacturing mode / jumper / signature |
-| Verification | readback checksum、version register、functional test |
-| Rollback | dual image、golden image、JTAG recovery、manual reflash |
-| Interruption test | AC loss、BMC reset、tool timeout、image mismatch |
+若硬體提供無副作用的 scratch register，可先用它確認：
 
-更新流程建議：
+- Bus path 與 address 正確。
+- Read / write 基本功能。
+- Register width 與 byte order。
+- Tool 與 image register map 相容。
 
-1. 確認目前 image version、board revision、CPLD device ID。
-2. 保存 CPLD register dump 與 BMC / host power state。
-3. 確認 host power state 符合更新要求，例如 host off。
-4. 驗證 package signature / checksum / board match。
-5. 解除必要 write protect，並記錄授權來源。
-6. 寫入 image。
-7. verify / readback。
-8. reset CPLD 或 AC cycle，依平台要求執行。
-9. 讀回 version register，執行 power sequence / reset / LED / presence smoke test。
-10. 收斂 log，回填本章版本表。
+Scratch register 不能和 power、reset、fault 或 security register 共用語意。
 
-#### 6.13 Linux / OpenBMC 整合模式
+##### 6.5.3 Regmap
 
-CPLD / FPGA 可以透過 kernel driver、userspace daemon 或 OpenBMC service 整合。建議依功能拆分，不要讓單一 debug tool 長期負責所有平台狀態。
+Linux regmap framework 可統一處理 register access，常用於 I2C、SPI 或 MMIO 裝置。它可以協助管理：
 
-| 功能 | 建議整合方式 | 對外狀態 |
-| --- | --- | --- |
-| version / board ID | sysfs / D-Bus inventory property | Redfish / Inventory |
-| presence | GPIO / CPLD service / Entity Manager | Inventory Present |
-| fault latch | platform fault service | SEL / Redfish EventLog |
-| power sequence state | power control service | Chassis / Host State |
-| LED | phosphor-led-manager 或平台 LED service | Redfish IndicatorLED |
-| write protect | security / update service | update precheck / audit log |
-| CPLD update | software manager / vendor updater | Software inventory |
+- Register / value width。
+- Endianness。
+- Locking。
+- Cache。
+- Readable / writable / volatile registers。
+- Debugfs register dump。
 
-D-Bus 對齊建議：
+Read-clear、W1C、volatile status 與 precious register 需要正確描述，避免 cache 或 debug read 破壞狀態。
+
+#### 6.6 Power Sequence 與 State Machine
+
+CPLD 常以 state machine 控制 host power。State machine 會根據 request、PGOOD、fault 與 timeout，依序切換 power enables 與 resets。
 
 ```text
-CPLD version register
-    → Inventory property / Software version object
-CPLD presence bit
-    → Inventory Present property
-CPLD fault latch
-    → Logging entry / EventLog / Functional=false
-CPLD power state
-    → xyz.openbmc_project.State.Host / Chassis
-CPLD LED control
-    → LED group / IndicatorLED
+Host power-on request
+        ↓
+Enable PSU
+        ↓ 等待 PSU_PGOOD
+Enable VR
+        ↓ 等待 VR_PGOOD
+Assert SYS_PWROK
+        ↓
+Release reset
+        ↓
+Host on
 ```
 
-常用檢查：
+##### 6.6.1 State 需要記錄什麼
 
-```sh
-busctl tree xyz.openbmc_project.Inventory.Manager 2>/dev/null
-busctl tree xyz.openbmc_project.State.Host 2>/dev/null
-busctl tree xyz.openbmc_project.State.Chassis 2>/dev/null
-busctl tree xyz.openbmc_project.Logging 2>/dev/null
-systemctl --failed
-journalctl -b --no-pager | grep -Ei 'cpld|fpga|power|fault|led|presence|wp|version' | tail -300
+每個 state 至少需要：
+
+- State ID 與名稱。
+- Entry condition。
+- CPLD outputs。
+- 等待的 input signal。
+- Timeout。
+- Timeout 後的 fault latch。
+- 下一個 state。
+- Shutdown / retry 行為。
+
+##### 6.6.2 State Machine 範例
+
+| State | 進入條件 | Output | 等待訊號 | Timeout 結果 |
+|---|---|---|---|---|
+| `IDLE_OFF` | AC present、host off | Rails off | Power request | 進入 `PSU_ON` |
+| `PSU_ON` | Power request | Assert `PSU_ON_N` | `PSU_PGOOD` | Latch PSU timeout |
+| `VR_ENABLE` | PSU good | Assert `VR_EN` | All `VR_PGOOD` | Latch VR timeout |
+| `SYS_PWROK` | VR good | Assert `SYS_PWROK` | PCH ready | Latch PWROK timeout |
+| `RELEASE_RESET` | PCH ready | Release reset | POST complete | Latch POST timeout |
+| `HOST_ON` | Sequence complete | Monitor faults | Off request / fault | 進入 shutdown |
+| `SHUTDOWN` | Request / fault | Deassert outputs | Rails off | 回到 `IDLE_OFF` |
+
+##### 6.6.3 Power On 失敗如何排查
+
+先保存：
+
+1. CPLD state。
+2. Fault latch。
+3. Raw PGOOD / fault bits。
+4. BMC power request。
+5. PMBus status。
+6. Kernel 與 OpenBMC journal。
+7. 相關訊號波形。
+
+波形常包含：
+
+```text
+AC_OK
+PSU_ON_N
+PSU_PGOOD
+VR_EN
+VR_PGOOD
+SYS_PWROK
+RSMRST_N
+PLTRST_N
+PERST_N
+POST_COMPLETE
 ```
 
-#### 6.14 DTS、driver 與平台工具欄位
+State 停在哪裡，通常能縮小到前一個 output、正在等待的 input，以及對應 timeout。
 
-若 CPLD 掛在 I2C，可用 DTS 描述 basic device node；若由 userspace tool 或 custom daemon 使用，也需文件化 bus、address、compatible 與 access method。
+#### 6.7 Reset 與 Reset Mux
 
-##### 6.14.1 I2C CPLD DTS 範本
+CPLD 可能接收多個 reset sources，再依平台狀態決定輸出到哪個 target。
+
+常見 reset sources：
+
+- Front panel reset button。
+- BMC host-reset request。
+- BMC watchdog。
+- Host watchdog。
+- CPLD internal fault。
+- External debug header。
+- AC cycle 或 supervisor reset。
+
+常見 targets：
+
+- BMC only。
+- Host only。
+- PCIe devices。
+- Chassis / full board。
+- Particular slot。
+
+##### 6.7.1 Reset 文件需要的資料
+
+| 欄位 | 說明 |
+|---|---|
+| Source | 誰產生 reset |
+| Target | 哪些元件受影響 |
+| Active level | High / low active |
+| Pulse width | Reset 持續多久 |
+| Gating | 什麼 power state 才允許 |
+| Mux select | 由哪個 bit / strap 選擇 |
+| Default | AC on 與 reset 後預設 |
+| Side effect | 是否造成 host、BMC 或 bus 中斷 |
+
+##### 6.7.2 BMC Reboot 不應等於 Host Power Loss
+
+若設計要求 BMC reboot 時 host 繼續運作，必須確認：
+
+- CPLD 自主維持 power sequence state。
+- BMC GPIO reset default 不會關閉 rail。
+- BMC-ready signal 不會直接解除 host enable。
+- Watchdog target 沒有誤設成 full-board reset。
+- BMC service 重新啟動後不會送出錯誤 power request。
+
+#### 6.8 Fault Status 與 Fault Latch
+
+Fault status 與 fault latch 應分開：
+
+```text
+Raw fault
+目前 fault pin 是否有效
+
+Fault latch
+從上次 clear 之後是否曾發生 fault
+```
+
+##### 6.8.1 Clear 流程
+
+```text
+發現 fault latch
+        ↓
+保存 CPLD register dump
+        ↓
+保存 PMBus / device status
+        ↓
+保存 journal、event 與 waveform
+        ↓
+確認 raw fault 已解除
+        ↓
+執行 W1C 或指定 clear
+        ↓
+再次讀取 raw 與 latch
+```
+
+若先 clear 再收集資訊，原始 fault 證據可能消失。
+
+##### 6.8.2 Read-Clear Register
+
+Read-clear register 只要讀取就會清除。這類 register 不應被一般 polling service、debugfs dump 或重複的 shell script 任意讀取。
+
+若 event 只能讀一次，應由單一 owner 讀取，再透過 D-Bus 或 logging service 分享結果，避免多個程式競爭。
+
+##### 6.8.3 Fault Retry
+
+Hot-swap 或 slot power fault 可能支援 retry。需定義：
+
+- 最大 retry 次數。
+- Retry delay。
+- 哪些 fault 可 retry。
+- 哪些 fault 必須 latch off。
+- AC cycle / manual clear 是否重設 counter。
+- BMC 與 CPLD 誰擁有 retry policy。
+
+#### 6.9 Presence、Board ID 與 Strap
+
+CPLD 常彙整多組 ID 與 presence pins。
+
+##### 6.9.1 Presence
+
+Presence 可能來自：
+
+- Connector pin。
+- PSU / fan presence pin。
+- Cable ID pins。
+- GPIO expander。
+- Hot-swap controller。
+
+需記錄 active level、pull-up domain、debounce time 與 hot-plug 行為。
+
+```text
+Raw presence
+    ↓
+CPLD debounce
+    ↓
+Presence status register
+    ↓
+OpenBMC inventory Present property
+    ↓
+Sensor availability / Redfish inventory
+```
+
+##### 6.9.2 Board ID 與 SKU ID
+
+Board ID 或 SKU ID 可由 resistor straps、EEPROM 或 CPLD NVM 提供。OpenBMC 可依 ID 選擇 Entity Manager config、inventory 名稱或功能組合。
+
+需要確認：
+
+- ID sampling 在哪個 reset 時刻發生。
+- Runtime 是否會改變。
+- 未接或非法組合如何處理。
+- ID 與 BOM、board revision 的對照表。
+- BMC 重開後是否讀到相同結果。
+
+##### 6.9.3 Manufacturing 與 Security Strap
+
+Manufacturing mode、debug enable、secure boot、JTAG enable 等 strap 涉及安全邊界。一般 service 不應有權任意修改；文件需記錄誰可讀、誰可改、變更何時生效，以及如何留下 audit log。
+
+#### 6.10 LED 與 Button
+
+##### 6.10.1 LED Owner
+
+LED 可能由 CPLD 自主控制，也可能由 BMC request 控制。若兩者都能控制，需要明確 priority。
+
+```text
+Critical hardware fault
+        >
+BMC fault indication
+        >
+User identify request
+        >
+Normal power state
+```
+
+實際 priority 依平台需求決定，但 CPLD register、OpenBMC LED group 與 Redfish 狀態要一致。
+
+##### 6.10.2 Button
+
+Button 通常需要：
+
+- Debounce。
+- Short press / long press 判斷。
+- Pulse width。
+- Host power-state gating。
+- Event owner。
+
+Power button 可以由 CPLD直接轉成 host pulse，也可先通知 BMC 再由 power-control service決定。兩種設計的延遲、故障模式與 BMC 無回應時行為不同。
+
+#### 6.11 Write Protect 與 Flash Mux
+
+CPLD 常控制：
+
+- BIOS flash write protect。
+- BMC flash write protect。
+- CPLD image write protect。
+- BMC / host / factory programmer flash mux。
+- Recovery strap。
+
+這些 bit 不是一般 GPIO。錯誤寫入可能造成無法開機、更新失敗或安全保護失效。
+
+##### 6.11.1 Write Protect 需要記錄什麼
+
+- Active level。
+- AC on default。
+- 誰能解除。
+- 解除條件與有效時間。
+- Host / BMC power-state requirement。
+- Update 完成後如何恢復。
+- Failure 時是否自動回到 protected state。
+- 是否有 hardware strap 或 physical presence requirement。
+
+##### 6.11.2 Flash Mux Interlock
+
+Flash mux 必須避免兩個 owners 同時驅動同一顆 flash。切換流程可能需要：
+
+1. 停止目前 owner 的 controller。
+2. 確認 chip select 為 inactive。
+3. Assert reset 或 isolation。
+4. 切換 mux。
+5. 等待訊號穩定。
+6. 啟用新的 owner。
+
+#### 6.12 CPLD / FPGA Firmware Update
+
+CPLD / FPGA update 可能影響 power、reset、flash 與 recovery path，因此需要比一般 service update 更嚴格的前置檢查。
+
+##### 6.12.1 Update 前
+
+- 讀取 device ID、image version 與 board revision。
+- 確認 package 與目標板相符。
+- 保存完整 register dump。
+- 確認 host / slot power state。
+- 確認 AC 與 standby rail 穩定。
+- 驗證 checksum / signature。
+- 確認 write protect 與授權。
+- 確認 recovery tool 和實體接點可用。
+
+##### 6.12.2 Update 中
+
+- 記錄寫入進度。
+- 不允許未管理的 BMC reboot 或 service restart。
+- 對 AC loss、tool timeout 與 verify failure 有明確結果。
+- 不在 image 尚未完成時套用會破壞現有控制邏輯的 reset。
+
+##### 6.12.3 Update 後
+
+- Readback / verify。
+- Reset CPLD 或依要求 AC cycle。
+- 讀回 image version。
+- 檢查 power state 與 safe defaults。
+- 驗證 presence、LED、reset、power sequence 與 write protect。
+- 保存 before / after dump。
+
+##### 6.12.4 Recovery
+
+Recovery 可能使用：
+
+- Golden image。
+- Dual configuration image。
+- JTAG programmer。
+- Factory fixture。
+- Manual strap。
+- External SPI programmer。
+
+Recovery path 必須在正式更新流程前實測，而不是更新失敗後才第一次嘗試。
+
+#### 6.13 Linux 與 OpenBMC 整合
+
+##### 6.13.1 Device Tree
+
+I2C CPLD 範例：
 
 ```dts
 &i2c8 {
     status = "okay";
-    clock-frequency = <400000>;
+    bus-frequency = <400000>;
 
     cpld@30 {
         compatible = "vendor,platform-cpld";
@@ -439,163 +657,267 @@ journalctl -b --no-pager | grep -Ei 'cpld|fpga|power|fault|led|presence|wp|versi
 };
 ```
 
-檢查重點：
+需確認：
 
-- `reg` 是 7-bit address，不是 8-bit shifted address。
-- interrupt pin 若接到 CPLD fault / event，需定義 trigger type 與 clear sequence。
-- reset-gpios 若會重置 power sequence controller，使用前需確認 host 影響範圍。
-- 若 CPLD register map 由 userspace 使用，仍需記錄工具版本與 register map 版本。
+- `reg` 使用 7-bit I2C address。
+- Reset CPLD 是否會影響 host power。
+- Interrupt 是 level 還是 edge。
+- Interrupt status 如何 clear。
+- Driver 與 register map version 是否相容。
 
-##### 6.14.2 FPGA Manager / configuration 狀態
+##### 6.13.2 Kernel Driver
 
-若平台由 Linux FPGA manager 或 vendor tool 載入 FPGA bitstream，需記錄：
+較完整的 CPLD register map 可使用 regmap-based driver，並依功能註冊：
 
-| 欄位 | 說明 |
-| --- | --- |
-| Config source | SPI config flash、BMC load、JTAG、host load |
-| Done / init pins | `DONE`、`INIT_B`、`PROGRAM_B`、status register |
-| Bitstream version | register、manifest、build id |
-| Load timing | AC on、BMC boot、host power on 前 / 後 |
-| Failure policy | bitstream fail 時是否禁止 host power on |
-| Recovery | golden bitstream、JTAG、factory fixture |
+- GPIO controller。
+- Hwmon。
+- LED class。
+- Reset controller。
+- NVMEM / board ID。
+- Sysfs 或 character device。
 
-#### 6.15 Target 端 log 收集
+不適合被簡化成 GPIO 的 register，例如 read-clear fault、pulse command、multi-bit state 或帶副作用的 control，應保留明確語意。
 
-以下提供 CPLD / FPGA / board glue logic 共用 log 套件。平台工具名稱需依實際專案調整。
+##### 6.13.3 OpenBMC Service
 
-```sh
-mkdir -p /tmp/cpld-debug
-cat /etc/os-release > /tmp/cpld-debug/os-release.txt
-uname -a > /tmp/cpld-debug/uname.txt
-cat /proc/cmdline > /tmp/cpld-debug/proc-cmdline.txt
-dmesg -T > /tmp/cpld-debug/dmesg.txt
-journalctl -b --no-pager > /tmp/cpld-debug/journal.txt
-journalctl -b -1 --no-pager > /tmp/cpld-debug/journal-previous.txt 2>&1 || true
-systemctl --failed > /tmp/cpld-debug/systemctl-failed.txt 2>&1
+| CPLD 資料 | OpenBMC 對應 |
+|---|---|
+| Version | Software / inventory version |
+| Presence | Inventory `Present` |
+| Fault latch | Logging / EventLog / functional state |
+| Power state | Host / chassis state |
+| LED mode | LED group / IndicatorLED |
+| Board ID | Entity Manager probe / platform selection |
+| Write protect | Update precheck / audit |
 
-# I2C / register access path
-i2cdetect -l > /tmp/cpld-debug/i2cdetect-l.txt 2>&1 || true
-ls -l /sys/bus/i2c/devices > /tmp/cpld-debug/sys-bus-i2c-devices.txt 2>&1 || true
-find /sys/bus/i2c/devices -maxdepth 3 -type l -o -type f > /tmp/cpld-debug/i2c-tree.txt 2>&1 || true
+Driver 提供可靠的硬體介面；OpenBMC service 負責名稱、關聯、事件與控制流程。
 
-# GPIO / pinctrl / clock
-mount | grep debugfs || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
-cat /sys/kernel/debug/gpio > /tmp/cpld-debug/debug-gpio.txt 2>&1 || true
-cat /sys/kernel/debug/clk/clk_summary > /tmp/cpld-debug/clk-summary.txt 2>&1 || true
-find /sys/kernel/debug/pinctrl -maxdepth 3 -type f -print > /tmp/cpld-debug/pinctrl-files.txt 2>&1 || true
+#### 6.14 FPGA Configuration
 
-# OpenBMC state
-busctl tree xyz.openbmc_project.State.Host > /tmp/cpld-debug/dbus-host-state.txt 2>&1 || true
-busctl tree xyz.openbmc_project.State.Chassis > /tmp/cpld-debug/dbus-chassis-state.txt 2>&1 || true
-busctl tree xyz.openbmc_project.Inventory.Manager > /tmp/cpld-debug/dbus-inventory.txt 2>&1 || true
-busctl tree xyz.openbmc_project.Logging > /tmp/cpld-debug/dbus-logging.txt 2>&1 || true
-busctl tree xyz.openbmc_project.Software.Version > /tmp/cpld-debug/dbus-software-version.txt 2>&1 || true
+若 FPGA bitstream 由 BMC 載入，需要記錄：
 
-# 平台工具，請依專案替換
-# cpldtool version > /tmp/cpld-debug/cpld-version.txt 2>&1 || true
-# cpldtool dump > /tmp/cpld-debug/cpld-dump.txt 2>&1 || true
-# cpldtool fault-status > /tmp/cpld-debug/cpld-fault-status.txt 2>&1 || true
-# cpldtool power-state > /tmp/cpld-debug/cpld-power-state.txt 2>&1 || true
-# fpgautil status > /tmp/cpld-debug/fpga-status.txt 2>&1 || true
+- Configuration source。
+- Bitstream format。
+- Load timing。
+- `DONE`、`INIT_B`、`PROGRAM_B` 等狀態。
+- Bitstream version。
+- Load failure 對 host power 的影響。
+- Golden image 或 JTAG recovery。
 
-tar czf /tmp/cpld-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp cpld-debug
+Linux FPGA Manager framework 可管理部分 FPGA configuration flow，但實際支援方式取決於 FPGA family、configuration interface 與平台 driver。
+
+#### 6.15 Target 端排查流程
+
+##### 6.15.1 確認裝置與版本
+
+```bash
+i2cdetect -l
+ls -l /sys/bus/i2c/devices
+
+dmesg | grep -Ei 'cpld|fpga|regmap|fault|power|reset'
 ```
 
-#### 6.16 常見問題與排查入口
+再使用平台核准的工具讀取 device ID、image version 與 register map version。
 
-| 現象 | 可能方向 | 第一輪檢查 |
-| --- | --- | --- |
-| CPLD I2C address 掃不到 | bus / mux / address / power / reset 問題 | `i2cdetect -l`、scope、rail、reset |
-| CPLD version register 讀值錯 | bus width、endianness、bank/page、image mismatch | register map、tool version、LA decode |
-| fault latch 一直回來 | raw fault 未解除、clear 順序錯、硬體真的異常 | raw status、PMBus status、scope |
-| fault latch 清掉後無 log | clear 前未保存、read-clear register 被輪詢 | journal、工具流程、register 語意 |
-| Host power on timeout | power sequence state machine 停在某 step | CPLD state、PGOOD waveform、fault latch |
-| BMC reboot 導致 host 掉電 | CPLD / GPIO default 不安全、BMC_READY 影響 power | waveform、CPLD default、power daemon log |
-| LED 狀態與 Redfish 不符 | LED owner 不一致、CPLD autonomous pattern、polarity 錯 | LED register、phosphor-led-manager、scope |
-| Presence 反相 | active level 錯、raw/debounce 混淆、connector ID 錯 | raw bit、debounced bit、entity config |
-| Board ID / SKU 錯 | strap resistor、CPLD decode、BOM 不符 | schematic、raw ID bit、inventory probe |
-| BIOS update 失敗 | WP 未解除、flash mux 未切、host owner 衝突 | WP bit、flashrom log、CPLD mux state |
-| CPLD update 後無法開機 | image 不符、power sequence regression、default 改變 | JTAG recovery、version、waveform |
-| Reset pulse 太短 / 太長 | CPLD pulse width 設定或 clock 不符 | LA、register、CPLD image版本 |
-| Watchdog reset target 錯 | CPLD reset routing / policy 錯 | reset reason、watchdog設定、scope |
-| OpenBMC inventory 不更新 | service 未重讀 CPLD state、Probe 條件錯 | Entity Manager journal、D-Bus tree |
+##### 6.15.2 確認 Raw、Latch 與 State
 
-#### 6.17 Bring-up 建議流程
+至少同時保存：
 
-1. 建立 CPLD / FPGA inventory：料號、位置、版本 register、access bus、update path、owner。
-2. 取得最新版 register map，標示每個 bit 的 R/W、default、active level、clear rule、side effect。
-3. 確認 access path：I2C / LPC / MMIO / UART / JTAG，並保存 bus map。
-4. 先讀 ID / version / scratch register，確認工具與 register map 對齊。
-5. 驗證 raw input：presence、PGOOD、fault、button、strap，以 scope / LA 與 register 同步比對。
-6. 驗證 control output：LED、mux select、safe GPIO、非破壞性 control bit。
-7. 驗證 power sequence：host on/off/cycle、timeout、fault injection、AC restore。
-8. 驗證 reset mux：BMC reset、host reset、watchdog reset、button reset、CPLD reset。
-9. 驗證 fault latch / clear rule：先保存 log，再 clear，再確認 raw fault 狀態。
-10. 驗證 write protect / flash mux：在授權流程中測試 BIOS / CPLD / BMC update 前置條件。
-11. 導入 OpenBMC service：inventory、state、fault、LED、power、software version。
-12. 驗證 Redfish / IPMI / SEL：對外狀態與 CPLD raw / latch / state 一致。
-13. 做 regression：AC cycle、BMC reboot、host power loop、service restart、update interruption、factory reset。
-14. 回填本章表格、版本、log、owner 與已知限制。
+- Raw inputs。
+- Debounced status。
+- Fault latch。
+- Control requests。
+- State machine state。
+- Derived outputs。
 
-#### 6.18 當前平台 CPLD / FPGA 實測表
+只保存其中一組，通常不足以判斷問題發生在哪一層。
 
-##### 6.18.1 Device 與存取資訊
+##### 6.15.3 確認 OpenBMC
 
-| 項目 | 實測值 | 來源 | Owner | 狀態 |
-| --- | --- | --- | --- | --- |
-| CPLD / FPGA device name | [待填] | schematic / BOM | HW | [待確認] |
-| Vendor / part number | [待填] | BOM | HW | [待確認] |
-| Board location | [待填] | layout | HW | [待確認] |
-| Image version | [待填] | version register | CPLD/BMC | [待確認] |
-| Register map version | [待填] | design doc | CPLD | [待確認] |
-| Access bus | [待填] | schematic / runtime | BMC | [待確認] |
-| Address / port / BAR | [待填] | bus map | BMC | [待確認] |
-| Update method | [待填] | factory / field process | Manufacturing/BMC | [待確認] |
-| Recovery method | [待填] | platform plan | HW/BMC | [待確認] |
-| Security mode | [待填] | security policy | Security | [待確認] |
+```bash
+systemctl --failed
+journalctl -b --no-pager | \
+    grep -Ei 'cpld|fpga|power|fault|led|presence|write.protect|version'
 
-##### 6.18.2 Register 實測表
+busctl tree xyz.openbmc_project.State.Host 2>/dev/null
+busctl tree xyz.openbmc_project.State.Chassis 2>/dev/null
+busctl tree xyz.openbmc_project.Logging 2>/dev/null
+```
 
-| Register | Bit | Name | Default | Raw / latch / control | 實測值 | Clear rule | Owner | 備註 |
-| --- | ---: | --- | --- | --- | --- | --- | --- | --- |
-| [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
-| [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] | [待填] |
+實際 service name 與 object path 依產品整合而異。
 
-##### 6.18.3 Power / reset / fault 驗證表
+##### 6.15.4 波形與 Register 同步
 
-| 測試 | CPLD state | 相關 register | Waveform / log | 預期 | 實測 | 結論 |
-| --- | --- | --- | --- | --- | --- | --- |
-| AC cycle | [待填] | [待填] | [待填] | safe default | [待填] | [待確認] |
-| BMC reboot | [待填] | [待填] | [待填] | host 不受非預期影響 | [待填] | [待確認] |
-| Host power on | [待填] | [待填] | [待填] | state machine 完成 | [待填] | [待確認] |
-| Host power off | [待填] | [待填] | [待填] | rails 依序關閉 | [待填] | [待確認] |
-| Watchdog reset | [待填] | [待填] | [待填] | reset target 正確 | [待填] | [待確認] |
-| Fault injection | [待填] | [待填] | [待填] | latch / event 正確 | [待填] | [待確認] |
-| CPLD update | [待填] | [待填] | [待填] | version 更新且功能正常 | [待填] | [待確認] |
+Power / reset 問題應在同一測試中同步保存：
 
-#### 6.19 驗收 Checklist
+- 示波器或 logic analyzer waveform。
+- CPLD state 與 fault registers。
+- BMC journal。
+- Host / chassis D-Bus state。
+- 測試動作與 timestamp。
 
-- [ ] CPLD / FPGA 料號、位置、版本 register、register map version 已記錄。
-- [ ] access bus、address、register width、endianness、bank/page、auto-increment 規則已確認。
-- [ ] 每個 register bit 已標示 R/W、default、active level、raw / latch / control / derived 語意。
-- [ ] W1C、read-clear、pulse、sticky、shadow 類 bit 已標示副作用與使用限制。
-- [ ] Power sequence state machine 已列出 state、entry condition、output、wait signal、timeout、failure latch。
-- [ ] Reset source、reset target、pulse width、watchdog reset 範圍已量測。
-- [ ] Fault latch 與 raw status 分開記錄；clear 前保存 log 的流程已建立。
-- [ ] Presence、Board ID、SKU ID、manufacturing mode、security strap 與 inventory / Probe 對齊。
-- [ ] LED / button / front panel 的 owner、pattern、debounce、Redfish / IPMI 對應已驗證。
-- [ ] BIOS / BMC / CPLD flash WP 與 flash mux default、安全流程、更新授權已確認。
-- [ ] CPLD / FPGA update flow、verify、rollback / recovery path 已測試。
-- [ ] BMC reboot、AC cycle、host reset、watchdog reset 不會造成非預期 power / reset 切換，或已有明確產品政策。
-- [ ] OpenBMC D-Bus / Redfish / IPMI / SEL 對外狀態與 CPLD register / waveform 一致。
-- [ ] cpld-debug log 收集腳本可執行，並納入 bring-up / regression 流程。
-- [ ] 測試紀錄包含 CPLD version、BMC image version、BIOS version、CPLD dump、journal、waveform、owner、已知限制。
+#### 6.16 常見問題與判讀
 
-#### 6.20 本章參考資料
+| 現象 | 優先方向 | 第一輪檢查 |
+|---|---|---|
+| CPLD I2C address 無回應 | Bus、power、reset、address | Adapter、rail、reset、waveform |
+| Version 讀值錯誤 | Width、endianness、bank、image | Register map、tool version |
+| Fault latch 清除後又出現 | Raw fault 尚未解除 | Raw status、PMBus、waveform |
+| Clear 後無法分析 | Clear 前未保存 | Tool / service 流程 |
+| Host power-on timeout | State machine 等不到 input | State、PGOOD、fault latch |
+| BMC reboot 造成 host 掉電 | Default 或 reset routing | CPLD state、GPIO default、waveform |
+| Presence 反相 | Active level 或 raw/debounce 混淆 | Raw bit、debounced bit、schematic |
+| LED 與 Redfish 不一致 | Owner、priority、polarity | LED register、D-Bus、waveform |
+| Board ID 錯誤 | Strap、decode、BOM | Raw ID、schematic、inventory |
+| BIOS update 失敗 | WP、flash mux、owner conflict | WP register、mux state、update log |
+| CPLD update 後無法開機 | Image / default / sequence regression | JTAG recovery、version、waveform |
+| Watchdog reset target 錯誤 | Reset mux / policy | Reset reason、CPLD register、scope |
 
-- Linux kernel documentation - GPIO Mappings: https://docs.kernel.org/driver-api/gpio/board.html
+#### 6.17 Debug Log 收集
+
+以下腳本只收集一般系統資訊；CPLD register dump 需使用平台核准的唯讀工具另外加入。
+
+```bash
+#!/bin/sh
+
+OUT=/tmp/cpld-fpga-debug
+mkdir -p "$OUT"
+
+cat /etc/os-release > "$OUT/os-release.txt" 2>&1
+uname -a > "$OUT/uname.txt"
+cat /proc/cmdline > "$OUT/proc-cmdline.txt"
+
+dmesg -T > "$OUT/dmesg.txt"
+journalctl -b --no-pager > "$OUT/journal.txt" 2>&1
+journalctl -b -1 --no-pager > "$OUT/journal-previous.txt" 2>&1
+systemctl --failed > "$OUT/systemctl-failed.txt" 2>&1
+
+i2cdetect -l > "$OUT/i2cdetect-l.txt" 2>&1
+ls -l /sys/bus/i2c/devices > "$OUT/i2c-devices.txt" 2>&1
+find /sys/bus/i2c/devices -maxdepth 3 -print > "$OUT/i2c-tree.txt" 2>&1
+
+mount | grep debugfs >/dev/null 2>&1 || \
+    mount -t debugfs debugfs /sys/kernel/debug
+
+cat /sys/kernel/debug/gpio > "$OUT/gpio.txt" 2>&1
+find /sys/kernel/debug/pinctrl -maxdepth 3 -type f -print \
+    > "$OUT/pinctrl.txt" 2>&1
+
+busctl tree xyz.openbmc_project.State.Host \
+    > "$OUT/host-state.txt" 2>&1
+busctl tree xyz.openbmc_project.State.Chassis \
+    > "$OUT/chassis-state.txt" 2>&1
+busctl tree xyz.openbmc_project.Logging \
+    > "$OUT/logging.txt" 2>&1
+
+# 依平台加入唯讀工具，例如：
+# cpldtool version > "$OUT/cpld-version.txt" 2>&1
+# cpldtool dump --safe > "$OUT/cpld-dump.txt" 2>&1
+# fpgautil status > "$OUT/fpga-status.txt" 2>&1
+
+tar czf "/tmp/cpld-fpga-debug-$(date +%Y%m%d-%H%M%S).tar.gz" \
+    -C /tmp cpld-fpga-debug
+```
+
+通用腳本不應自動：
+
+- Clear fault latch。
+- 發出 power / reset request。
+- 切換 flash mux。
+- 解除 write protect。
+- Reset CPLD / FPGA。
+- 寫入 scratch 以外的 register。
+
+#### 6.18 Bring-up 順序
+
+1. 確認 CPLD / FPGA part number、board location 與 power rail。
+2. 取得對應 image version 的 register map。
+3. 確認 access bus、address、width、endianness 與 bank。
+4. 先讀取 ID、version 與無副作用 status。
+5. 使用 scratch register 驗證基本 read / write，若平台提供。
+6. 將 raw inputs 與 schematic / waveform 對照。
+7. 驗證 debounce、presence、board ID 與 straps。
+8. 驗證非破壞性的 LED 與 mux 狀態。
+9. 驗證 power sequence 的每個 state、timeout 與 fault latch。
+10. 驗證 reset source、target 與 pulse width。
+11. 建立 fault 保存、clear 與 event 流程。
+12. 驗證 write protect 與 flash mux 的授權流程。
+13. 驗證 OpenBMC inventory、state、LED 與 logging。
+14. 最後執行 firmware update、interruption 與 recovery 測試。
+15. 進行 BMC reboot、host power cycle、AC cycle 與 watchdog regression。
+
+#### 6.19 平台實測紀錄表
+
+| 項目 | 來源 / 指令 | 實測值 | 備註 |
+|---|---|---|---|
+| Device / part number | BOM / schematic | [待填] | CPLD / FPGA / MCU |
+| Board location | Layout | [待填] | Silkscreen |
+| Image version | Version register | [待填] | 對應 build commit |
+| Register map version | Design document | [待填] | 必須和 image 對齊 |
+| Access path | I2C / MMIO / LPC / UART | [待填] | Bus / address |
+| Register format | Width / endian / bank | [待填] | Tool 設定 |
+| Reset source | Schematic | [待填] | POR / BMC / host |
+| Power rail | Schematic | [待填] | Standby / main |
+| Raw status | Register dump | [待填] | 與 pin 波形對照 |
+| Fault latch | Register dump | [待填] | Clear rule |
+| Power state | State register | [待填] | State / timeout |
+| Reset routing | Register / waveform | [待填] | Source / target |
+| Board / SKU ID | Strap register | [待填] | BOM 對照 |
+| Write protect | Security register | [待填] | Default / owner |
+| OpenBMC mapping | D-Bus | [待填] | Inventory / state / log |
+| Update method | Platform process | [待填] | Verify / rollback |
+| Recovery method | JTAG / golden image | [待填] | 已實測 |
+
+#### 6.20 驗收 Checklist
+
+基本資料：
+
+- [ ] Part number、位置、image version 與 register map version 已記錄。
+- [ ] Access bus、address、width、endianness、bank 與 auto-increment 已確認。
+- [ ] 每個 bit 的 access、default、active level、owner 與副作用已記錄。
+- [ ] Raw、debounced、latched、request 與 derived state 已區分。
+
+Power、Reset 與 Fault：
+
+- [ ] Power state machine 的 state、input、output、timeout 與 fault 已實測。
+- [ ] Reset source、target、pulse width 與 gating 已量測。
+- [ ] BMC reboot 不會造成非預期 host power / reset。
+- [ ] Fault clear 前會保存 register、PMBus、journal 與 waveform。
+- [ ] Read-clear、W1C、Pulse 與 Sticky register 不會被一般輪詢破壞。
+
+平台功能：
+
+- [ ] Presence、board ID、SKU ID 與 OpenBMC inventory 一致。
+- [ ] LED owner、priority、pattern 與 Redfish 狀態一致。
+- [ ] Write protect 與 flash mux 具有安全 default 與授權流程。
+- [ ] Kernel driver與 userspace tool 不會衝突存取 register。
+- [ ] OpenBMC state、logging 與 CPLD status 一致。
+
+Update 與 Recovery：
+
+- [ ] Image package 會檢查 device ID 與 board revision。
+- [ ] Update 前後會保存 version 與 register dump。
+- [ ] Verify、interruption、rollback 與 recovery 已測試。
+- [ ] AC cycle、BMC reboot、host cycle 與 watchdog regression 已完成。
+
+#### 6.21 本章重點
+
+1. CPLD 常負責必須在 BMC Linux 啟動前運作的 power、reset 與保護邏輯。
+2. FPGA 通常提供更多邏輯與高速 I/O，並需要管理 bitstream 載入與 recovery。
+3. Raw input、debounced state、fault latch、control request 與 derived output 是不同狀態。
+4. Register map 必須記錄 access、default、reset domain、owner、clear rule 與 side effect。
+5. W1C、read-clear、pulse 與 security register 不能用一般輪詢或未知工具任意存取。
+6. Power sequence 應以 state machine、等待訊號與 timeout 排查，不只看 power request bit。
+7. Fault clear 前要先保存 raw status、latch、PMBus status、journal 與 waveform。
+8. BMC reboot、host reset、watchdog reset 與 AC cycle 的影響範圍必須分開驗證。
+9. Write protect、flash mux 與 firmware update 屬於安全與 recovery 邊界。
+10. OpenBMC 對外狀態應能回溯到 CPLD register、實體訊號與明確的 owner。
+
+#### 6.22 本章參考資料
+
 - Linux kernel documentation - Regmap API: https://docs.kernel.org/driver-api/regmap.html
-- Linux kernel documentation - Linux I2C Sysfs: https://docs.kernel.org/i2c/i2c-sysfs.html
+- Linux kernel documentation - GPIO Mappings: https://docs.kernel.org/driver-api/gpio/board.html
+- Linux kernel documentation - I2C Sysfs: https://docs.kernel.org/i2c/i2c-sysfs.html
 - Linux kernel documentation - FPGA Manager Framework: https://docs.kernel.org/driver-api/fpga/fpga-mgr.html
 - OpenBMC entity-manager: https://github.com/openbmc/entity-manager
 - OpenBMC phosphor-led-manager: https://github.com/openbmc/phosphor-led-manager
