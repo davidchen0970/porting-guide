@@ -1,4 +1,4 @@
-### 17. Presence / Intrusion / GPIO State Sensor
+# 17. Presence / Intrusion / GPIO State Sensor
 
 本章整理 OpenBMC 中 Presence、Intrusion 與 GPIO State 類狀態感測器的 porting 方法。這類資料通常不是溫度、電壓、電流、功率或轉速等連續數值，而是代表硬體是否存在、機殼是否被開啟、GPIO / CPLD bit 是否 asserted 的布林或列舉狀態。它們會影響 inventory、FRU / asset、fan / power policy、Redfish / IPMI 對外呈現、SEL / EventLog 與安全稽核。
 
@@ -9,7 +9,7 @@
 
 建議不要把 `Present=false` 與 `Functional=false` 混用，否則 Redfish / IPMI、event log 與 control policy 可能出現不一致。
 
-#### 17.1 適用情境
+## 17.1 適用情境
 
 常見項目包含：
 
@@ -50,7 +50,7 @@ CPLD bit state        CPLD / FPGA 維護的 presence、fault、ID、interrupt bi
 
 不同 OpenBMC branch / vendor fork 的 service name、object path 或 JSON schema 可能不同，實作前需以目前專案 source tree 與實機 `busctl tree` 為準。
 
-#### 17.2 常見來源
+## 17.2 常見來源
 
 | 來源 | 說明 | 優點 | 常見風險 |
 | :--- | :--- | :--- | :--- |
@@ -70,7 +70,7 @@ Bring-up 前建議建立對照表：
 | PSU0 | `/system/chassis/powersupply0` | GPIO + PMBus | `PSU0_PRESENT_N`, bus/address `[待填]` | Low = present + PMBus ACK | BMC/HW | `[待填]` |
 | Chassis cover | `/xyz/openbmc_project/Intrusion/Chassis_Intrusion` | GPIO | `CHASSIS_INTRUSION` | 依 schematic | BMC/HW/Security | `[待填]` |
 
-#### 17.3 資料路徑（Data Flow）
+## 17.3 資料路徑（Data Flow）
 
 GPIO based presence detection：
 
@@ -121,9 +121,9 @@ D-Bus xyz.openbmc_project.Chassis.Intrusion
 Redfish Chassis PhysicalSecurity / EventLog / SEL / Journal
 ```
 
-#### 17.4 Porting 步驟
+## 17.4 Porting 步驟
 
-##### Step 1：確認硬體資訊
+### Step 1：確認硬體資訊
 
 從 schematic、board spec、CPLD register map、BIOS / PCH 文件取得：
 
@@ -140,7 +140,7 @@ Redfish Chassis PhysicalSecurity / EventLog / SEL / Journal
 - Redfish / IPMI / SEL 是否需要露出與記錄
 ```
 
-##### Step 2：確認 GPIO / CPLD / hwmon 原始讀值
+### Step 2：確認 GPIO / CPLD / hwmon 原始讀值
 
 ```bash
 gpiodetect
@@ -170,7 +170,7 @@ find /sys/class/hwmon -maxdepth 3 -type f | grep -E 'intrusion|alarm|fault|prese
 for h in /sys/class/hwmon/hwmon*; do echo === $h ===; cat $h/name 2>/dev/null; ls $h; done
 ```
 
-##### Step 3：Device Tree GPIO 命名與 pinctrl
+### Step 3：Device Tree GPIO 命名與 pinctrl
 
 為了讓 userspace 能依名稱取得 GPIO，需在 DTS 中定義 `gpio-line-names`，並確認 pinctrl 沒有被其他功能占用。
 
@@ -207,7 +207,7 @@ ls /sys/firmware/devicetree/base
 
 若改 DTS 後 line name 沒變，優先排查是否燒到正確 image、U-Boot 是否載入正確 DTB、FIT image 是否含舊 DTB，或 overlay / platform DTS 是否覆蓋。
 
-##### Step 4：Entity Manager 配置（GPIO Presence，新設計）
+### Step 4：Entity Manager 配置（GPIO Presence，新設計）
 
 新設計的 `gpio-presence-sensor` 位於 `entity-manager`，透過 `xyz.openbmc_project.Configuration.GPIODeviceDetect` 取得配置。設計重點是：presence daemon 偵測到硬體存在後，expose `xyz.openbmc_project.Inventory.Source.DevicePresence`，再讓 Entity Manager 用 Probe 建立該硬體對應的 inventory / sensor / FRU 配置。
 
@@ -281,7 +281,7 @@ ls /sys/firmware/devicetree/base
 
 注意：新設計通常不是直接寫 `Inventory.Item.Present`，而是先 expose `Inventory.Source.DevicePresence`，讓 Entity Manager 決定後續 inventory / sensor 配置。
 
-##### Step 5：舊式 phosphor-multi-gpio-presence / phosphor-inventory-manager
+### Step 5：舊式 phosphor-multi-gpio-presence / phosphor-inventory-manager
 
 舊式設計會先由 `phosphor-inventory-manager` 建立 static inventory，再由 `phosphor-multi-gpio-presence` 依 GPIO 狀態更新 `xyz.openbmc_project.Inventory.Item.Present`。
 
@@ -321,7 +321,7 @@ static inventory YAML 範例：
 - `ActiveLow=true` 表示 GPIO low 時 `Present=true`。
 - 若同一元件還有 FRU EEPROM、PMBus、tach 等偵測方式，需定義優先順序。
 
-##### Step 6：Chassis Intrusion Sensor 配置
+### Step 6：Chassis Intrusion Sensor 配置
 
 `IntrusionSensor` daemon 屬於 `dbus-sensors`。常見來源包含 GPIO、PCH / I2C、hwmon。不同 branch 的 JSON schema 可能不同，常見類型是 `ChassisIntrusionSensor`，並以 `Class` 選擇 `Gpio`、`Hwmon`、`I2C` 或平台特定 class。
 
@@ -375,7 +375,7 @@ Rearm 模式：
 | `Automatic` | 硬體狀態回到 closed / normal 後，D-Bus `Status` 自動回到 `Normal` | 開蓋→HardwareIntrusion，關蓋→Normal |
 | `Manual` | 觸發後即使關蓋仍維持 `HardwareIntrusion`，直到管理介面執行 rearm / reset | 開蓋→HardwareIntrusion，關蓋仍維持，rearm 後 Normal |
 
-##### Step 7：Fan presence 與 fan tach / fan control 整合
+### Step 7：Fan presence 與 fan tach / fan control 整合
 
 Fan presence 可能由三種方式判斷：
 
@@ -402,7 +402,7 @@ Fan presence 可能由三種方式判斷：
 - 多 rotor fan：模組 presence 只有一個，但 tach sensor 可能有兩個或更多。
 - Fan board 不存在時，該 board 下所有 fan / temp sensors 應隨 Probe 被移除或標示 unavailable。
 
-##### Step 8：D-Bus 驗證
+### Step 8：D-Bus 驗證
 
 Presence 狀態：
 
@@ -435,7 +435,7 @@ busctl get-property   xyz.openbmc_project.IntrusionSensor   /xyz/openbmc_project
 busctl introspect xyz.openbmc_project.IntrusionSensor <object-path>
 ```
 
-##### Step 9：Redfish / IPMI 驗證
+### Step 9：Redfish / IPMI 驗證
 
 ```bash
 curl -k -u root:0penBmc https://<bmc>/redfish/v1/Chassis/
@@ -451,7 +451,7 @@ ipmitool -I lanplus -H <bmc> -U root -P 0penBmc sel list
 
 若 Redfish / IPMI 看不到 presence，先確認 D-Bus inventory 是否存在，再檢查 association、chassis mapping、bmcweb / IPMI SDR 產生策略。
 
-#### 17.5 進階除錯與常見陷阱
+## 17.5 進階除錯與常見陷阱
 
 | 問題現象 | 可能方向 | 建議檢查 |
 | :--- | :--- | :--- |
@@ -479,7 +479,7 @@ ipmitool -I lanplus -H <bmc> -U root -P 0penBmc sel list
 5. 再看消費端：Entity Manager Probe、inventory、Redfish、IPMI、event log
 ```
 
-#### 17.6 Presence / Intrusion / GPIO State Sensor 完整 Checklist
+## 17.6 Presence / Intrusion / GPIO State Sensor 完整 Checklist
 
 ```text
 硬體設計階段：
@@ -540,7 +540,7 @@ Redfish / IPMI / 事件：
 [ ] Redfish / IPMI 不會把 absent 誤報為 failed，或把 failed 誤報為 absent
 ```
 
-#### 17.7 常用指令速查
+## 17.7 常用指令速查
 
 ```bash
 # GPIO / device tree
@@ -572,7 +572,7 @@ busctl get-property <service> <object-path> <interface> <property>
 busctl monitor
 ```
 
-#### 17.9 本章參考資料
+## 17.9 本章參考資料
 
 - OpenBMC GPIO based hardware inventory design：<https://github.com/openbmc/docs/blob/master/designs/inventory/gpio-based-hardware-inventory.md>
 - OpenBMC entity-manager gpio-presence-sensor README：<https://github.com/openbmc/entity-manager/blob/master/src/gpio-presence/README.md>

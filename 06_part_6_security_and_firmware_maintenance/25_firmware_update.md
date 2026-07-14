@@ -1,4 +1,4 @@
-### 25. Firmware Update
+# 25. Firmware Update
 
 更新流程：上傳 image → 驗證 manifest/signature/version/machine → 建立 software object → activation → progress → reboot 或切換 slot → health check → commit / rollback。
 

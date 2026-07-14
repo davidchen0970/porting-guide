@@ -1,8 +1,8 @@
-### 29. 各類 Sensor 共用除錯指令及附錄
+# 29. 各類 Sensor 共用除錯指令及附錄
 
 本節整理各類 Sensor 共用的除錯入口，適用於 ADC、Temperature、Voltage、Current、Power、Fan Tach、Fan PWM、PSU、CPU、NVMe、GPU、External 與 Presence 類型。實務上建議依「硬體訊號 → kernel / sysfs → sensor daemon → D-Bus → association / inventory → Redfish / IPMI → event / log」的順序排查，避免只看單一介面造成判讀落差。
 
-#### 29.1 除錯路徑總覽
+## 29.1 除錯路徑總覽
 
 Sensor 問題通常可以先切成六層：
 
@@ -24,7 +24,7 @@ Sensor 問題通常可以先切成六層：
 - service status、journal、dmesg、ObjectMapper 查詢結果。
 - host power state、device presence、CPLD / PSU / VR fault status。
 
-#### 29.2 Kernel / sysfs
+## 29.2 Kernel / sysfs
 
 Kernel / sysfs 層要先確認 driver 是否有 probe、hwmon / iio / gpio / peci / mctp node 是否存在，以及 sysfs 數值單位是否符合 Linux hwmon 慣例。
 
@@ -70,7 +70,7 @@ sysfs 常見判讀方向：
 - sysfs 有值但 D-Bus 沒 sensor：多半在 Entity Manager config、daemon matching、service 啟動或 JSON type / index / label 對應。
 - D-Bus 有值但 Redfish 沒值：常見在 chassis / inventory association、bmcweb path mapping、Redfish feature flag 或 service cache。
 
-#### 29.3 I2C / SMBus / PMBus
+## 29.3 I2C / SMBus / PMBus
 
 I2C / SMBus / PMBus 排查前要先確認 bus number、mux channel、address、device power state、host / BMC ownership，以及該 device 是否允許被掃描。部分 PMBus、EEPROM、VR、MCU 裝置在不合適的時間讀取可能造成狀態改變或拉長 bus timeout，`i2cdetect`、`i2cdump` 應在知道風險後使用。
 
@@ -105,7 +105,7 @@ I2C / PMBus 檢查表：
 | Fault bit | PMBus `STATUS_WORD` / vendor register | present 但 fault，或 input lost 被誤判成 absent |
 | Timing | bus speed、clock stretching、timeout | 100k / 400k 不符、device stretch 過長 |
 
-#### 29.4 systemd service
+## 29.4 systemd service
 
 Sensor daemon 通常由 Entity Manager 或各 sensor service 依設定建立 D-Bus object。不同平台可能使用 dbus-sensors、phosphor-hwmon 或 vendor daemon，實際 service 名稱需以 image 內容為準。
 
@@ -132,7 +132,7 @@ systemctl status bmcweb.service
 - service 正常但沒有 object：確認 Entity Manager 的 `Exposes` 是否有匹配該 sensor type，以及 daemon 是否支援該 type。
 - service restart 後短暫有值再消失：可能是 device absent、read timeout、threshold parse fail、association 或 availability policy。
 
-#### 29.5 journal
+## 29.5 journal
 
 journal 的目標是比對 service 啟動流程、config reload、device matching、讀值失敗、threshold alarm 與 bmcweb 查詢行為。
 
@@ -161,7 +161,7 @@ journalctl -f | grep -Ei 'sensor|threshold|fan|psu|redfish|bmcweb'
 - sensor value 變成 NaN、Unavailable、Functional=false 的前後 log。
 - Redfish request 的 HTTP status 與 bmcweb log。
 
-#### 29.6 D-Bus / ObjectMapper
+## 29.6 D-Bus / ObjectMapper
 
 OpenBMC sensor 的核心觀念是把 sensor 映射成 D-Bus object。典型 path 為 `/xyz/openbmc_project/sensors/<type>/<sensor_name>`，常見 interface 包含 `xyz.openbmc_project.Sensor.Value`、`xyz.openbmc_project.Sensor.Threshold.Warning`、`xyz.openbmc_project.Sensor.Threshold.Critical`、`xyz.openbmc_project.State.Decorator.Availability`、`xyz.openbmc_project.State.Decorator.OperationalStatus` 與 `xyz.openbmc_project.Association.Definitions`。
 
@@ -229,7 +229,7 @@ D-Bus 判讀重點：
 | Threshold property 不存在 | JSON 未設定、daemon 不支援、sensor type 不使用 threshold | config、phosphor-dbus-interfaces |
 | `Unit` 與預期不一致 | sensor type 錯、daemon mapping 錯 | D-Bus path type、JSON Type、bmcweb mapping |
 
-#### 29.7 Redfish
+## 29.7 Redfish
 
 Redfish 層主要確認三件事：chassis 是否存在、sensor 是否掛到正確 chassis / inventory association、bmcweb 是否把 D-Bus sensor type 映射到對應 Redfish resource。
 
@@ -277,7 +277,7 @@ Redfish 若沒有 sensor，但 D-Bus 有值，優先確認：
 - chassis id 是否正確，不同平台可能是 `chassis`、`system`、`baseboard` 或專案自訂名稱。
 - `bmcweb` 是否需要 restart 或等待 ObjectMapper 更新。
 
-#### 29.8 IPMI / SDR / SEL
+## 29.8 IPMI / SDR / SEL
 
 若平台仍提供 IPMI，需確認 D-Bus sensor 是否被 IPMI SDR policy 收錄，單位、線性化、threshold、event type 是否與需求一致。
 
@@ -306,7 +306,7 @@ IPMI 排查方向：
 | threshold 事件沒進 SEL | event policy、threshold alarm、SEL service | `busctl introspect` threshold、SEL log |
 | Sensor 顯示 `na` | unavailable / host state gating / reading failed | D-Bus `Available`、`Functional`、service log |
 
-#### 29.9 Entity Manager / configuration
+## 29.9 Entity Manager / configuration
 
 Entity Manager 或平台 sensor config 是 sysfs / hardware 與 D-Bus object 的橋接。不同 sensor type 的欄位不同，但共通檢查方向一致。
 
@@ -337,7 +337,7 @@ grep -R "<sensor_name>" /usr/share /etc 2>/dev/null
 | `PollRate` / `PollInterval` | 過短可能造成 bus loading，過長可能影響 event 反應 |
 | Association / Inventory | Redfish / IPMI 可見性常受此影響 |
 
-#### 29.10 常見一次性收集腳本
+## 29.10 常見一次性收集腳本
 
 以下腳本適合在問題單初期收集 baseline。正式使用前可依平台裁切，避免包含敏感資訊。
 
@@ -380,7 +380,7 @@ tar czf "$OUT.tar.gz" -C /tmp "$(basename "$OUT")"
 echo "$OUT.tar.gz"
 ```
 
-#### 29.11 Sensor Type 快速對照
+## 29.11 Sensor Type 快速對照
 
 | Sensor 種類 | 常見 D-Bus type | 常見來源 | 主要確認項目 | 常見 sysfs / 介面 |
 | ----------- | --------------- | -------- | ------------ | ----------------- |
@@ -399,7 +399,7 @@ echo "$OUT.tar.gz"
 | External | 依設定 | D-Bus / external daemon | timeout、unavailable policy、更新頻率 | D-Bus property |
 | Presence | state / inventory | GPIO / CPLD / PMBus ACK / FRU | active level、debounce、present vs functional | libgpiod / inventory |
 
-#### 29.12 常見問題索引
+## 29.12 常見問題索引
 
 | 問題 | 第一輪判斷 | 建議入口 |
 | ---- | ---------- | -------- |
@@ -414,7 +414,7 @@ echo "$OUT.tar.gz"
 | PSU present 但無讀值 | input power lost、PMBus fault、page wrong | PMBus status、FRU、presence GPIO |
 | host off 時 sensor 消失 | `PowerState` / host gating 符合設定或設定過嚴 | Entity Manager config、host state |
 
-#### 29.13 Porting / Debug Checklist
+## 29.13 Porting / Debug Checklist
 
 - [ ] 硬體：sensor 型號、bus / address / channel / page、供電、reset、presence、fault、量測點已確認。
 - [ ] Device Tree：compatible、reg、pinctrl、io-channels、pulses-per-revolution、mux、status 已確認。
@@ -429,7 +429,7 @@ echo "$OUT.tar.gz"
 - [ ] 量測比對：DMM / power meter / thermal chamber / tach meter 與 sysfs / D-Bus / Redfish 數值已建立誤差 baseline。
 - [ ] 異常測試：device absent、bus timeout、host off、PSU unplug、fan stall、threshold crossing、service restart 已驗證。
 
-#### 29.14 參考資料
+## 29.14 參考資料
 
 - OpenBMC Sensor Architecture  
   <https://github.com/openbmc/docs/blob/master/architecture/sensor-architecture.md>

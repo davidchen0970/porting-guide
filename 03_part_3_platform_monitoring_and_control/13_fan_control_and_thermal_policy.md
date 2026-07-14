@@ -1,4 +1,4 @@
-### 13. Fan Control 與 Thermal Policy
+# 13. Fan Control 與 Thermal Policy
 
 本章承接第 12 章的 sensor porting：第 12 章回答「感測器如何被讀到、如何發佈到 D-Bus」，本章回答「系統如何依感測器資料調整 fan PWM / fan target，並在異常時進入安全風速」。對伺服器 BMC 來說，Fan Control 不是單純把 PWM 寫到某個 sysfs 檔案，而是由 host power state、thermal zone、sensor availability、fan tach feedback、presence、failsafe policy、Redfish / IPMI 顯示與事件紀錄共同組成的控制迴路。
 
@@ -10,7 +10,7 @@
 - 說明 PID、stepwise、event-driven fan control 的適用情境。
 - 建立 bring-up、debug、tuning、驗收 checklist。
 
-#### 13.1 適用情境與控制目標
+## 13.1 適用情境與控制目標
 
 Fan Control 適用於下列場景：
 
@@ -34,7 +34,7 @@ Fan Control 的設計目標：
 | 可除錯 | 可追蹤 input sensor、zone、controller、output | journal、D-Bus、policy log |
 | 對外一致 | Redfish / IPMI / SEL 顯示與內部狀態一致 | API / SDR / SEL 驗證 |
 
-#### 13.2 Fan Control 資料路徑
+## 13.2 Fan Control 資料路徑
 
 典型 Fan Control 資料流：
 
@@ -102,7 +102,7 @@ Fan loop:
 Temperature sensor → stepwise table → PWM output
 ```
 
-#### 13.3 Fan State Model
+## 13.3 Fan State Model
 
 建議每個平台至少定義下列四種 fan state。這些 state 不一定要以同一個 daemon 的 enum 呈現，但在設計文件、test plan 與 debug log 中需能對齊。
 
@@ -140,7 +140,7 @@ Recover：必要 sensor / tach / control output 恢復後，依 hysteresis 與 h
 - 最近一次 PWM write 是否成功。
 - 是否仍在 config reload / service shutdown 階段。
 
-#### 13.4 Thermal Zone 設計
+## 13.4 Thermal Zone 設計
 
 Thermal zone 是 fan policy 的核心。Zone 代表一組需要共同控制 airflow 的硬體區域，包含 input sensors、controlled fans、policy 與安全邊界。
 
@@ -184,7 +184,7 @@ Zone 設計原則：
 - 若 sensor 來自 host telemetry，需定義 host off / host not ready 的 fallback 值。
 - 若 fan bank 有冗餘設計，需定義單顆 fan fail 時的補償策略。
 
-#### 13.5 OpenBMC Fan Control 架構選項
+## 13.5 OpenBMC Fan Control 架構選項
 
 OpenBMC 常見 fan / thermal 相關元件如下：
 
@@ -216,7 +216,7 @@ OpenBMC 常見 fan / thermal 相關元件如下：
     適合 bring-up 初期或小型平台，但量產前仍需完成 abnormal path 驗證。
 ```
 
-#### 13.6 PID Control 原理與參數
+## 13.6 PID Control 原理與參數
 
 PID control 的目標是依誤差調整輸出，使溫度或 margin 接近目標值。Fan control 中常見有兩種 PID：
 
@@ -269,7 +269,7 @@ PID 常見現象：
 | 負載上升時反應慢 | sample time 太長、slew rate up 太小 | 縮短 sample time、提高 slew rate up。 |
 | 低溫仍很吵 | min output 太高、failsafe 未解除、host state 錯 | 查 zone state、failsafe flag、host state。 |
 
-#### 13.7 Stepwise / Table-based Fan Policy
+## 13.7 Stepwise / Table-based Fan Policy
 
 Stepwise policy 使用溫度區間對應固定 fan output，適合早期 bring-up、小型平台、或不需要連續 PID 的 zone。
 
@@ -293,7 +293,7 @@ Stepwise 設計重點：
 - 若多個 sensor 對同一 fan group 提出需求，通常取最大輸出。
 - Stepwise table 需搭配 component spec、thermal chamber 與 acoustic tuning 資料。
 
-#### 13.8 Event-driven Fan Control
+## 13.8 Event-driven Fan Control
 
 Event-driven policy 適合處理非連續型條件，例如 host state、cable presence、fan tray presence、system type、service state、timer loop 或特定 D-Bus property 變化。
 
@@ -324,7 +324,7 @@ Event-driven policy 適合處理非連續型條件，例如 host state、cable p
 
 Event-driven policy 和 PID / stepwise 可以並存。常見方式是 Event policy 設定 floor / ceiling / profile，PID 或 stepwise 依 sensor 計算 target，最後取最大值或依優先序合併。
 
-#### 13.9 Failsafe 設計
+## 13.9 Failsafe 設計
 
 Failsafe 是 Fan Control 中最重要的安全路徑之一。Failsafe 不只代表 fan 全速，也代表「目前控制環境不完整，無法保證正常閉迴路判斷」。
 
@@ -369,7 +369,7 @@ Failsafe recovery 建議：
 6. 記錄 recovery event，便於追蹤。
 ```
 
-#### 13.10 Thermal Mode / Fan Profile
+## 13.10 Thermal Mode / Fan Profile
 
 許多平台會提供多種 thermal profile：
 
@@ -392,7 +392,7 @@ Profile 切換需定義：
 - 切換失敗時 fallback profile
 ```
 
-#### 13.11 設定檔與部署路徑
+## 13.11 設定檔與部署路徑
 
 不同 OpenBMC 實作使用不同設定來源，需先確認平台採用哪套 fan control 架構。
 
@@ -468,7 +468,7 @@ ls -l /usr/share/phosphor-fan-presence/control/ 2>/dev/null
 systemctl list-units | grep -Ei 'fan|pid|thermal|swampd'
 ```
 
-#### 13.12 Bring-up 步驟
+## 13.12 Bring-up 步驟
 
 建議從「固定風速」逐步導入完整策略，不要一開始就直接啟用複雜 PID。
 
@@ -525,7 +525,7 @@ Step 10：整合 Redfish / IPMI / Event
     [ ] SEL / Journal event 正確
 ```
 
-#### 13.13 D-Bus / systemd 驗證指令
+## 13.13 D-Bus / systemd 驗證指令
 
 ```bash
 # Fan / thermal 相關 service
@@ -566,7 +566,7 @@ busctl call xyz.openbmc_project.ObjectMapper \
   /xyz/openbmc_project/sensors 0 1 xyz.openbmc_project.Sensor.Value
 ```
 
-#### 13.14 sysfs / 手動 PWM 驗證
+## 13.14 sysfs / 手動 PWM 驗證
 
 手動 PWM 測試前需確認平台允許人工寫入 PWM，且沒有另一個 daemon 同時覆寫。建議先停止 fan control daemon，保留 fan monitor 或視測試目的調整。
 
@@ -604,7 +604,7 @@ done
 - 如果 fan controller 有 watchdog / automatic mode，需確認手動寫入是否會被硬體覆寫。
 - 若 fan control service 會定期寫 PWM，手動值可能很快被改回。
 
-#### 13.15 Redfish / IPMI / Event 驗證
+## 13.15 Redfish / IPMI / Event 驗證
 
 Redfish：
 
@@ -641,7 +641,7 @@ Event 驗證項目：
 [ ] IPMI sensor status 與 D-Bus threshold 狀態一致
 ```
 
-#### 13.16 Thermal Tuning 與量測資料
+## 13.16 Thermal Tuning 與量測資料
 
 Thermal tuning 建議保存下列資料：
 
@@ -686,7 +686,7 @@ Thermal tuning 建議輸出圖表：
 - event timeline
 ```
 
-#### 13.17 進階除錯與常見陷阱
+## 13.17 進階除錯與常見陷阱
 
 | 問題現象 | 可能方向 | 排查 / 解法 |
 | :--- | :--- | :--- |
@@ -702,7 +702,7 @@ Thermal tuning 建議輸出圖表：
 | IPMI SDR 缺 fan | sensor type / naming / sensor map 不完整 | 查 dbus-sdr、ipmid log、sensor path。 |
 | service restart 後 fan 低速 | offline failsafe 未設定、service dependency 不完整 | 設 boot default PWM、offline failsafe、systemd ordering。 |
 
-#### 13.18 Fan Control Porting 驗收 Checklist
+## 13.18 Fan Control Porting 驗收 Checklist
 
 ```text
 硬體 / 線路：
@@ -759,7 +759,7 @@ Tuning / 量產：
 [ ] AC cycle / DC cycle / BMC reboot 測試完成
 ```
 
-#### 13.19 Fan Control 資料表範本
+## 13.19 Fan Control 資料表範本
 
 | Zone | Fan Group | Fan | PWM Channel | Tach Channel | PPR | Min PWM | Max PWM | Min RPM | Max RPM | Required Sensors | Optional Sensors | Failsafe PWM | Profile | 備註 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -767,7 +767,7 @@ Tuning / 量產：
 | CPU Zone | Front Bank | Fan1 | pwm2 | fan2_input | [待填] | [待填] | [待填] | [待填] | [待填] | CPU0_Temp | Inlet_Temp | 100% | Balanced | [待填] |
 | DIMM Zone | Front Bank | Fan2 | pwm3 | fan3_input | [待填] | [待填] | [待填] | [待填] | [待填] | DIMM_A0_Temp | Inlet_Temp | 100% | Balanced | [待填] |
 
-#### 13.20 本章參考資料
+## 13.20 本章參考資料
 
 - OpenBMC phosphor-pid-control: https://github.com/openbmc/phosphor-pid-control
 - OpenBMC phosphor-pid-control configure.md: https://github.com/openbmc/phosphor-pid-control/blob/master/configure.md
