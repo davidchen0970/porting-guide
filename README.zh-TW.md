@@ -2,13 +2,6 @@
 
 語言: [English](README.md) | README.zh-TW.md
 
-## 檔案結構
-
-- [原始指南](bmc_guide.md)：文件總覽、手動說明與修訂紀錄。
-- [章節目錄](./)：依照文件各 Part 分類整理的目錄。
-- [章節檔案](./)：保留原始小節結構的個別章節 Markdown 檔案。
-- [Repository README](README.md)：Repository 總覽與章節索引。
-
 ## 章節索引
 
 ### Part 1：硬體抽象層

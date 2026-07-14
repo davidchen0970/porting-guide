@@ -2,13 +2,6 @@
 
 Languages: README.md | [中文](README.zh-TW.md)
 
-## File Structure
-
-- [Original Guide](bmc_guide.md)
-- [Part Directories](./)
-- [Chapter Files](./)
-- [Repository README](README.md)
-
 ## Chapter Index
 
 ### Part 1: Hardware Abstraction Layer
