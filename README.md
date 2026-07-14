@@ -1,6 +1,6 @@
 # BMC Porting Technical Reference
 
-Languages: [English](README.md) | README.zh-TW.md
+Languages: README.md | [中文](README.zh-TW.md)
 
 ## File Structure
 

@@ -1,5 +1,7 @@
 # BMC 移植技術參考文件
 
+語言: [English](README.md) | README.zh-TW.md
+
 ## 檔案結構
 
 - [原始指南](bmc_guide.md)：文件總覽、手動說明與修訂紀錄。
