@@ -1,81 +1,81 @@
-# BMC 通用 Porting 技術參考
+# BMC Porting Technical Reference
 
+Languages: [English](README.md) | README.zh-TW.md
 
-## 檔案結構
+## File Structure
 
-- `00_手冊使用說明.md`：原文件開頭、手冊說明與修訂紀錄。
-- `NN_第X部分_.../`：依文件中的「第X部分」建立的資料夾。
-- `NN_章節名稱.md`：各主章節內容，保留原章節內的小節。
+- [Original Guide](bmc_guide.md)
+- [Part Directories](./)
+- [Chapter Files](./)
+- [Repository README](README.md)
 
-## 章節索引
+## Chapter Index
 
-### 第一部分：硬體底層抽象層
+### Part 1: Hardware Abstraction Layer
 
-- [1. Boot Flow 與 SoC 初始化](01_第一部分_硬體底層抽象層/01_Boot_Flow_與_SoC_初始化.md)
-- [2. Flash Partition 與儲存架構](01_第一部分_硬體底層抽象層/02_Flash_Partition_與儲存架構.md)
-- [3. Pinmux / GPIO 通用設計模式](01_第一部分_硬體底層抽象層/03_Pinmux_GPIO_通用設計模式.md)
-- [4. Reset / Clock / Power Domain](01_第一部分_硬體底層抽象層/04_Reset_Clock_Power_Domain.md)
-- [5. 周邊匯流排通用知識](01_第一部分_硬體底層抽象層/05_周邊匯流排通用知識.md)
-- [6. CPLD / FPGA / Board Glue Logic](01_第一部分_硬體底層抽象層/06_CPLD_FPGA_Board_Glue_Logic.md)
+- [Boot Flow and SoC Initialization](01_part_1_hardware_abstraction_layer/01_boot_flow_and_soc_initialization.md)
+- [Flash Partition and Storage Architecture](01_part_1_hardware_abstraction_layer/02_flash_partition_and_storage_architecture.md)
+- [Pinmux GPIO Common Design Patterns](01_part_1_hardware_abstraction_layer/03_pinmux_gpio_common_design_patterns.md)
+- [Reset, Clock, and Power Domain](01_part_1_hardware_abstraction_layer/04_reset_clock_and_power_domain.md)
+- [Peripheral Bus Fundamentals](01_part_1_hardware_abstraction_layer/05_peripheral_bus_fundamentals.md)
+- [CPLD/FPGA Board Glue Logic](01_part_1_hardware_abstraction_layer/06_cpld_fpga_board_glue_logic.md)
 
-## 第二部分：BSP、Kernel 與 Device Tree
+### Part 2: BSP, Kernel, and Device Tree
 
-- [7. Build System 與 BSP 結構](02_第二部分_BSP_Kernel_與_Device_Tree/07_Build_System_與_BSP_結構.md)
-- [8. Device Tree 通用寫法與排查](02_第二部分_BSP_Kernel_與_Device_Tree/08_Device_Tree_通用寫法與排查.md)
-- [9. Kernel Driver 與核心服務](02_第二部分_BSP_Kernel_與_Device_Tree/09_Kernel_Driver_與核心服務.md)
+- [Build System and BSP Structure](02_part_2_bsp_kernel_and_device_tree/07_build_system_and_bsp_structure.md)
+- [Device Tree Common Patterns and Troubleshooting](02_part_2_bsp_kernel_and_device_tree/08_device_tree_common_patterns_and_troubleshooting.md)
+- [U-Boot, Kernel Drivers, and Core Services](02_part_2_bsp_kernel_and_device_tree/09_u_boot_kernel_drivers_and_core_services.md)
 
-## 第三部分：平台監控與控制
+### Part 3: Platform Monitoring and Control
 
-- [10. I2C / PMBus Framework](03_第三部分_平台監控與控制/10_I2C_PMBus_Framework.md)
-- [11. OpenBMC 常用 Project 與服務速查](03_第三部分_平台監控與控制/11_OpenBMC_常用_Project_與服務速查.md)
-- [12. Sensor 抽象層](03_第三部分_平台監控與控制/12_Sensor_抽象層.md)
-- [13. Fan Control 與 Thermal Policy](03_第三部分_平台監控與控制/13_Fan_Control_與_Thermal_Policy.md)
-- [14. Power Control](03_第三部分_平台監控與控制/14_Power_Control.md)
-- [15. Inventory / FRU / Asset 資料模型](03_第三部分_平台監控與控制/15_Inventory_FRU_Asset_資料模型.md)
-- [16. Logging / Event / Telemetry](03_第三部分_平台監控與控制/16_Logging_Event_Telemetry.md)
-- [17. Presence / Intrusion / GPIO State Sensor](03_第三部分_平台監控與控制/17_Presence_Intrusion_GPIO_State_Sensor.md)
+- [I2C and PMBus Framework](03_part_3_platform_monitoring_and_control/10_i2c_pmbus_framework.md)
+- [OpenBMC Common Projects and Services Reference](03_part_3_platform_monitoring_and_control/11_openbmc_common_projects_and_services_reference.md)
+- [Sensor Abstraction Layer](03_part_3_platform_monitoring_and_control/12_sensor_abstraction_layer.md)
+- [Fan Control and Thermal Policy](03_part_3_platform_monitoring_and_control/13_fan_control_and_thermal_policy.md)
+- [Power Control](03_part_3_platform_monitoring_and_control/14_power_control.md)
+- [Inventory, FRU, and Asset Data Model](03_part_3_platform_monitoring_and_control/15_inventory_fru_asset_data_model.md)
+- [Logging, Event, and Telemetry](03_part_3_platform_monitoring_and_control/16_logging_event_and_telemetry.md)
+- [Presence, Intrusion, GPIO, and State Sensor](03_part_3_platform_monitoring_and_control/17_presence_intrusion_gpio_state_sensor.md)
 
+### Part 4: Host Communication
 
-### 第四部分：Host Communication
+- [KCS, BT, SSIF, and eSPI](04_part_4_host_communication/18_kcs_bt_ssif_espi.md)
+- [BIOS/UEFI and BMC Interaction](04_part_4_host_communication/19_bios_uefi_and_bmc_interaction.md)
 
-- [18. KCS / BT / SSIF / eSPI](04_第四部分_Host_Communication/18_KCS_BT_SSIF_eSPI.md)
-- [19. BIOS / UEFI 與 BMC 互動](04_第四部分_Host_Communication/19_BIOS_UEFI_與_BMC_互動.md)
+### Part 5: Management Interfaces and Networking
 
-## 第五部分：管理介面與網路
+- [MCTP, PLDM, and SPDM](05_part_5_management_interfaces_and_networking/20_mctp_pldm_spdm.md)
+- [IPMI Fundamentals](05_part_5_management_interfaces_and_networking/21_ipmi_fundamentals.md)
+- [Redfish Fundamentals](05_part_5_management_interfaces_and_networking/22_redfish_fundamentals.md)
+- [Network Services](05_part_5_management_interfaces_and_networking/23_network_services.md)
 
-- [20. MCTP / PLDM / SPDM](05_第五部分_管理介面與網路/20_MCTP_PLDM_SPDM.md)
-- [21. IPMI 通用知識](05_第五部分_管理介面與網路/21_IPMI_通用知識.md)
-- [22. Redfish 通用知識](05_第五部分_管理介面與網路/22_Redfish_通用知識.md)
-- [23. Network Services](05_第五部分_管理介面與網路/23_Network_Services.md)
+### Part 6: Security and Firmware Maintenance
 
-### 第六部分：安全與韌體維運
+- [Security Baseline](06_part_6_security_and_firmware_maintenance/24_security_baseline.md)
+- [Firmware Update](06_part_6_security_and_firmware_maintenance/25_firmware_update.md)
+- [Secure Recovery, RMA, and Field Service](06_part_6_security_and_firmware_maintenance/26_secure_recovery_rma_and_field_service.md)
 
-- [24. Security Baseline](06_第六部分_安全與韌體維運/24_Security_Baseline.md)
-- [25. Firmware Update](06_第六部分_安全與韌體維運/25_Firmware_Update.md)
-- [26. Secure Recovery / RMA / Field Service](06_第六部分_安全與韌體維運/26_Secure_Recovery_RMA_Field_Service.md)
+### Part 7: Debugging, Performance, and Testing
 
-### 第七部分：除錯、效能與測試
+- [Debug Methodology](07_part_7_debugging_performance_and_testing/27_debug_methodology.md)
+- [Debug Toolkit](07_part_7_debugging_performance_and_testing/28_debug_toolkit.md)
+- [Common Sensor Debug Commands and Appendix](07_part_7_debugging_performance_and_testing/29_common_sensor_debug_commands_and_appendix.md)
+- [Performance, Resource, and Boot Time](07_part_7_debugging_performance_and_testing/30_performance_resource_and_boot_time.md)
+- [General Test Matrix](07_part_7_debugging_performance_and_testing/31_general_test_matrix.md)
 
-- [27. Debug Methodology](07_第十部分_附錄/27_Debug_Methodology.md)
-- [28. Debug Toolkit](07_第十部分_附錄/28_Debug_Toolkit.md)
-- [29. 各類 Sensor 共用除錯指令及附錄](07_第十部分_附錄/29_各類_Sensor_共用除錯指令及附錄.md)
-- [30. Performance / Resource / Boot Time](07_第十部分_附錄/30_Performance_Resource_Boot_Time.md)
-- [31. 通用測試矩陣](07_第十部分_附錄/31_通用測試矩陣.md)
+### Part 8: Manufacturing and Production
 
-### 第八部分：工廠與生產
+- [Manufacturing and Factory](08_part_8_manufacturing_and_production/32_manufacturing_and_factory.md)
+- [Calibration, Board Data, and Provisioning](08_part_8_manufacturing_and_production/33_calibration_board_data_and_provisioning.md)
 
-- [32. Manufacturing / Factory](08_第八部分_工廠與生產/32_Manufacturing_Factory.md)
-- [33. Calibration / Board Data / Provisioning](08_第八部分_工廠與生產/33_Calibration_Board_Data_Provisioning.md)
+### Part 9: Platform-Specific Notes
 
-### 第九部分：平台差異筆記本
+- [SoC Notes Template](09_part_9_platform_specific_notes/34_soc_notes_template.md)
 
-- [34. SoC 筆記標準填寫模板](06_第九部分_平台差異筆記本/34_SoC_筆記標準填寫模板.md)
+### Part 10: Appendices
 
-
-### 第十部分：附錄
-
-- [附錄 A01：常用縮寫與名詞對照](10_第十部分_附錄/A01_常用縮寫與名詞對照.md)
-- [附錄 A02：常用指令速查](10_第十部分_附錄/A02_常用指令速查.md)
-- [附錄 A03：Log 收集套件範本](10_第十部分_附錄/A03_Log_收集套件範本.md)
-- [附錄 A04：Bring-up 與驗收 Checklist](10_第十部分_附錄/A04_Bring-up_與驗收_Checklist.md)
-- [附錄 A05：文件填寫範本](10_第十部分_附錄/A05_文件填寫範本.md)
+- [Common Abbreviations and Terms](10_part_10_appendices/A01_common_abbreviations_and_terms.md)
+- [Common Commands Reference](10_part_10_appendices/A02_common_commands_reference.md)
+- [Log Collection Package Template](10_part_10_appendices/A03_log_collection_package_template.md)
+- [Bring-up and Acceptance Checklist](10_part_10_appendices/A04_bring_up_and_acceptance_checklist.md)
+- [Documentation Template](10_part_10_appendices/A05_documentation_template.md)
