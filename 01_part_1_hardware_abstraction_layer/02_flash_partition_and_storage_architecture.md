@@ -32,14 +32,11 @@ flowchart TB
 
     A["Storage Media<br/>SPI-NOR / SPI-NAND / eMMC"]
     B["Partition<br/>MTD / GPT"]
+    C["Volume<br/>UBI Volume (optional)"]
+    D["Filesystem<br/>SquashFS / UBIFS / ext4"]
+    E["Runtime Mount<br/>rootfs / overlay / data"]
 
-    B --> C["Filesystem<br/>JFFS2 / ext4"]
-    B --> D["UBI Layer<br/>(raw flash only)"]
-    D --> E["UBI Volume"]
-    E --> F["Filesystem<br/>SquashFS / UBIFS"]
-
-    C --> G["Runtime Mount"]
-    F --> G
+    A --> B --> C --> D --> E
 ```
 
 Build 與更新流程另外會產生 `.ubi` / `.wic` / `.mtd.tar` 等映像或封裝檔. 這些檔案用來燒錄 / 傳輸或更新, 不表示 target 一定會直接 mount 該檔案.
