@@ -113,6 +113,54 @@ busctl tree xyz.openbmc_project.Settings
 | `phosphor-hwmon` | 傳統 hwmon sensor 讀取方案, 部分平台仍使用. | hwmon config, label, scale, threshold, service instance. | `/sys/class/hwmon/hwmonX/*`, `journalctl -u '*hwmon*' -b` |
 | `phosphor-inventory-manager` | 管理 inventory object 與 FRU / chassis / board / assembly 類資料. | inventory path, association, FRU property, Redfish inventory mapping. | `busctl tree xyz.openbmc_project.Inventory.Manager`, `busctl tree /xyz/openbmc_project/inventory` |
 
+#### 11.5.1 Entity Manager
+
+Entity Manager 使用 JSON 描述平台實體元件、FRU、sensor、connector、association 與 Probe 條件。常見設定路徑為 `/usr/share/entity-manager/configurations/*.json`，平台差異通常由 configuration recipe、JSON 設定與 schema 管理。
+
+Entity Manager 位於硬體識別資料與 sensor daemon 之間。當 FRU 或其他 Probe 條件符合時，Entity Manager 載入對應設定並建立 D-Bus 物件；後續 sensor daemon、inventory 與對外介面再使用這些資料。
+
+```mermaid
+flowchart TB
+    A["FRU / Probe 條件"] --> B["Entity Manager JSON"]
+    B --> C["Entity Manager D-Bus object"]
+    C --> D["dbus-sensors / Inventory"]
+    D --> E["Redfish / IPMI / WebUI"]
+```
+
+設定與檢查重點：
+
+| 項目 | 檢查內容 | 常見排查入口 |
+| --- | --- | --- |
+| JSON 設定 | 設定檔是否存在於 `/usr/share/entity-manager/configurations/`，內容是否可被解析 | Entity Manager journal、platform configuration recipe |
+| Probe 條件 | FRU 資料與 Probe rule 是否相符 | `fru-device` D-Bus tree、Entity Manager journal |
+| D-Bus 物件 | Entity Manager 是否建立預期的實體、connector 與 association | `busctl tree xyz.openbmc_project.EntityManager` |
+| Sensor 串接 | 對應 sensor daemon 是否啟動，sensor object 是否建立 | `systemctl list-units '*sensor*'`、`busctl tree /xyz/openbmc_project/sensors` |
+| Inventory 串接 | Inventory path、FRU property 與 association 是否符合平台設計 | `busctl tree /xyz/openbmc_project/inventory` |
+| Yocto 整合 | configuration recipe 與平台 `.bbappend` 是否套用 | `bitbake-layers show-recipes`、`bitbake-layers show-appends` |
+
+建議排查程序：
+
+1. 確認 FRU EEPROM、kernel interface 或其他 Probe 來源可被讀取。
+2. 確認目標 JSON 已安裝至 `/usr/share/entity-manager/configurations/`。
+3. 檢查 Entity Manager journal 是否出現 JSON 解析或 Probe 不匹配訊息。
+4. 確認 Entity Manager D-Bus tree 中已建立預期物件。
+5. 確認對應 sensor daemon 已啟動，且 `/xyz/openbmc_project/sensors` 下存在預期 sensor object。
+6. 依序核對 threshold、association、inventory path，以及 Redfish / IPMI mapping。
+
+常用指令：
+
+```bash
+$ systemctl status xyz.openbmc_project.EntityManager.service --no-pager
+$ journalctl -u xyz.openbmc_project.EntityManager.service -b --no-pager
+$ busctl tree xyz.openbmc_project.EntityManager
+$ busctl tree xyz.openbmc_project.FruDevice
+$ busctl tree /xyz/openbmc_project/sensors
+$ busctl tree /xyz/openbmc_project/inventory
+$ ls -l /usr/share/entity-manager/configurations/
+```
+
+若 Entity Manager 已建立預期 D-Bus 物件，但 sensor 未出現，建議接著檢查 `dbus-sensors` daemon、hwmon / sysfs 來源與 sensor 設定。若 D-Bus sensor 已存在但 Redfish 或 IPMI 未顯示，則應轉往 association、inventory path、bmcweb route 或 SDR mapping 排查。
+
 Sensor 類問題排查流程:
 
 ```text
