@@ -28,11 +28,18 @@ BMC 韌體需要儲存 bootloader / kernel / Device Tree / root filesystem / 系
 閱讀 BMC 儲存架構時, 最容易混淆的是把儲存媒體 / partition / volume / 檔案系統與映像檔當成同一件事. 它們位於不同層級:
 
 ```mermaid
-flowchart LR
-    A["儲存媒體<br/>SPI-NOR / SPI-NAND / eMMC"] --> B["空間切割方式<br/>MTD partition / GPT partition"]
-    B --> C["Flash 管理層<br/>UBI, 僅用於 raw flash 的特定設計"]
-    C --> D["檔案系統<br/>SquashFS / UBIFS / JFFS2 / ext4"]
-    D --> E["Runtime 掛載方式<br/>Readonly rootfs / OverlayFS / persistent data"]
+flowchart TB
+
+    A["Storage Media<br/>SPI-NOR / SPI-NAND / eMMC"]
+    B["Partition<br/>MTD / GPT"]
+
+    B --> C["Filesystem<br/>JFFS2 / ext4"]
+    B --> D["UBI Layer<br/>(raw flash only)"]
+    D --> E["UBI Volume"]
+    E --> F["Filesystem<br/>SquashFS / UBIFS"]
+
+    C --> G["Runtime Mount"]
+    F --> G
 ```
 
 Build 與更新流程另外會產生 `.ubi` / `.wic` / `.mtd.tar` 等映像或封裝檔. 這些檔案用來燒錄 / 傳輸或更新, 不表示 target 一定會直接 mount 該檔案.
@@ -111,6 +118,113 @@ UBI volume 是 UBI device 內切分出的邏輯儲存空間. 它可以儲存 Squ
 | `.mtd.tar`  | OpenBMC 更新流程使用的封裝                                  |
 | `fitImage`  | 可包含 kernel / DTB / initramfs 與簽章資訊的 boot container |
 | `MANIFEST`  | 更新包的版本 / 機型 / 用途與驗證資訊                        |
+
+### 2.1.6 參考
+
+
+```mermaid
+flowchart TB
+
+    subgraph L5["Build / Update Artifact Layer"]
+        IMG1[".ubi<br/>UBI image"]
+        IMG2[".wic<br/>Disk image"]
+        IMG3[".mtd.tar<br/>OpenBMC update package"]
+        IMG4["fitImage<br/>Kernel + DTB + initramfs"]
+        IMG5["MANIFEST<br/>Version / Machine / Verify"]
+    end
+
+
+    subgraph L4["Runtime Filesystem Layer"]
+        FS1["SquashFS<br/>Readonly rootfs"]
+        FS2["UBIFS<br/>Writable filesystem"]
+        FS3["JFFS2<br/>Small NOR writable area"]
+        FS4["ext4<br/>Block storage filesystem"]
+        FS5["OverlayFS<br/>Lower + Upper merge"]
+    end
+
+
+    subgraph L3["Logical Storage Layer"]
+        UBI["UBI Device<br/>ubi0"]
+
+        VOL1["Volume: rofs-a"]
+        VOL2["Volume: rofs-b"]
+        VOL3["Volume: rwfs"]
+
+        UBI --> VOL1
+        UBI --> VOL2
+        UBI --> VOL3
+    end
+
+
+    subgraph L2["Partition Layer"]
+        MTD["MTD partitions<br/>raw flash"]
+
+        P1["mtd0<br/>u-boot"]
+        P2["mtd1<br/>u-boot-env"]
+        P3["mtd2<br/>kernel"]
+        P4["mtd3<br/>rootfs"]
+        P5["mtd4<br/>rwfs"]
+
+
+        GPT["GPT partitions<br/>block device"]
+
+        G1["mmcblk0p1<br/>boot"]
+        G2["mmcblk0p2<br/>rootfs-a"]
+        G3["mmcblk0p3<br/>rootfs-b"]
+        G4["mmcblk0p4<br/>rw-data"]
+    end
+
+
+    subgraph L1["Physical Storage Layer"]
+        NOR["SPI-NOR<br/>MTD"]
+        NAND["SPI-NAND<br/>MTD"]
+        EMMC["eMMC<br/>Block device"]
+        SD["SD / USB storage"]
+        SSD["SATA / NVMe"]
+    end
+
+
+    NOR --> MTD
+    NAND --> MTD
+
+    EMMC --> GPT
+    SD --> GPT
+    SSD --> GPT
+
+
+    MTD --> P1
+    MTD --> P2
+    MTD --> P3
+    MTD --> P4
+    MTD --> P5
+
+    GPT --> G1
+    GPT --> G2
+    GPT --> G3
+    GPT --> G4
+
+
+    P4 --> UBI
+
+    VOL1 --> FS1
+    VOL2 --> FS1
+    VOL3 --> FS2
+
+    G2 --> FS4
+    G3 --> FS4
+    G4 --> FS4
+
+
+    FS1 --> FS5
+    FS2 --> MOUNT["Linux Mount<br/>/ /var /data"]
+
+    FS4 --> MOUNT
+
+    IMG1 -.-> UBI
+    IMG2 -.-> GPT
+    IMG3 -.-> MTD
+    IMG4 -.-> BOOT["Boot Loader"]
+```
 
 ## 2.2 Raw Flash 與 Block Device
 
