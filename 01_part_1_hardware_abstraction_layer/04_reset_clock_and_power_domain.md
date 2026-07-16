@@ -26,6 +26,87 @@ Reset / Clock / Power Domain 問題常呈現為: driver probe deferred、I2C / S
 - [Bring-up 順序](#412-bring-up-順序)
 - [驗收 Checklist](#414-驗收-checklist)
 
+### 4.0 先建立 Reset、Clock 與 Power Domain 的理解模型
+
+這三個主題不應分開背誦。對多數數位裝置而言，能被軟體正常存取之前，必須先滿足一組具有順序的前置條件：
+
+```text
+供電存在且進入規格
+        ↓
+參考 clock 存在，必要 PLL 已 lock
+        ↓
+Reset 保持足夠時間後解除
+        ↓
+Pinmux、bus owner 與 isolation 狀態正確
+        ↓
+Driver 才能讀寫 register 或進行 bus transaction
+        ↓
+Userspace 才能建立 D-Bus object 與管理功能
+```
+
+這條路徑不是所有裝置都完全相同。例如有些 device 要先有 clock 才能解除 reset，有些外部 PHY 要先解除 reset 才會輸出 ready，有些 Host sideband clock 只有 Host 進入特定 power state 後才存在。因此文件真正需要保存的不是一條固定規則，而是每個 device 或 domain 的依賴圖與時序條件。
+
+#### 4.0.1 三者分別回答什麼問題
+
+- **Power / rail**：電路現在是否有正確且穩定的電壓與電流能力？
+- **Clock**：數位邏輯是否有時間基準，clock source、parent、divider 與 gate 是否正確？
+- **Reset**：邏輯目前是否被強制維持在初始狀態，何時允許開始工作？
+- **Ready signal**：硬體是否已確認前置條件成立，可讓下一階段繼續？
+- **Power domain**：哪些硬體共享供電、clock、reset、isolation 或 runtime power control？
+
+其中 `PGOOD`、`PLL_LOCK`、`RESET_N` 與 `LINK_UP` 不能互相替代：
+
+```text
+PGOOD = rail 已進入供電規格
+PLL_LOCK = PLL 已鎖定參考 clock
+RESET_N = reset 是否已解除
+LINK_UP = protocol training 或連線已完成
+```
+
+看到某一個 ready signal 成立，只能證明它所代表的條件，不代表整個 device 已可由上層使用。
+
+#### 4.0.2 靜態狀態和時序證據
+
+這類問題具有明顯的時間關係。系統 ready 後讀到 rail 正常、clock enabled、reset deasserted，不足以證明開機過程正確。例如 reset 曾在 rail 尚未穩定時短暫解除，稍後再恢復正常，最終靜態狀態仍看不出問題。
+
+因此應同時保存兩類證據：
+
+```text
+靜態證據
+DTS、register、clk_summary、regulator state、GPIO state、D-Bus state
+
+時序證據
+Rail ramp、PGOOD、clock start、PLL lock、reset release、bus transaction、driver log
+```
+
+對偶發 probe failure、warm reset 後裝置消失、BMC reboot 影響 Host 等問題，時序證據通常比單一時間點的 register dump更有判斷力。
+
+#### 4.0.3 一個 Device 可用的最小依賴圖
+
+以外部 Ethernet PHY 為例：
+
+```text
+3V3_PHY / 1V0_PHY 穩定
+        ↓
+25 MHz reference clock 存在
+        ↓
+PHY_RESET_N 維持 datasheet 要求時間
+        ↓
+PHY_RESET_N 解除
+        ↓
+等待 strap sampling 與內部初始化
+        ↓
+MDIO register 可讀
+        ↓
+MAC driver、PHY driver attach
+        ↓
+Auto-negotiation / link training
+        ↓
+Network service 可使用介面
+```
+
+如果最後表現為 `no link`，可能停在任何一步。這也是本章的核心方法：不要只從最終現象命名問題，而要沿依賴圖找出第一個未成立的條件。
+
 ## 4.1 基本觀念
 
 | 名詞 | 說明 | Bring-up 關注點 |
@@ -53,6 +134,61 @@ flowchart TB
 
 若任一層缺資料, 後面看到的現象可能只是連鎖結果. 例如 I2C device ACK 不到, 方向可能是 I2C pinmux 錯、pull-up rail 未上、expander reset 未釋放、clock gate 未開、bus owner 還在 CPLD / Host、或 power domain 尚未 ready.
 
+#### 4.1.1 Source、Provider、Consumer 與 Domain
+
+Linux 文件常使用 provider 與 consumer 描述資源關係：
+
+```text
+Clock provider       產生或分配 clock
+Clock consumer       使用該 clock 的 device driver
+
+Reset controller     控制一組 internal reset lines
+Reset consumer       要求 assert / deassert reset 的 driver
+
+Regulator provider   提供 rail 或供電控制介面
+Regulator consumer   透過 *-supply 宣告其供電需求
+
+Power domain provider 管理 domain 的 on/off
+Power domain consumer 掛接到該 domain 的 device
+```
+
+Device Tree 的 phandle 用來建立這些關係。Provider node 存在，不代表 provider driver 已 probe；consumer node 寫了 phandle，也不代表對應資源名稱與 driver 期待一致。Deferred probe 經常發生在這兩者尚未完成連接時。
+
+#### 4.1.2 Request、Hardware State 與 Ready State
+
+軟體發出 enable 或 deassert request，不等於硬體已 ready：
+
+```text
+Regulator enable request
+→ Enable GPIO / PMIC command 已送出
+→ Rail 開始 ramp
+→ Voltage 進入規格
+→ PGOOD asserted
+→ Consumer 才能進入下一步
+```
+
+同樣地：
+
+```text
+Clock prepare/enable
+→ Clock gate 被開啟
+→ 外部波形或 PLL lock 成立
+→ Consumer 才可能正常執行
+```
+
+Linux framework 通常能管理 request 與資源引用，但硬體 ready 條件是否被 framework、driver、CPLD 或外部電路確認，必須依平台設計判斷。
+
+#### 4.1.3 Domain 邊界比單一訊號更重要
+
+Reset domain、clock domain 與 power domain 可能不同：
+
+- 兩個 peripheral 可能共用同一個 reset bit，但使用不同 clock gate。
+- 一個 PHY 可能具有多路 rail，卻共用單一 reset pin。
+- BMC reset 可能不切斷 CPLD standby rail，但會讓 GPIO 進入 reset default。
+- Host warm reset 可能切換 `PLTRST_N`，但不關閉 Host standby power。
+
+排查時要畫出 domain 邊界，避免把「某 rail 仍有電」誤認為「該 device 未被 reset」，也避免把「BMC-only reboot」誤認為所有 BMC 管理訊號都會保持不變。
+
 ## 4.2 Reset 類型與影響範圍
 
 | Reset 類型 | 常見來源 | 影響範圍 | 常見現象 | 必填資料 |
@@ -73,6 +209,66 @@ Reset 排查基本要求:
 - 對 BMC reboot / watchdog reset 特別確認 host power 是否受到 side effect.
 - 若 reset line 是 open drain 或由多方 wired-OR, 需列出所有可能拉低者.
 - 若 reset line 由 CPLD pulse 產生, 需記錄 pulse width、stretch、debounce 與 clear rule.
+
+#### 4.2.1 Assert、Deassert 與 Active Level
+
+Reset 的 `assert` 表示讓 target 進入 reset 狀態，`deassert` 表示解除 reset。它們描述功能狀態，不等同固定的 High 或 Low。
+
+以 `PHY_RESET_N` 為例：
+
+```text
+Assert reset   = Physical Low
+Deassert reset = Physical High
+```
+
+若中間經過 inverter、buffer、CPLD 或 level shifter，BMC-side GPIO level 與 target-side reset pin level可能不同。正式紀錄應分別保存 source-side、target-side physical level 與 functional state。
+
+#### 4.2.2 Reset Pulse 需要哪些條件
+
+一個有效 reset 通常包含：
+
+1. Assert level 達到有效電壓範圍。
+2. Assert 持續時間不少於 datasheet 的 minimum pulse width。
+3. Reset 期間 rail 與 clock 狀態符合元件規格。
+4. Deassert edge 滿足需要的 slew 或同步條件。
+5. Deassert 後等待 initialization delay，才開始第一次 transaction。
+
+只看到 reset pin曾變化，不代表 reset 流程有效。若 pulse 太短、rail 尚未進入規格、clock 缺失，或 deassert 後立即讀 register，device 仍可能無回應。
+
+#### 4.2.3 Shared Reset 的風險
+
+Shared reset 代表多個 consumer 受同一條 reset line 或 reset bit 影響。任一 driver 若在 runtime 單獨 assert shared reset，可能同時重置其他正在工作的 device。
+
+需確認：
+
+- Reset controller binding 是否宣告 shared/exclusive 語意。
+- Driver 是否只在 probe 階段使用 reset，還會在 runtime error recovery 重置。
+- BMC reboot、driver unbind 或 suspend/resume 是否會碰到該 reset。
+- Shared consumers 是否有共同的 quiesce 與 recovery 流程。
+
+#### 4.2.4 Reset Tree 與 Wired-OR
+
+一條 target reset 可能同時受多個來源影響：
+
+```text
+POR supervisor ─┐
+CPLD fault reset ├─ wired-OR / logic gate → TARGET_RESET_N
+BMC reset GPIO ─┤
+Watchdog output ─┘
+```
+
+此時只釋放 BMC GPIO 不一定能解除 target reset，因為其他來源仍可能保持 asserted。排查需要列出所有可能 source，並量測邏輯合成前後的節點。
+
+#### 4.2.5 Warm Reset 為什麼特別容易留下問題
+
+Warm reset 通常不移除主要供電，因此 external device、CPLD latch、clock generator 或 bus state 可能保留。SoC driver重新啟動後，若只假設 device 已回到 power-on default，可能發生：
+
+- Controller reset 了，但 external PHY 沒有 reset。
+- Bus master重啟，但 expander仍保留 output。
+- Driver重新 probe，但 stale interrupt status仍為 asserted。
+- Clock parent 改變，consumer register卻保留舊 divider假設。
+
+因此 warm reset 測試應同時確認哪些狀態會清除、哪些狀態會保留，以及 driver是否有完整重新初始化流程。
 
 ## 4.3 Clock 類型與檢查重點
 
@@ -102,6 +298,67 @@ $ find /sys/kernel/debug/clk -maxdepth 2 -type f -print 2>/dev/null
 $ dmesg | grep -Ei 'clk|clock|pll|osc|refclk|rate'
 ```
 
+#### 4.3.1 Clock Tree：Source、Parent、Divider 與 Gate
+
+一個 peripheral clock 通常不是直接來自 crystal，而是經過多層 clock tree：
+
+```text
+Crystal / oscillator
+→ PLL
+→ Parent selector / mux
+→ Divider
+→ Clock gate
+→ Peripheral functional clock
+```
+
+每一層都可能造成不同現象：
+
+- Source 無波形：整個 clock tree 不工作。
+- PLL 未 lock：頻率可能不穩或下游被保持 reset。
+- Parent 選錯：頻率來源不符合 driver 假設。
+- Divider 錯誤：UART baud、PWM、I2C 或 bus timeout 出現比例性偏差。
+- Gate 未開：register access timeout 或 peripheral 完全不動。
+
+`clk_summary` 主要呈現 Linux Common Clock Framework 所知道的 parent、rate 與 enable/prepare count。它不能取代實體波形量測，也不一定涵蓋外部 clock generator 或 Host 提供的 clock。
+
+#### 4.3.2 Clock Enable Count 不等於實體 Clock 一定正常
+
+Clock framework 顯示 enabled，通常表示軟體引用計數與 gate request 已成立；仍可能存在：
+
+- 外部 oscillator 沒供電。
+- Clock generator 的 OE pin 未解除。
+- PLL 未 lock。
+- Pinmux 沒把 clock 輸出到 pad。
+- Level translator 或 buffer 未 enable。
+- Host-provided clock 因 Host power state 尚未出現。
+
+因此應依 clock 類型選擇證據：internal clock 看 `clk_summary` 與 register，external/reference clock 看 scope，Host clock還要對照 Host power state與 sideband ready。
+
+#### 4.3.3 Clock Accuracy、Jitter 與 Signal Integrity
+
+不同問題需要不同量測能力：
+
+- 一般 scope 可確認 clock 是否存在、頻率是否大致正確及開始時間。
+- 高速 reference clock 的 jitter、duty cycle、spread spectrum 與 differential amplitude，可能需要符合頻寬的探棒與專用量測方法。
+- Crystal pin 直接量測可能因 probe capacitance 影響振盪，應依硬體量測規範選擇測點。
+
+文件不應只寫「clock 有看到」，還應寫明測點、instrument、probe、頻率、振幅、開始時間與測試條件。
+
+#### 4.3.4 Runtime PM 與 Clock Gate
+
+裝置在 probe 時正常、閒置後無回應，可能涉及 runtime PM：
+
+```text
+Driver idle
+→ runtime suspend
+→ clock gate / power domain off
+→ event 或 request 到來
+→ runtime resume
+→ restore clock / reset / register context
+```
+
+若 resume path漏掉 clock、reset或register restore，問題只會在閒置、suspend/resume或特定服務重啟後出現。排查時需區分初次 probe failure 與 runtime resume failure。
+
 ## 4.4 Power rail、regulator 與 power domain
 
 Linux regulator framework 用於描述電壓 / 電流 regulator 與其 consumer, 常見能力包含 enable / disable、電壓設定、current limit 與 constraints. BMC 平台中不一定所有 rail 都由 Linux regulator 管理; 有些 rail 只由 CPLD / PMIC / analog circuit 控制, 但仍建議在本章記錄 dependency 與 ready 條件.
@@ -116,6 +373,71 @@ Linux regulator framework 用於描述電壓 / 電流 regulator 與其 consumer,
 | External hot-swap / eFuse | HSC / eFuse driver 或 GPIO fault | riser、NVMe、PCIe slot | fault clear、retry、inrush policy |
 
 Power domain 表格要同時填 rail、clock、reset、dependency、ready 條件. 只填 rail 名稱不足以排查 probe 問題.
+
+#### 4.4.1 Rail、Regulator 與 Power Domain 並不相同
+
+- **Rail** 是實體電源網路，例如 `3V3_AUX`。
+- **Regulator** 是產生或控制 rail 的元件，或 Linux對該供電來源的抽象。
+- **Power domain** 是可一同管理的一組邏輯區塊，可能涉及 rail、clock gate、reset、isolation及context retention。
+
+一個 rail 可供應多個 domain，一個 device 也可能依賴多個 rail：
+
+```text
+Ethernet PHY
+├── AVDD：類比電路
+├── DVDD：數位核心
+├── VDDIO：I/O level
+├── REFCLK
+└── RESET_N
+```
+
+只量到其中一路有電，不能判定整顆 PHY 的供電條件完整。
+
+#### 4.4.2 `regulator-boot-on` 與 `regulator-always-on`
+
+兩者語意不同：
+
+- `regulator-boot-on` 表示開機階段預期已啟用，Linux在接手時應視需要維持，但後續仍可能依 constraint 關閉。
+- `regulator-always-on` 表示正常系統運作中不應由 regulator framework 關閉。
+
+這些 property 描述軟體政策，不會替代硬體量測，也不保證 Bootloader、PMIC default 或 external pull 已正確建立初始 rail。若 Bootloader 已開啟 rail，但 Device Tree 沒表示正確，regulator core 可能在 unused-regulator handling 階段關閉它。
+
+#### 4.4.3 Ramp、Inrush、PGOOD 與 Brownout
+
+供電判斷不能只看 nominal voltage：
+
+- **Ramp time**：從 enable 到進入規格所需時間。
+- **Inrush current**：上電瞬間對上游供電造成的負載。
+- **PGOOD delay**：rail達標後，PGOOD何時變化。
+- **Ripple / droop**：負載切換時是否短暫離開規格。
+- **Brownout**：電壓未完全消失但低於可靠工作範圍。
+
+偶發 reset、Flash 寫入錯誤或裝置消失，可能發生在極短 droop期間。一般軟體 log只看得到後續 reset或I/O錯誤，需搭配 rail waveform與 fault latch才能建立事件順序。
+
+#### 4.4.4 Isolation 與 Retention
+
+部分 SoC power domain 在關閉前需先 isolation，避免已掉電區塊向仍有電的邏輯輸出不確定電位；重新上電時則需依順序解除 isolation、clock與reset。某些 domain支援 retention，能保留少量context。
+
+若平台使用 generic power domain 或 SoC-specific PM driver，需確認：
+
+- Domain on/off sequence。
+- Isolation assert/deassert順序。
+- Context是否需要driver重新寫入。
+- Domain off後GPIO、interrupt與bus access的行為。
+- Wake source是否位於仍供電的domain。
+
+#### 4.4.5 Supply Dependency 與循環依賴
+
+Regulator也可能有上游 supply：
+
+```text
+12V_AUX
+→ 3V3_AUX regulator
+→ 1V8 regulator
+→ Sensor / Expander
+```
+
+Device Tree需正確描述parent supply，否則enable順序、reference count與狀態判讀可能不完整。若enable GPIO本身位於尚未上電的expander，則可能形成循環依賴，設計上需由always-on controller、CPLD或硬體預設打破循環。
 
 ## 4.5 DTS 範本: reset、clock、regulator、power domain
 
@@ -193,6 +515,68 @@ ethernet-phy@0 {
 - enable GPIO active level 需與硬體實測一致.
 - 若 rail 在 bootloader 階段已開, Linux regulator state 需避免 probe 時誤關.
 
+#### 4.5.4 DTS 只描述依賴，不等於完成硬體時序
+
+Device Tree 的 `clocks`、`resets`、`*-supply` 與 `power-domains` 用來讓driver取得資源，但真正的順序可能由下列位置共同決定：
+
+- Driver probe 與 runtime PM callback。
+- Regulator、clock、reset framework。
+- CPLD state machine。
+- PMIC或外部 supervisor。
+- Bootloader已建立的初始狀態。
+- Datasheet要求的delay與ready polling。
+
+因此，DTS property齊全不代表時序必然正確。仍需確認driver呼叫順序、delay來源與實體波形。
+
+#### 4.5.5 完整案例：I2C GPIO Expander 偶發消失
+
+```text
+3V3_AUX 上升
+→ I2C pull-up rail 上升
+→ Expander reset保持asserted
+→ Rail穩定後解除reset
+→ 等待內部初始化
+→ I2C controller clock與pinmux ready
+→ Driver第一次transaction
+→ Expander gpiochip註冊
+→ 下游presence service開始使用lines
+```
+
+若只在部分開機失敗，優先比較成功與失敗波形：
+
+1. Expander VCC與pull-up rail是否同時ready。
+2. Reset是否在VCC穩定前解除。
+3. Reset deassert到第一次START condition的間隔。
+4. I2C mux是否已選到正確channel。
+5. Driver failure是NACK、timeout還是deferred probe。
+6. Expander所在domain是否在Host off或runtime PM時被移除。
+
+單純增加retry可能暫時降低失敗率，但仍應確認原始時序條件。
+
+#### 4.5.6 完整案例：BMC Reboot 造成 Host 掉電
+
+可能的完整路徑如下：
+
+```text
+BMC watchdog reset
+→ SoC GPIO回到reset default / Hi-Z
+→ 外部pull改變PWR_EN或PWRBTN_N
+→ CPLD判斷Host off request或失去keep-alive
+→ Host rail關閉
+```
+
+另一種可能是：
+
+```text
+BMC reboot
+→ OpenBMC power daemon重新啟動
+→ 尚未完成Host state rediscovery
+→ 以預設state寫入control request
+→ CPLD執行非預期power transition
+```
+
+因此需同步量測BMC reset、關鍵GPIO、CPLD output、Host PGOOD與PLTRST，並對照service journal。只確認BMC reboot命令本身無誤，無法排除控制權交接與userspace policy問題。
+
 ## 4.6 Domain 對照表範本
 
 | Domain | Rail | Clock | Reset | Dependency | Ready 條件 | Owner | Boot risk | 狀態 |
@@ -250,7 +634,7 @@ Reset reason 是 boot failure 排查的入口, 但需注意它可能被下次 re
 
 常用指令範本:
 
-> [待確認] 原始文件的 regulator 匯出指令使用 `/tmp/$ reset-debug/regulator.txt`, 其中 `$` 與空白可能影響輸出路徑. 以下保留原始指令, 執行前需依平台確認.
+> [待確認] 原始文件的 regulator 匯出指令使用 `/tmp/reset-debug/regulator.txt`, 其中 `$` 與空白可能影響輸出路徑. 以下保留原始指令, 執行前需依平台確認.
 
 ```bash
 $ mkdir -p /tmp/reset-debug
@@ -267,7 +651,7 @@ $ fw_printenv > /tmp/reset-debug/fw_printenv.txt 2>&1
 $ cat /sys/kernel/debug/clk/clk_summary > /tmp/reset-debug/clk_summary.txt 2>&1
 $ find /sys/kernel/debug/pinctrl -maxdepth 3 -type f -print > /tmp/reset-debug/pinctrl-files.txt 2>&1
 $ cat /sys/kernel/debug/gpio > /tmp/reset-debug/debug-gpio.txt 2>&1
-$ find /sys/class/regulator -maxdepth 3 -type f -print -exec sh -c 'echo ==== $1; cat $1 2>/dev/null' _ {} \; > /tmp/$ reset-debug/regulator.txt 2>&1
+$ find /sys/class/regulator -maxdepth 3 -type f -print -exec sh -c 'echo ==== $1; cat $1 2>/dev/null' _ {} \; > /tmp/reset-debug/regulator.txt 2>&1
 $ tar czf /tmp/reset-debug-$(date +%Y%m%d-%H%M%S).tar.gz -C /tmp reset-debug
 ```
 
@@ -347,16 +731,118 @@ $ find /sys/class/regulator -maxdepth 2 -type l -o -type d 2>/dev/null
 
 ## 4.12 Bring-up 順序
 
-1.  建立 rail / clock / reset / ready signal 依賴圖, 先從 BMC core、DDR、boot flash、UART 開始.
-2.  收集 reset source: POR IC、CPLD、watchdog、BMC GPIO、Host reset、peripheral reset.
-3.  收集 clock source: crystal、oscillator、clock generator、PLL、host-provided clock.
-4.  收集 power rail: standby、BMC core、IO、DDR、PHY、sensor、host sideband、slot power.
-5.  對每個 domain 填寫 rail、clock、reset、dependency、ready 條件與 owner.
-6.  以 scope / LA 量測 AC on、BMC reset、Linux boot、Host power on 的 timing.
-7.  在 kernel 中驗證 regulator、clk、reset provider 與 consumer 是否 probe.
-8.  在 userspace 中驗證 power daemon、state manager、sensor daemon 是否依 domain 狀態 gating.
-9.  做異常測試: BMC reboot、watchdog reset、AC loss、host reset、peripheral reset、rail fault、clock disable 模擬.
-10. 將 reset reason、fault latch、journal、dmesg 與 waveform 放在同一測試紀錄.
+Bring-up 建議遵循「先核心開機條件，再單一 peripheral，最後才做 power transition 與異常注入」的順序。
+
+#### 4.12.1 建立靜態依賴圖
+
+1. 從 schematic列出所有 rail、enable、PGOOD、reset、clock、ready與fault signals。
+2. 標記每個訊號的source、consumer、active level、voltage domain及外部pull。
+3. 建立BMC core、DDR、Boot Flash、UART、CPLD、I2C、Network、Host sideband等domain。
+4. 對每個domain填寫rail、clock、reset、dependency、ready條件與owner。
+5. 標記哪些設定由Bootloader、CPLD、Kernel driver或OpenBMC service控制。
+6. 列出warm reset、BMC-only reset、Host reset及AC cycle各自會清除與保留的狀態。
+
+#### 4.12.2 先驗證 BMC 最小開機鏈
+
+```text
+Standby rail
+→ Main oscillator
+→ POR / BMC reset
+→ Boot strap
+→ Boot SPI access
+→ SPL / DDR init
+→ U-Boot UART
+→ Kernel start
+```
+
+此階段優先使用scope與UART。若沒有early UART，先查rail、oscillator、reset與Boot SPI activity，不應先從systemd或OpenBMC service排查。
+
+#### 4.12.3 驗證 Linux Provider
+
+依序確認：
+
+- Regulator provider與constraints。
+- Clock provider、parent、rate與gate。
+- Reset controller與reset lines。
+- Generic power domain或SoC PM driver。
+- GPIO、pinctrl與interrupt controller。
+- Parent bus與外部mux。
+
+檢查running DTB、kernel config、provider probe log與`devices_deferred`。Provider未ready時，consumer錯誤通常只是後續現象。
+
+#### 4.12.4 逐一驗證 Consumer
+
+每個consumer都建立相同紀錄：
+
+```text
+Supply request與實體rail
+→ Clock request與實體clock
+→ Reset assert/deassert waveform
+→ Ready delay / status polling
+→ 第一次register或bus transaction
+→ Driver probe結果
+→ Userspace object建立
+```
+
+先選低風險、容易量測的device，再處理Host power、Flash mux或slot power等高風險domain。
+
+#### 4.12.5 驗證控制權交接
+
+至少驗證：
+
+- AC applied到Bootloader。
+- Bootloader到Kernel。
+- Kernel provider到consumer driver。
+- Driver到OpenBMC service。
+- BMC warm reboot且Host維持運作。
+- Service restart後重新發現目前hardware state。
+
+每個交接點都可能發生短暫disable、reset pulse、clock gate或錯誤預設值，需以共同時間軸保存waveform與log。
+
+#### 4.12.6 驗證 Reset Matrix
+
+建立reset測試矩陣：
+
+```text
+Software reboot
+BMC watchdog reset
+External BMC reset
+Host warm reset
+Host cold reset
+Peripheral reset
+Full AC cycle
+Brownout / rail fault，限核准測試環境
+```
+
+對每一項記錄受影響domain、保留狀態、reset reason、CPLD/PMIC latch及Host side effect。不要只記錄「系統有重新啟動」。
+
+#### 4.12.7 驗證異常與 Recovery
+
+在具備安全復原能力的環境中，測試：
+
+- Rail延遲或PGOOD timeout。
+- Reset stuck asserted / deasserted。
+- Clock missing或clock generator未enable。
+- Deferred probe與provider晚到。
+- BMC reboot期間Host state維持。
+- Runtime suspend/resume。
+- Service restart與state rediscovery。
+- Watchdog、AC loss及fault latch保存流程。
+
+先保存原始證據，再執行clear、reset或power cycle，避免清除reset reason與fault latch。
+
+#### 4.12.8 Bring-up 完成條件
+
+完成不只是device已probe，還應確認：
+
+- 依賴圖與實際波形一致。
+- DTS provider/consumer關係與driver binding一致。
+- Rail、clock、reset與ready時序符合datasheet或量測規格。
+- Warm/cold reset後的保留狀態符合設計。
+- BMC reboot不造成未定義的Host side effect。
+- Runtime PM與service restart可正確恢復。
+- Reset reason、fault latch、UART、kernel log、journal、D-Bus與waveform可對上同一時間軸。
+- 異常情境具有明確的shutdown、retry、rollback或recovery行為。
 
 ## 4.13 當前平台 Reset / Clock / Power 實測表
 
