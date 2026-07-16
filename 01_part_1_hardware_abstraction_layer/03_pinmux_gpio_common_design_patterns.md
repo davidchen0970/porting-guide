@@ -22,6 +22,73 @@ Pinmux 決定 SoC pin 要連接 GPIO, I2C, UART, PWM 或其他硬體功能; GPIO
 
 本章從 pin, pinmux 與 GPIO 的關係開始, 接著說明 Device Tree, active level, reset default, GPIO expander, interrupt, OpenBMC mapping, 以及如何從 schematic 一路追到 D-Bus 與 Redfish.
 
+### 3.0 先建立 Pinmux 與 GPIO 的理解模型
+
+閱讀這個主題時，最容易混淆的是把 pin、pinmux、GPIO、訊號名稱與 OpenBMC 狀態視為同一件事。它們其實位於不同層級：
+
+```text
+主板電路          Schematic net、pull resistor、buffer、level shifter
+                        ↓
+SoC 封裝           Ball / package pin
+                        ↓
+SoC I/O cell        Pad、電氣設定、power domain
+                        ↓
+Pinmux              選擇 GPIO / I2C / UART / PWM / SPI 等功能
+                        ↓
+GPIO controller     Direction、input value、output value、edge detection
+                        ↓
+Linux GPIO line     gpiochip、offset、line name、consumer、active flag
+                        ↓
+Kernel / Service    Driver、GPIO hog、OpenBMC service
+                        ↓
+管理介面            D-Bus、Redfish、IPMI、event log
+```
+
+因此，看到「GPIO 不正常」時，至少可能有六種不同問題：
+
+1. Schematic 上接到的 net 或 ball 與預期不同。
+2. Pinmux 沒有選成 GPIO，而是仍由 UART、PWM 或其他 peripheral 使用。
+3. Pin configuration 的 pull、open-drain、input enable 或 drive strength 不合適。
+4. GPIO controller 的 direction、active level 或 interrupt type 不正確。
+5. Line 已被另一個 kernel driver、hog 或 userspace process 擁有。
+6. 底層 GPIO 正常，但 OpenBMC 的 polarity、state mapping 或 event policy 錯誤。
+
+排查時應逐層確認，不宜把 `gpioinfo` 看得到 line，直接視為整條功能路徑正常。
+
+#### 3.0.1 Pinmux 和 GPIO 分別回答什麼問題
+
+- **Pinmux 回答**：「這顆實體 pin 現在交給哪個硬體功能使用？」
+- **Pin configuration 回答**：「這顆 pin 的電氣行為如何設定？」
+- **GPIO controller 回答**：「若它被選成 GPIO，方向、輸出與輸入值是什麼？」
+- **GPIO consumer 回答**：「目前由哪個 driver 或 process 使用這條 line？」
+- **OpenBMC mapping 回答**：「這個 logical state 對產品功能代表什麼？」
+
+例如 `PSU0_PRSNT_N` 為 Low，不代表所有層都應顯示 `0`：
+
+```text
+實體腳位 Low
+→ Hardware signal asserted
+→ GPIO descriptor 套用 ACTIVE_LOW
+→ Consumer 取得 logical active = 1
+→ Inventory Present = true
+```
+
+#### 3.0.2 一條 GPIO 的完整文件應回答什麼
+
+對每條重要訊號，至少應能回答：
+
+- Schematic net name 與 revision 是什麼？
+- 接到 SoC ball、GPIO expander port，還是 CPLD register bit？
+- Runtime function 是 GPIO 還是 alternate function？
+- Active level、外部 pull 與 voltage domain 是什麼？
+- Reset、Bootloader、Kernel 與 service 各階段由誰控制？
+- Linux gpiochip label、line offset、line name 與 consumer 是什麼？
+- 它是 input、output、interrupt、strap，還是多重用途？
+- D-Bus / Redfish / IPMI 對應到哪個 object 或 property？
+- 哪些測試可安全執行，哪些動作可能造成 power、reset 或安全影響？
+
+後續各節就是用來回答這些問題。
+
 ## 3.1 Pin, Pad, Ball 與 Net
 
 同一條硬體訊號在不同文件中會使用不同名稱.
@@ -104,6 +171,47 @@ Controller 驅動 SDA / SCL
 - JTAG 與一般 GPIO 共用.
 
 Device Tree 中同時啟用兩個使用相同 pin group 的 peripherals, 可能造成 probe failure, 後套用的 state 覆蓋前者, 或硬體輸出異常.
+
+#### 3.2.3 Pinmux 不等於 GPIO Direction
+
+Pinmux 選成 GPIO，只表示該 pad 被路由到 GPIO controller；它還沒有決定這條 line 是 input 或 output。Direction 通常由 GPIO consumer 在要求 line 時設定。
+
+```text
+Pinmux = GPIO function
+        ↓
+GPIO controller 可看見這條 line
+        ↓
+Consumer request line
+        ↓
+設定 input 或 output，以及初始 output value
+```
+
+反過來，如果 pinmux 仍為 UART TX，即使程式嘗試把對應 GPIO offset 設為 output，實體 pin 也可能仍由 UART controller 驅動。這是「register 看似有改，pin 電壓卻沒變」的常見方向之一。
+
+#### 3.2.4 Pinmux 的 Owner 與切換時機
+
+Pinmux 可能在多個階段被設定：
+
+```text
+SoC reset default
+→ BootROM / strap sampling
+→ Bootloader pinmux
+→ Kernel pinctrl default state
+→ Driver runtime / sleep state
+```
+
+Kernel 啟動後看到的 pinctrl 狀態，只能代表當下狀態，不能證明 reset release 或 Bootloader 階段沒有短暫切錯。對 power enable、reset、flash mux、write protect 與 boot strap，應搭配示波器或 logic analyzer 觀察完整時間線。
+
+#### 3.2.5 如何判斷 Pinmux 衝突
+
+Pinmux 衝突不一定總是以 probe failure 呈現。不同 SoC 與 driver 可能出現：
+
+- Pinctrl core 拒絕第二個 owner，並在 kernel log 留下 request failure。
+- 後套用的 state 改寫 mux，使先前 peripheral 不再有外部波形。
+- Bootloader 設定正確，但 Kernel 套用另一組 state 後功能消失。
+- Debug/JTAG 或 secure mode 鎖住 pin function，使一般 DTS 設定無法生效。
+
+第一輪應同時比對 running DTB、pinctrl debugfs、consumer probe log 與實體波形，而不是只確認 source DTS 中存在某個 pinctrl node。
 
 ## 3.3 Pin Configuration
 
@@ -351,6 +459,33 @@ Property 名稱, cell 數量與 flags 需依該 device binding.
 
 當 line 已被 driver, GPIO hog 或 userspace process 要求, 再使用 `gpioget` / `gpioset` 可能收到 busy error.此時應先查看 consumer, 不應透過強制解除 driver 來繞過正常 ownership.
 
+#### 3.7.3 Descriptor-based GPIO 的語意
+
+現代 Linux driver 通常透過 GPIO descriptor API 使用 line，而不是依賴全域 GPIO number。Device Tree 中的 active flag 會成為 descriptor 的一部分，consumer API 通常取得 logical value。
+
+以 `reset-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;` 為例：
+
+```text
+Consumer 要求 assert reset
+→ logical value = 1
+→ descriptor 套用 ACTIVE_LOW
+→ physical output = Low
+```
+
+Driver 若使用 logical API，就不應再次手動反相；否則可能造成 double inversion。若 driver 刻意使用 raw API，文件與程式應明確說明，因為 raw value 直接描述 controller level，不套用 active-low 語意。
+
+#### 3.7.4 Request 與初始 Output Value
+
+對 output line，安全的作法是要求 line 時同時指定初始 logical value，避免先要求成 input、之後再改 output 所形成的短暫 glitch。實際是否能完全無 glitch，仍受 GPIO controller、pinctrl、外部 pull 與硬體設計影響。
+
+關鍵 output 應記錄：
+
+- request 前的 reset/default level。
+- request 時的初始 logical value。
+- polarity 轉換後的 physical level。
+- driver remove、service restart 與 BMC reboot 時 line 如何處理。
+- consumer 釋放 line 後由 external pull 拉到什麼狀態。
+
 ## 3.8 Active Level 與 Logical Value
 
 Active level 描述訊號在何種 physical level 下具有功能意義.
@@ -389,6 +524,39 @@ Inventory Present = true
 ### 3.8.2 名稱中的 `_N`
 
 `_N`, `#` 或 `L` 通常表示 Low active, 但最終仍需以 schematic, datasheet 與實測確認.External inverter, level shifter 或 CPLD logic 都可能改變 BMC pin 看到的 polarity.
+
+#### 3.8.3 完整極性判讀案例：BIOS_WP_N
+
+假設硬體定義 `BIOS_WP_N = Low` 時啟用寫入保護，而 BMC GPIO 直接連到該 net：
+
+```text
+功能需求：啟用寫入保護
+Hardware asserted level：Low
+DTS：GPIO_ACTIVE_LOW
+Consumer logical request：1
+Physical output：Low
+結果：Write protection enabled
+```
+
+若更新流程要暫時解除保護：
+
+```text
+Consumer logical request：0
+Physical output：High
+結果：Write protection disabled
+```
+
+但如果中間存在反相 buffer 或 CPLD，BMC pin 的 physical level 可能與 flash WP pin 不同。因此正式紀錄至少要分別寫出：BMC-side voltage、經過的邏輯元件、flash-side voltage，以及最終功能狀態。
+
+#### 3.8.4 常見的極性錯誤
+
+- Schematic net 名稱有 `_N`，程式又額外反相一次。
+- DTS 使用 `GPIO_ACTIVE_LOW`，service config 同時設定 `inverted=true`。
+- `gpioget` 的工具版本或選項顯示 logical value，但測試者把它當 raw level。
+- CPLD register 已經提供解碼後狀態，OpenBMC 又依 net name 反相。
+- Expander pin 經過 transistor 或 level shifter，實際 polarity 與 SoC-side 假設不同。
+
+排查時應建立 truth table，並分別記錄 physical level、asserted state、descriptor logical value 與產品 property，不要只寫「0/1 顛倒」。
 
 ## 3.9 Reset Default 與控制權交接
 
@@ -549,6 +717,32 @@ watch -n 1 cat /proc/interrupts
 - IRQ count 是否增加.
 - Driver 是否進入 handler.
 - Status 是否被清除.
+
+#### 3.12.4 Interrupt 的完整處理鏈
+
+GPIO interrupt 能正常工作，至少要完成以下鏈條：
+
+```text
+Device 內部事件發生
+→ Device 拉動 INT pin
+→ Pinmux 將 pad 設為 GPIO / interrupt function
+→ GPIO controller 偵測 edge 或 level
+→ Parent interrupt controller 收到 IRQ
+→ Kernel handler 讀取 device status
+→ Handler 清除或解除真正的 interrupt source
+→ INT pin 回到 inactive
+```
+
+若 `/proc/interrupts` 計數不增加，問題可能在 pin 電位、pinmux、GPIO IRQ mapping、parent interrupt 或 trigger type。若計數快速增加，則可能是 level source 未清除、polarity 錯誤，或 shared IRQ 中仍有其他 device 保持 asserted。
+
+#### 3.12.5 Edge 和 Level 的選擇不是只看波形
+
+- Edge trigger 適合事件以轉換表示，handler 不需等待 pin 回復才能解除 IRQ。
+- Level trigger 適合 device 持續保持告警，直到 handler 清除內部 status。
+- 使用 edge trigger 監看很短的 pulse 時，仍需確認 GPIO controller 能否捕捉 pulse width。
+- 使用 both-edge 監看 presence 時，需處理插入、拔除及 debounce，避免將 bounce 建立成多筆事件。
+
+Trigger type 應依 device datasheet、board wiring 與 driver clear flow 共同決定，不能只因 net 名稱以 `_N` 結尾就直接選 `IRQ_TYPE_LEVEL_LOW`。
 
 ## 3.13 Debounce
 
@@ -717,6 +911,50 @@ Power-control service 可能讀取:
 
 CPLD fault latch 即使被 driver 暴露成 GPIO-like state, 仍要保留 read-clear, W1C, sticky 與 reset domain 等 register 語意.
 
+### 3.17.1 完整案例：PSU Presence 從接點到 Redfish
+
+假設 PSU 插入後，connector 將 `PSU0_PRSNT_N` 拉低，訊號經 GPIO expander 傳給 BMC：
+
+```text
+PSU connector contact closes
+→ PSU0_PRSNT_N = Low
+→ PCA9555 port 0 input = 0
+→ Device Tree 將 line 描述為 GPIO_ACTIVE_LOW
+→ GPIO consumer 取得 logical active = 1
+→ Presence service 設定 Inventory Present = true
+→ PSU sensor / FRU 開始建立或啟用
+→ Redfish PowerSupply 資源顯示 Present
+```
+
+若 Redfish 顯示 PSU 不存在，可依下列順序縮小範圍：
+
+1. 電表或 scope 確認 expander pin 是否真的為 Low。
+2. 確認 I2C adapter、mux channel 與 expander address 可存取。
+3. 確認 expander driver probe，並出現對應 gpiochip。
+4. 確認 line offset、line name、direction 與 consumer。
+5. 比較 raw physical level 和 descriptor logical state。
+6. 檢查 presence service 設定與 D-Bus `Present` property。
+7. 確認 inventory association 與 Redfish mapping。
+
+若拔插時產生多筆事件，則進一步確認 connector bounce、CPLD／service debounce，以及是否有多個 owner 同時建立事件。
+
+### 3.17.2 完整案例：Reset Output 的安全交接
+
+假設 BMC GPIO 控制 active-low 的 `SLOT_RESET_N`：
+
+```text
+External pull-down
+→ SoC reset 階段保持 reset asserted
+→ Bootloader 不改變該 pin
+→ Kernel pinctrl 選為 GPIO
+→ Slot driver request output，初始 logical asserted
+→ Slot power 與 PGOOD 成立
+→ Driver logical deassert
+→ Physical pin 轉為 High，解除 reset
+```
+
+需要注意的不是只有最終 High/Low，而是每次 owner 交接是否產生短暫 High pulse。若 slot 尚未供電就短暫解除 reset，可能造成裝置狀態不確定。這類訊號需用 waveform 驗證，而不能只以 `gpioinfo` 的穩態輸出判斷。
+
 ## 3.18 Kernel 與 Yocto
 
 常見 kernel functions:
@@ -871,7 +1109,84 @@ tar czf "/tmp/pinmux-gpio-debug-$(date +%Y%m%d-%H%M%S).tar.gz" \
 
 ## 3.22 Bring-up 順序
 
+Pinmux 與 GPIO bring-up 建議依「先靜態資料、再唯讀狀態、最後才進行控制測試」的順序進行。
 
+#### 3.22.1 建立靜態對照
+
+1. 從 schematic 取得 net name、SoC ball／expander port／CPLD bit。
+2. 記錄 active level、external pull、voltage domain、buffer／inverter 與 power source。
+3. 從 SoC datasheet 或 pinctrl binding 找到對應 pin group 與可選 function。
+4. 確認訊號是否同時為 boot strap、JTAG、UART 或其他共用功能。
+5. 記錄 reset default，以及 Bootloader、Kernel、driver、service 的預期 owner。
+
+輸出應是一列可追蹤的訊號紀錄，而不是只有「GPIO 24」。
+
+#### 3.22.2 確認 Running Software
+
+1. 確認 Bootloader 實際載入的 DTB 與 source revision 相符。
+2. 確認 pinctrl、GPIO controller 與 expander driver 已 probe。
+3. 透過 pinctrl debugfs 確認目標 pad 的 function、group 與 owner。
+4. 使用 `gpiodetect`、`gpioinfo`、`gpiofind` 記錄 chip label、offset、line name、direction、active flag 與 consumer。
+5. 確認沒有 GPIO hog、kernel driver 與 userspace service 重複要求同一 line。
+
+#### 3.22.3 驗證 Input
+
+Input 測試應同時保存：
+
+```text
+測試條件
+→ 實體 pin voltage / waveform
+→ gpioinfo direction 與 active flag
+→ gpioget 或 driver 取得的 logical state
+→ D-Bus property
+→ Redfish / IPMI / event 結果
+```
+
+對 presence、button 與 intrusion，還要測試 debounce、短脈波、插拔、BMC reboot 初始狀態及 event 次數。
+
+#### 3.22.4 驗證 Output
+
+Output 測試前先依風險分類：
+
+- **低風險**：測試專用 GPIO、非關鍵 LED。
+- **中風險**：一般 mux select、非關鍵 reset，需確認 target 狀態。
+- **高風險**：power enable、Host reset、flash mux、write protect、CPLD reset。
+
+高風險 line 不應用通用 `gpioset` 直接測試，應透過正式 driver 或 service，並確認 recovery path。測試至少量測 initial level、assert/deassert level、pulse width、glitch，以及 consumer 重新啟動和 BMC reboot 時的行為。
+
+#### 3.22.5 驗證 Interrupt
+
+1. 先確認 inactive 與 active physical level。
+2. 確認 interrupt parent、line mapping 與 trigger type。
+3. 觸發一次可控事件，觀察 waveform 與 `/proc/interrupts` count。
+4. 確認 handler 讀取正確 status source。
+5. 確認 clear 後 pin 回到 inactive，且沒有 IRQ storm。
+6. 測試短脈波、重複事件、shared interrupt 與 service restart。
+
+#### 3.22.6 驗證開機與控制權交接
+
+至少測試四條時間線：
+
+```text
+AC on → BMC boot → OpenBMC ready
+BMC warm reboot，Host 保持運作
+Host power off → on
+OpenBMC service restart
+```
+
+關鍵訊號需同步保存 waveform、Bootloader log、kernel log、gpio consumer 與 D-Bus state。若只看系統 ready 後的 GPIO state，無法發現 early-boot glitch。
+
+#### 3.22.7 完成條件
+
+Bring-up 完成不只是「GPIO 可以讀寫」，還應包含：
+
+- Schematic、DTS、runtime line 與 OpenBMC object 可完整對照。
+- Physical level、logical value 與產品語意一致。
+- Reset default 與所有控制權交接符合安全需求。
+- Interrupt、debounce、event 與 clear flow 已驗證。
+- BMC reboot、Host transition 與 AC cycle 不造成非預期輸出。
+- 高風險 line 只能由核准 owner 控制。
+- 正常輸出、異常輸出、waveform 與測試結果已保存。
 
 ## 3.23 平台訊號紀錄表
 
