@@ -1,5 +1,7 @@
 # 第 3 章　Pinmux 與 GPIO 通用設計模式
 
+> 現場正在排查故障，不需要依序閱讀本章時，請直接前往：[3.20 附錄：現場急救索引](#gpio-field-first-aid)。
+
 ## 適用範圍
 
 本章說明 BMC 平台上的 Pinmux、GPIO、GPI、GPO、Device Tree、U-Boot、Linux kernel 與 OpenBMC 之間的關係。
@@ -806,6 +808,225 @@ Consumer 還可能引用 pinctrl state：
 
 只改 source DTS，但 image 未更新或 bootloader 載入其他 DTB，target 行為不會改變。
 
+### 3.7.5 GPIO Mapping 是什麼
+
+GPIO Mapping 可以翻成「GPIO 對應關係」。它描述的不是 Pinmux，而是：
+
+> 某個裝置的某項功能，要使用哪一個 GPIO controller 的哪一條 line，以及該訊號的有效極性。
+
+例如：
+
+```dts
+slot@0 {
+    reset-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+    enable-gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+};
+```
+
+先只看第一條：
+
+```dts
+reset-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+```
+
+它可以拆成四件事：
+
+```text
+reset-gpios
+├── reset：consumer function，表示這是裝置的 reset 功能
+├── &gpio0：提供 GPIO 的 controller
+├── 12：gpio0 內的 line offset
+└── GPIO_ACTIVE_LOW：physical Low 時，reset 為 active
+```
+
+因此這一行的完整意思是：
+
+```text
+slot@0 的 reset 功能
+使用 gpio0 的 line 12
+而且這條 reset 訊號為 active-low
+```
+
+#### GPIO Mapping 如何和 driver 對上
+
+Device Tree 的 GPIO consumer property 通常使用：
+
+```text
+<function>-gpios
+```
+
+例如：
+
+```text
+reset-gpios
+power-gpios
+enable-gpios
+presence-gpios
+```
+
+Driver 取得 GPIO 時，會使用相同的 function name：
+
+```c
+reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+```
+
+這裡的 `"reset"` 會對應到 Device Tree 裡的：
+
+```dts
+reset-gpios = <...>;
+```
+
+完整關係如下：
+
+```text
+Driver 要求 "reset"
+    ↓
+GPIO subsystem 尋找 reset-gpios
+    ↓
+解析 &gpio0、line 12、GPIO_ACTIVE_LOW
+    ↓
+回傳 GPIO descriptor 給 driver
+```
+
+若同一項功能有多條 GPIO，可以使用 index：
+
+```dts
+led-gpios =
+    <&gpio0 15 GPIO_ACTIVE_HIGH>,
+    <&gpio0 16 GPIO_ACTIVE_HIGH>,
+    <&gpio0 17 GPIO_ACTIVE_HIGH>;
+```
+
+Driver 再以 index 0、1、2 分別取得三條 line。
+
+#### GPIO Mapping、Pinmux 與 Direction 的差異
+
+這三件事要分開理解：
+
+```text
+Pinmux
+回答：這顆實體 pin 要交給 GPIO、UART、I2C 還是 PWM？
+
+GPIO Mapping
+回答：這個裝置的 reset、enable 或 presence 功能，要使用哪條 GPIO line？
+
+GPIO Direction
+回答：Consumer 取得 line 後，要把它設定成 input 還是 output？
+```
+
+以 reset output 為例：
+
+```text
+SoC ball A12
+    ↓
+Pinmux 選成 GPIO function
+    ↓
+A12 對應到 gpio0 line 12
+    ↓
+reset-gpios 將 line 12 對應給裝置的 reset 功能
+    ↓
+Driver 以 output 方式要求這條 line
+```
+
+因此：
+
+```text
+Pinmux != GPIO Mapping != GPIO Direction
+```
+
+三者缺少任何一項，GPIO 功能都可能無法正常工作。
+
+#### GPIO Mapping 與 gpio-line-names 的差異
+
+`gpio-line-names` 只是替各 line 加上方便辨識的名稱：
+
+```dts
+&gpio0 {
+    gpio-line-names =
+        "slot-reset-n",
+        "slot-enable",
+        "psu-present-n";
+};
+```
+
+Consumer mapping 則是把 line 分配給裝置功能：
+
+```dts
+slot@0 {
+    reset-gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+};
+```
+
+兩者分別回答：
+
+```text
+gpio-line-names：這條 line 叫什麼？
+reset-gpios：哪個裝置以 reset 功能使用這條 line？
+```
+
+只有 `gpio-line-names`，不表示 driver 已經取得該 line；只有 `reset-gpios`，即使沒有可讀的 line name，driver 仍可能正常取得 GPIO。
+
+#### GPIO Mapping 與 GPI / GPO 的關係
+
+Mapping 本身指定 controller、line 與 active flag，但 line 最後作為 input 或 output，通常由 consumer driver 的要求方式決定。
+
+例如 presence：
+
+```dts
+presence-gpios = <&gpio0 20 GPIO_ACTIVE_LOW>;
+```
+
+Driver 以 input 方式要求後，它就是一條 GPI：
+
+```text
+外部 presence 訊號 → gpio0 line 20 → presence driver
+```
+
+例如 reset：
+
+```dts
+reset-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+```
+
+Driver 以 output 方式要求後，它就是一條 GPO：
+
+```text
+reset driver → gpio0 line 12 → 外部 reset pin
+```
+
+所以不能只看到 `*-gpios` 就判定它是 GPI 或 GPO，還要看 binding、driver 與實際資料方向。
+
+#### 舊式 `-gpio` 與目前的 `-gpios`
+
+較舊的 Device Tree binding 可能使用：
+
+```dts
+reset-gpio = <...>;
+```
+
+新的 binding 應使用複數形式：
+
+```dts
+reset-gpios = <...>;
+```
+
+舊式單數形式主要為相容既有 binding，不應直接拿來建立新的 binding。
+
+#### GPIO Mapping 的排查方式
+
+如果 driver 顯示找不到 GPIO，可以依序檢查：
+
+1. Consumer node 是否真的存在於 running DTB。
+2. Property 是否使用正確 function name，例如 `reset-gpios`。
+3. Driver 要求的名稱是否也是 `"reset"`。
+4. Phandle 是否指向正確 GPIO controller。
+5. Line offset 是否在 controller 的有效範圍內。
+6. `#gpio-cells` 與 property 參數數量是否符合 binding。
+7. Active flag 是否正確。
+8. GPIO controller driver 是否已 probe。
+9. Line 是否已被 GPIO hog 或其他 consumer 要求。
+10. Pinmux 是否將對應 pad 選成 GPIO function。
+
 ## 3.8 GPIO consumer 與 GPIO hog
 
 ### 3.8.1 Descriptor-based GPIO
@@ -1583,9 +1804,177 @@ Host power transition 行為：
 - 關鍵 GPO 的穩態正確仍不足以證明安全，還要量測 reset、U-Boot、kernel 與 service 交接期間是否有 glitch。
 - 完整文件應讓讀者能從 Schematic net 一路追到 gpiochip、consumer、D-Bus 與 Redfish。
 
-## 3.20 參考資料
+<a id="gpio-field-first-aid"></a>
 
-- Linux kernel GPIO mappings: <https://docs.kernel.org/driver-api/gpio/board.html>
+## 3.20 附錄 : 現場急救索引
+
+本節供問題發生時先縮小範圍。所有指令先以唯讀檢查為主。對 power、reset、write protect、flash mux 與 strap，不要直接切換輸出或寫入暫存器。
+
+### 現象一：進入 kernel 後，GPIO 電位不再變化
+
+先執行：
+
+```sh
+mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug
+cat /sys/kernel/debug/gpio 2>/dev/null
+find /sys/kernel/debug/pinctrl -name pinmux-pins -exec sh -c 'echo "===== $1"; cat "$1"' _ {} \;
+```
+
+判讀：
+
+- `pinmux-pins` 顯示 UART、I2C、PWM 等 function：該 pad 目前不一定交給 GPIO。
+- 顯示 GPIO 但電位不動：再查 direction、consumer、external driver、open-drain 與 CPLD override。
+- `/sys/kernel/debug/gpio` 不存在或資訊不足：可能是 kernel config、driver 或 kernel 版本差異；它不是所有 SoC 的 GPIO 資料暫存器傾印。
+
+### 現象二：不確定 kernel 實際使用哪份 Device Tree
+
+```sh
+dtc -I fs -O dts /sys/firmware/devicetree/base > /tmp/running.dts
+```
+
+優先比對：
+
+```text
+status
+pinctrl-names
+pinctrl-0
+*-gpios
+gpio-line-names
+interrupt-parent
+interrupts
+```
+
+若 `dtc` 不存在，可先保存 `/sys/firmware/devicetree/base`，再於開發環境使用 DTC 分析。反編譯結果可能展開 label、phandle 與 include，不宜只做逐行文字比較，應比對 node、property 與數值。
+
+### 現象三：`Device or resource busy` 或 `EBUSY`
+
+```sh
+gpioinfo
+cat /sys/kernel/debug/gpio 2>/dev/null
+```
+
+判讀：
+
+- Line 已有 consumer：表示 kernel driver、GPIO hog 或另一個 userspace process 已持有它。
+- `--consumer=debug` 只會設定本次 request 顯示的 consumer 名稱，不會搶走已被持有的 line。
+- 若確實要卸載 driver，先確認它不是 power、reset、watchdog、flash、thermal 或安全路徑，並準備復原方式。
+
+### 現象四：gpiochip 編號改變
+
+先列出 chip、label 與裝置路徑：
+
+```sh
+gpiodetect
+for c in /sys/bus/gpio/devices/gpiochip*; do
+    [ -e "$c" ] || continue
+    printf '%s label=' "$(basename "$c")"
+    cat "$c/label" 2>/dev/null
+    readlink -f "$c/device" 2>/dev/null
+done
+```
+
+判讀：
+
+- 不要把 `gpiochip0` 寫死在長期腳本。
+- Label 可協助定位，但不保證所有平台都唯一，正式流程應再搭配 device path 或明確驗證只能匹配一個 chip。
+- 使用 `gpiodetect | grep ... | awk ...` 前，要處理冒號、零筆與多筆匹配，不能直接假設第一筆一定正確。
+
+### 現象五：GPIO expander 沒出現
+
+先查 I2C topology，再查 expander：
+
+```sh
+i2cdetect -l
+ls -l /sys/bus/i2c/devices/i2c-*/device 2>/dev/null
+find /sys/bus/i2c/devices -maxdepth 2 -name name -print -exec cat {} \; 2>/dev/null
+```
+
+確認 bus 與地址後，才考慮掃描：
+
+```sh
+i2cdetect -y -r <bus>
+```
+
+判讀：
+
+- 顯示地址，例如 `20`：該地址有裝置回應，但尚不能單靠這點證明型號與設定正確。
+- 顯示 `UU`：該地址通常已被 kernel driver 使用，不代表故障。
+- 顯示 `--`：沒有探測到回應，可能是 bus、mux channel、power、reset、地址或探測方式問題。
+- `i2cdetect` 會在 bus 上產生交易，部分裝置不適合被任意掃描；先確認平台允許。
+
+PCA9555 類裝置的 input register 可依 datasheet 讀取，但暫存器位址與 transaction type 必須依實際型號確認：
+
+```sh
+i2cget -y <bus> 0x20 0x00
+```
+
+若裝置已綁定 kernel driver，直接由 userspace 存取可能失敗或干擾 driver。不要把強制參數當成一般排查流程。
+
+### 現象六：U-Boot 正常，kernel 啟動後失效
+
+U-Boot 先使用 GPIO 與 pinmux 正式命令：
+
+```text
+gpio status -a
+gpio input <pin>
+gpio set <pin>
+gpio clear <pin>
+pinmux status -a
+```
+
+可用 `help gpio`、`help pinmux` 確認該版本是否支援。`gpio status` 的常見判讀：
+
+- `input: 0/1`：目前為 input，後方為讀值。
+- `output: 0/1`：目前為 output，後方為輸出值。
+- `func ...`：目前為 alternate function，不是一般 GPIO。
+- `[x]`：該 GPIO 已被某個 owner 使用。
+
+只有在已核對 SoC datasheet、暫存器位址、bit field、clock/reset domain 與副作用後，才使用 `md` 讀取 MMIO：
+
+```text
+md.l <register-address> <count>
+```
+
+`mw.l` 會直接寫入 MMIO，可能造成掉電、reset、flash owner 切換、bus contention 或鎖死。本文不提供可直接套用的寫入值；若必須使用，應先保存原值、使用 read-modify-write、限定目標 bit，並準備斷電復原。
+
+### 現象七：Raw、logical 與電表結果互相矛盾
+
+同時保存：
+
+```text
+測點位置
+實測電壓
+SoC-side 電位
+中間的 buffer / inverter / level shifter
+Device-side 電位
+DTS active flag
+工具完整命令與版本
+Driver / D-Bus logical state
+```
+
+不要只量名義上的 net，也不要假設能直接量到 BGA ball。依 Schematic 選擇 SoC-side 與 device-side 的可接觸 test point 或元件腳位；若中間有反相器，兩側電位本來就應相反。DTS 的 active flag應描述 consumer 所看到的邏輯語意，不能僅依 net 名稱機械式反相。
+
+### 現場第一包唯讀資料
+
+```sh
+OUT=/tmp/gpio-first-aid
+mkdir -p "$OUT"
+uname -a > "$OUT/uname.txt"
+cat /proc/cmdline > "$OUT/cmdline.txt"
+dmesg > "$OUT/dmesg.txt"
+gpiodetect > "$OUT/gpiodetect.txt" 2>&1
+gpioinfo > "$OUT/gpioinfo.txt" 2>&1
+cat /sys/kernel/debug/gpio > "$OUT/debug-gpio.txt" 2>&1
+dtc -I fs -O dts /sys/firmware/devicetree/base > "$OUT/running.dts" 2>"$OUT/dtc.err"
+find /sys/kernel/debug/pinctrl -maxdepth 2 -type f -print > "$OUT/pinctrl-files.txt" 2>&1
+i2cdetect -l > "$OUT/i2c-list.txt" 2>&1
+```
+
+這一包先回答四件事：目前跑哪個 kernel、實際 DT 是什麼、GPIO owner 是誰、I2C topology 是否存在。它不會主動切換 GPIO output，也不會掃描每條 I2C bus。
+
+## 3.21 參考資料
+
+- Linux kernel GPIO consumer mappings：說明 Device Tree、ACPI 與 platform data 如何將裝置功能對應到 GPIO line：<https://docs.kernel.org/driver-api/gpio/board.html>
 - Linux GPIO character device userspace API: <https://docs.kernel.org/userspace-api/gpio/chardev.html>
 - Linux PINCTRL subsystem: <https://docs.kernel.org/driver-api/pin-control.html>
 - Linux GPIO Device Tree bindings: <https://github.com/torvalds/linux/tree/master/Documentation/devicetree/bindings/gpio>
