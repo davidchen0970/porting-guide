@@ -1839,6 +1839,14 @@ grep -Ei '<pin-name>|<function-name>|gpio|uart|i2c' \
 
 `<pin-name>` 應替換成 datasheet、DTS 或 debugfs 中的實際名稱。只用 `grep "PIO"` 可能漏掉不含該字串的 owner 或 function。
 
+聯動判讀：
+
+- `pinmux-pins` 用來確認 pad 的 mux function 與 pinctrl ownership。
+- `gpioinfo` 的 consumer 欄位用來確認 GPIO line 是否已被 GPIO consumer 要求。判斷 `gpioget` 或 `gpioset` 是否可能遇到 `EBUSY` 時，應以 GPIO line 的 consumer 狀態為主要依據。
+- 若 `pinmux-pins` 顯示 GPIO，而 `gpioinfo` 顯示 kernel、hog 或具體 driver consumer：該 line 已被要求，另一個獨占 request 通常會得到 `EBUSY`。
+- 若 `pinmux-pins` 顯示 GPIO，而 `gpioinfo` 顯示 unused：表示目前未顯示既有 GPIO consumer，但仍須確認權限、line 是否有效、kernel 版本、工具版本、競爭條件與平台限制。這不代表任何訊號都適合使用 `gpioset`。
+- 即使 line 顯示 unused，power、reset、write protect、flash mux、strap、watchdog 與共享 open-drain line 仍不得直接切換。
+
 ### 現象二：不確定 kernel 實際使用哪份 Device Tree
 
 ```sh
@@ -1901,6 +1909,39 @@ i2cdetect -l
 ls -l /sys/bus/i2c/devices/i2c-*/device 2>/dev/null
 find /sys/bus/i2c/devices -maxdepth 2 -name name -print -exec cat {} \; 2>/dev/null
 ```
+
+
+Linux 的 `i2c-N` 是 runtime adapter number，不等於 DTS label 中的數字。例如 `&i2c7` 是 source DTS label，進入 DTB 後通常不保留該 label；若中間有 I2C mux，child adapter number 也可能由 runtime 動態分配。
+
+先列出每個 adapter 的名稱與 OF node 路徑：
+
+```sh
+for a in /sys/class/i2c-adapter/i2c-*; do
+    [ -e "$a" ] || continue
+    printf '%s  name=' "$(basename "$a")"
+    cat "$a/name" 2>/dev/null
+    printf '  of_node='
+    readlink -f "$a/device/of_node" 2>/dev/null || true
+done
+```
+
+再查看 Device Tree alias 與實際路徑。若系統保留 `/aliases`：
+
+```sh
+for a in /sys/firmware/devicetree/base/aliases/i2c*; do
+    [ -e "$a" ] || continue
+    printf '%s -> ' "$(basename "$a")"
+    tr -d '\000' < "$a"
+    printf '\n'
+done
+```
+
+判讀：
+
+- `&i2c7` 是 DTS source label，不能直接用 `grep i2c7` 保證找到 runtime adapter。
+- `/aliases/i2c7` 若存在，其內容是 Device Tree path；將它與 adapter 的 `of_node` 路徑比對，才能確認 root adapter。
+- I2C mux 的 child adapter 應再依 adapter `name`、`of_node`、parent symlink、mux channel `reg` 與 DTS topology 確認。
+- `dmesg` 可作輔助，但 log 格式取決於 driver，而且 log 可能因層級或 ring buffer 被覆寫，不能作為唯一依據。
 
 確認 bus 與地址後，才考慮掃描：
 
@@ -2043,6 +2084,7 @@ OUT=/tmp/gpio-first-aid
 mkdir -p "$OUT"
 uname -a > "$OUT/uname.txt"
 cat /proc/cmdline > "$OUT/cmdline.txt"
+cat /proc/interrupts > "$OUT/interrupts.txt" 2>&1
 dmesg > "$OUT/dmesg.txt"
 gpiodetect > "$OUT/gpiodetect.txt" 2>&1
 gpioinfo > "$OUT/gpioinfo.txt" 2>&1
@@ -2052,7 +2094,7 @@ find /sys/kernel/debug/pinctrl -maxdepth 2 -type f -print > "$OUT/pinctrl-files.
 i2cdetect -l > "$OUT/i2c-list.txt" 2>&1
 ```
 
-這一包先回答四件事：目前跑哪個 kernel、實際 DT 是什麼、GPIO owner 是誰、I2C topology 是否存在。它不會主動切換 GPIO output，也不會掃描每條 I2C bus。
+這一包先回答五件事：目前跑哪個 kernel、實際 DT 是什麼、GPIO owner 是誰、I2C topology 是否存在，以及收集當下的 IRQ count。它不會主動切換 GPIO output，也不會掃描每條 I2C bus。`interrupts.txt` 只是單一時間點快照；若要判斷 count 是否增加，仍需在事件前後各收集一次，或使用 `watch` 觀察。
 
 ## 3.21 參考資料
 
