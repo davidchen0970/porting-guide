@@ -1823,8 +1823,21 @@ find /sys/kernel/debug/pinctrl -name pinmux-pins -exec sh -c 'echo "===== $1"; c
 判讀：
 
 - `pinmux-pins` 顯示 UART、I2C、PWM 等 function：該 pad 目前不一定交給 GPIO。
-- 顯示 GPIO 但電位不動：再查 direction、consumer、external driver、open-drain 與 CPLD override。
+- 同時查看 pin、mux owner、GPIO owner 與 function。實際欄位排列與文字格式由 SoC pinctrl driver 決定，不能假設固定是第三欄或最後一欄。
+- 若 function 顯示 GPIO，但 GPIO owner 為空：只能表示 mux 已切到 GPIO，仍要用 `gpioinfo` 或 `/sys/kernel/debug/gpio` 確認 direction、consumer 與 value。
+- 若 GPIO owner 顯示具體 device 或 driver：表示 line 可能已被 consumer 要求；再用 `gpioinfo` 確認。此時 `gpioget` 或 `gpioset` 通常會得到 `EBUSY`。
+- `pinctrl` 字樣不等於 line 一定可被 userspace 要求，也不等於 line 必然懸空。Pinctrl ownership 與 GPIO descriptor ownership 是不同層，必須交叉比對。
+- 顯示 GPIO 但電位不動：再查 direction、consumer、external driver、open-drain、I/O power domain 與 CPLD override。
 - `/sys/kernel/debug/gpio` 不存在或資訊不足：可能是 kernel config、driver 或 kernel 版本差異；它不是所有 SoC 的 GPIO 資料暫存器傾印。
+
+依 SoC pin 或 function 名稱縮小輸出：
+
+```sh
+grep -Ei '<pin-name>|<function-name>|gpio|uart|i2c' \
+    /sys/kernel/debug/pinctrl/*/pinmux-pins
+```
+
+`<pin-name>` 應替換成 datasheet、DTS 或 debugfs 中的實際名稱。只用 `grep "PIO"` 可能漏掉不含該字串的 owner 或 function。
 
 ### 現象二：不確定 kernel 實際使用哪份 Device Tree
 
@@ -1953,6 +1966,75 @@ Driver / D-Bus logical state
 ```
 
 不要只量名義上的 net，也不要假設能直接量到 BGA ball。依 Schematic 選擇 SoC-side 與 device-side 的可接觸 test point 或元件腳位；若中間有反相器，兩側電位本來就應相反。DTS 的 active flag應描述 consumer 所看到的邏輯語意，不能僅依 net 名稱機械式反相。
+
+### 現象八：GPIO 軟體狀態正確，但實體電位不變
+
+可以進一步唯讀 SoC 的 MMIO 狀態，但 `devmem` 不是通用 GPIO raw-value API。只有在取得正確 SoC datasheet、register map 與平台核准後才使用。
+
+先確認：
+
+- SoC 型號與 revision。
+- GPIO bank base address。
+- Direction、pad input/readback、output latch 與 pinmux register 的 offset。
+- Register width、endianness、clock/reset domain 與 secure access 限制。
+
+唯讀形式：
+
+```sh
+devmem <register-address> 32
+# 或
+busybox devmem <register-address> 32
+```
+
+不要直接套用其他 SoC 的位址。即使同為 ASPEED，不同世代、bank 或 revision 的 offset 與 bit 定義也可能不同。應至少區分 direction、pad input/readback、output latch 與 pinmux register；它們不一定回傳相同值。
+
+判讀：
+
+- Direction 顯示 input：先查 consumer、hog、driver request 與 pinmux，不要只看 output latch。
+- Output latch 與 pad readback 都會變，但量測點不變：檢查測點是否在 buffer 或 level shifter 另一側、I/O power domain、焊接、外部短路與參考地。
+- Output latch 會變，但 pad readback 不變：可能涉及 pinmux、open-drain、外部強拉、I/O domain 或 controller readback 語意。
+- MMIO readback 與電表一致，但 `gpioget` 或 D-Bus 不一致：優先檢查 line mapping、offset、active-low、driver 反相與 service mapping。
+- `devmem` 回傳 bus error、permission denied 或固定值：可能是 secure register、禁止 `/dev/mem`、clock/reset 未開、位址錯誤或平台限制，不能直接判定硬體故障。
+
+`devmem` 讀到的是 register value，不必然等於封裝 pin 的即時物理電位。最終仍要交叉比對 MMIO、pinctrl、GPIO consumer、SoC-side 測點與 device-side 測點。
+
+不要以 `devmem` 寫入 GPIO 或 pinmux register作為一般急救步驟。直接寫入可能同時改變同 bank 的其他 line，引發 power、reset、flash mux 或安全狀態變化。
+
+### 現象九：GPI 已跳變，但 kernel driver 或事件沒有反應
+
+先同時觀察實體波形與 interrupt count：
+
+```sh
+cat /proc/interrupts
+watch -n 1 cat /proc/interrupts
+```
+
+若已知 driver、device 或 IRQ 名稱，再縮小範圍：
+
+```sh
+grep -Ei '<driver>|<device>|gpio|irq' /proc/interrupts
+```
+
+不要只依 `grep gpio` 判定。GPIO child IRQ 在 `/proc/interrupts` 中可能顯示 device 或 driver 名稱，不一定包含 `gpio`。
+
+判讀：
+
+- 實體 pin 沒有跳變：回查 Schematic、power、pull、buffer、expander 與 device status。
+- 實體 pin 有跳變，但 IRQ count 不增加：檢查 pinmux、GPIO-to-IRQ mapping、interrupt parent、IRQ domain、mask/unmask、polarity 與 edge/level trigger。
+- IRQ count 增加，但 driver 狀態不更新：檢查 handler、threaded IRQ、work queue、device status register、clear flow 與 service mapping。
+- IRQ count 持續快速增加：常見方向是 level source 未清除、polarity 錯誤、shared IRQ 仍有 source asserted，或 clear sequence 不完整。
+- `gpiomon` 能看到 edge，不代表 kernel driver 的 IRQ mapping正確；line 已被 driver 持有時，`gpiomon` 也可能因 `EBUSY` 無法要求 line。
+
+若 kernel 開啟對應 IRQ debugfs，可查看：
+
+```sh
+ls /sys/kernel/debug/irq/irqs 2>/dev/null
+cat /sys/kernel/debug/irq/irqs/<irq-number> 2>/dev/null
+cat /proc/irq/<irq-number>/spurious 2>/dev/null
+cat /proc/irq/<irq-number>/smp_affinity_list 2>/dev/null
+```
+
+不同 kernel 版本與 config 的欄位不同，debugfs 不一定直接提供完整 trigger type。還要檢查 Device Tree 的 `interrupt-parent`、`interrupts` 或 `interrupts-extended`，並確認 edge/level 與 active polarity。若是 GPIO expander interrupt，還要確認 parent GPIO IRQ、expander interrupt controller、INT pin polarity，以及讀取哪個 status/input register 才能解除 interrupt。
 
 ### 現場第一包唯讀資料
 
