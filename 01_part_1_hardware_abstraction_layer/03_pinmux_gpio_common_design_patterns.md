@@ -734,6 +734,21 @@ Device Tree 可透過 `gpio-line-names` 提供名稱：
 
 名稱順序必須與 controller line offset 完全一致。
 
+`gpioinfo` 顯示 `unnamed`，不表示該 line 不存在或被停用。它只表示目前沒有可用的 line name。`gpiofind` 依名稱搜尋，因此找不到 unnamed line；此時應回到 `gpioinfo <chip>`，確認目標 offset 是否存在、是否有效，以及 consumer 狀態。
+
+若中間某個 offset 沒有名稱，但後面的 offset 仍需命名，應使用空字串保留位置，不可把後面的名稱向前移：
+
+```dts
+&gpio0 {
+    gpio-line-names =
+        "pwrbtn-n",       /* offset 0 */
+        "",               /* offset 1，刻意不命名 */
+        "host-pgood";     /* offset 2 */
+};
+```
+
+陣列至少應覆蓋到最後一個需要命名的 offset。未提供名稱的其餘 line 仍可能存在，但能否由 userspace 依 offset 要求，還要看 valid mask、consumer、權限與 controller driver；不能因 `gpiofind` 找不到名稱，就判定硬體沒有 mapping。
+
 ### 3.6.5 Consumer
 
 Consumer 是目前要求該 line 的 kernel driver 或 userspace process。
@@ -1956,13 +1971,31 @@ i2cdetect -y -r <bus>
 - 顯示 `--`：沒有探測到回應，可能是 bus、mux channel、power、reset、地址或探測方式問題。
 - `i2cdetect` 會在 bus 上產生交易，部分裝置不適合被任意掃描；先確認平台允許。
 
-PCA9555 類裝置的 input register 可依 datasheet 讀取，但暫存器位址與 transaction type 必須依實際型號確認：
+PCA9555 類裝置應將 direction、pin input 與 output latch 分開讀取。以下位址只適用於已確認為 PCA9555 相容 register map 的裝置：
 
 ```sh
+# Input Port 0 / 1：讀取 port pin 的邏輯狀態
 i2cget -y <bus> 0x20 0x00
+i2cget -y <bus> 0x20 0x01
+
+# Output Port 0 / 1：讀取 output latch
+i2cget -y <bus> 0x20 0x02
+i2cget -y <bus> 0x20 0x03
+
+# Configuration Port 0 / 1：1 = input，0 = output
+i2cget -y <bus> 0x20 0x06
+i2cget -y <bus> 0x20 0x07
 ```
 
-若裝置已綁定 kernel driver，直接由 userspace 存取可能失敗或干擾 driver。不要把強制參數當成一般排查流程。
+判讀時先找出目標 bit，再分別比對 configuration、input port 與 output latch：
+
+- Configuration bit = 1：該 pin 設為 input，Input Port bit 是目前讀到的 pin 狀態。
+- Configuration bit = 0：該 pin 設為 output；Output Port bit 是輸出 latch，Input Port bit則用來讀取 port pin 的實際邏輯狀態。Input Port 不是 Output Port register 的別名。
+- Output latch 與 Input Port 不同：可能涉及外部強拉、open-drain 類電路、供電、負載或硬體連線，需依 datasheet 與波形繼續確認。
+
+PCA9555 的 Polarity Inversion register 也可能影響 Input Port 的讀值，因此還要依型號確認 `0x04`、`0x05` 的設定。不同 expander 的 register map、auto-increment 與 transaction type可能不同，不可直接照搬上述位址。
+
+若裝置已綁定 kernel driver，直接由 userspace 存取可能失敗、與 driver 競爭或改變 interrupt clear 時序。不要把強制參數當成一般排查流程。
 
 ### 現象六：U-Boot 正常，kernel 啟動後失效
 
@@ -1982,6 +2015,20 @@ pinmux status -a
 - `output: 0/1`：目前為 output，後方為輸出值。
 - `func ...`：目前為 alternate function，不是一般 GPIO。
 - `[x]`：該 GPIO 已被某個 owner 使用。
+
+U-Boot 的 `GPIOA0`、`GPIOB3` 等 bank 名稱，不一定直接等於 Linux gpiochip offset。對帳時應建立明確換算表：
+
+```text
+U-Boot bank/pin
+→ SoC datasheet 的 GPIO controller、bank 與 bit
+→ Linux gpiochip label / device path
+→ 該 gpiochip 內的 line offset
+→ gpio-line-name / consumer
+```
+
+不要假設每個 bank 固定有 8、16 或 32 lines，也不要假設 Bank A 一定由 offset 0 開始。部分 SoC 會有保留洞、分成多個 gpiochip，或由 driver 使用不同的 offset 編排。應以 SoC datasheet、U-Boot GPIO driver、Linux GPIO driver 與 runtime `gpioinfo` 交叉確認。
+
+若需要跨 U-Boot 與 kernel 比對同一 MMIO register，可在兩個階段唯讀相同位址及相同 bit。兩邊結果一致只能證明該 register bit 在兩次讀取時一致，不能單獨證明 U-Boot 名稱與 Linux line mapping 正確；mapping 仍需由 driver 與 datasheet 對帳。
 
 只有在已核對 SoC datasheet、暫存器位址、bit field、clock/reset domain 與副作用後，才使用 `md` 讀取 MMIO：
 
@@ -2058,6 +2105,23 @@ grep -Ei '<driver>|<device>|gpio|irq' /proc/interrupts
 
 不要只依 `grep gpio` 判定。GPIO child IRQ 在 `/proc/interrupts` 中可能顯示 device 或 driver 名稱，不一定包含 `gpio`。
 
+執行插拔、按鍵或其他可控事件前後，分別保存同一個 IRQ 的計數：
+
+```sh
+grep -E '^ *<irq-number>:' /proc/interrupts > /tmp/irq-before.txt
+# 執行一次可控觸發
+grep -E '^ *<irq-number>:' /proc/interrupts > /tmp/irq-after.txt
+diff -u /tmp/irq-before.txt /tmp/irq-after.txt
+```
+
+多核心系統的 `/proc/interrupts` 會有多個 per-CPU count，判讀時要比較同一列所有 CPU 欄位的合計變化：
+
+- 合計完全不變：這次觀察期間沒有看到 IRQ 送達該 interrupt entry。
+- 合計增加一或少量，但 driver 狀態未更新：IRQ 已到達 CPU，優先查 handler、status/clear flow、threaded work 與後續 mapping。
+- 合計大量增加：檢查 IRQ storm、level source 未清除、polarity 與 shared source。
+
+前後快照比 `watch` 更適合留下可重現證據；若事件非常短或系統可能重啟，應搭配 serial log、trace 或平台可用的持久化紀錄。
+
 判讀：
 
 - 實體 pin 沒有跳變：回查 Schematic、power、pull、buffer、expander 與 device status。
@@ -2089,12 +2153,23 @@ dmesg > "$OUT/dmesg.txt"
 gpiodetect > "$OUT/gpiodetect.txt" 2>&1
 gpioinfo > "$OUT/gpioinfo.txt" 2>&1
 cat /sys/kernel/debug/gpio > "$OUT/debug-gpio.txt" 2>&1
-dtc -I fs -O dts /sys/firmware/devicetree/base > "$OUT/running.dts" 2>"$OUT/dtc.err"
-find /sys/kernel/debug/pinctrl -maxdepth 2 -type f -print > "$OUT/pinctrl-files.txt" 2>&1
+dtc -I fs -O dts /sys/firmware/devicetree/base \
+    > "$OUT/running.dts" 2>"$OUT/dtc.err"
+find /sys/kernel/debug/pinctrl -maxdepth 3 -type f -print \
+    > "$OUT/pinctrl-files.txt" 2>&1
+find /sys/kernel/debug/pinctrl \
+    \( -name pins -o -name pinmux-pins -o -name pinconf-pins -o -name gpio-ranges \) \
+    -type f -exec sh -c '
+        for f do
+            echo "===== $f"
+            cat "$f"
+            echo
+        done
+    ' sh {} + > "$OUT/pinctrl-dump.txt" 2>&1
 i2cdetect -l > "$OUT/i2c-list.txt" 2>&1
 ```
 
-這一包先回答五件事：目前跑哪個 kernel、實際 DT 是什麼、GPIO owner 是誰、I2C topology 是否存在，以及收集當下的 IRQ count。它不會主動切換 GPIO output，也不會掃描每條 I2C bus。`interrupts.txt` 只是單一時間點快照；若要判斷 count 是否增加，仍需在事件前後各收集一次，或使用 `watch` 觀察。
+這一包先回答五件事：目前跑哪個 kernel、實際 DT 是什麼、GPIO owner 是誰、I2C topology 是否存在，以及收集當下的 IRQ count。它不會主動切換 GPIO output，也不會掃描每條 I2C bus。`interrupts.txt` 只是單一時間點快照；若要判斷 count 是否增加，仍需在事件前後各收集一次。`pinctrl-files.txt` 保存檔案清單，`pinctrl-dump.txt` 才保存 `pins`、`pinmux-pins`、`pinconf-pins` 與 `gpio-ranges` 的實際內容。部分檔案可能因 kernel config、driver 或讀取權限而不存在，錯誤也會被保留在 dump 中。
 
 ## 3.21 參考資料
 
