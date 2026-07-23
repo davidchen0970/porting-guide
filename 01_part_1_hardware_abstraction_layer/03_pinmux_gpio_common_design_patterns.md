@@ -1295,6 +1295,8 @@ Line name、direction 與 value 驗證
 
 ## 3.11 GPIO interrupt
 
+GPIO 中斷 (GPIO interrupt) 是一種硬體機制，當外部引腳的電位發生特定變化時，會暫停 MCU 當前的程式，優先執行特定的中斷服務程式 (ISR)
+
 ### 3.11.1 GPIO value 與 interrupt 是兩件事
 
 GPIO input 可以讀取現在的 High/Low；interrupt 則是在特定轉換或電位下通知 CPU。
