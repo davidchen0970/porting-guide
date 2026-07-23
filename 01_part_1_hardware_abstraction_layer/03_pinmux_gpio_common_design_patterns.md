@@ -799,6 +799,10 @@ property 名稱與 cells 格式必須符合該 device binding。
 Consumer 還可能引用 pinctrl state：
 
 ```dts
+/*
+ * Enable I2C5 pinmux configuration.
+ * The corresponding GPIO pins are configured as I2C5 SDA/SCL signals.
+ */
 &pinctrl {
     pinctrl_i2c5_default: i2c5-default {
         function = "I2C5";
@@ -806,6 +810,9 @@ Consumer 還可能引用 pinctrl state：
     };
 };
 
+/*
+ * Enable AST2600 I2C5 bus.
+ */
 &i2c5 {
     status = "okay";
     pinctrl-names = "default";
