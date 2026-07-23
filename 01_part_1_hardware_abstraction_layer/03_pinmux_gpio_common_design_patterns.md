@@ -1225,9 +1225,7 @@ gpiomon --num-events=5 gpiochip2 3
 
 ## 3.10 GPIO expander
 
-GPIO expander（GPIO 擴充晶片）是一種透過少量晶片接腳（如 I2C 或 SPI 匯流排）來擴充微控制器（MCU）更多通用輸入輸出（GPIO）接腳的積體電路。
-
-GPIO expander 透過 I2C 或 SPI 增加 GPIO lines。
+GPIO expander (GPIO 擴充晶片) 是一種透過少量晶片接腳 (如 I2C 或 SPI 匯流排) 來擴充 MCU 更多 GPIO 接腳的積體電路。
 
 ### 3.10.1 它和 SoC GPIO 的差異
 
