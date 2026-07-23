@@ -1077,6 +1077,7 @@ Request output with initial value
 
 ### 3.8.4 GPIO hog
 
+GPIO Hog（也稱 GPIO 獨占）是 Linux 核心提供的一種機制，它允許系統在啟動的早期階段（驅動程式載入時）自動請求並鎖定特定的 GPIO 引腳，將其配置為輸入、輸出高電平或輸出低電平，並一直由系統核心持有。
 GPIO hog 會在 GPIO controller 註冊時要求 line：
 
 ```dts
