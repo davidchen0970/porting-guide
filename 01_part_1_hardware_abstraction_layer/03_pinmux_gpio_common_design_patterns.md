@@ -1374,7 +1374,7 @@ watch -n 1 cat /proc/interrupts
 
 ## 3.12 Debounce
 
-Mechanical button、presence switch 與 connector 可能在切換時快速抖動。
+防彈跳 (Debounce) 是一種用於消除機械開關或按鍵在閉合或斷開瞬間，因彈性金屬片接觸不良所產生的短暫突波 (Bounce) 的技術. Mechanical button、presence switch 與 connector 可能在切換時快速抖動。
 
 Debounce 可由以下其中一層負責：
 
