@@ -1317,6 +1317,10 @@ Interrupt ：何時應通知 CPU？
 ### 3.11.3 Device Tree 範例
 
 ```dts
+/*
+ * Some-device is connected through the I2C bus at address 0x40.
+ * GPIO14 is used as the device interrupt input and is asserted low.
+ */
 some_device@40 {
     compatible = "vendor,some-device";
     reg = <0x40>;
