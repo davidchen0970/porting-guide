@@ -398,20 +398,20 @@ Initial output value = 0 或 1，若為 output
 
 除了 mux 與 direction，pad 還可能有電氣設定：
 
-- Pull-up。
-- Pull-down。
-- Bias disable。
+- <mark>Pull-up。</mark>
+- <mark>Pull-down。</mark>
+- <mark>Bias disable。</mark>
 - Drive strength。
 - Open-drain。
 - Schmitt trigger。
 - Slew rate。
 - Input enable。
 
-所以一顆 pin 至少要分成三個問題：
+<mark>所以一顆 pin 至少要分成三個問題：</mark>
 
-1. Pinmux 選了哪個功能？
-2. GPIO direction 是 input 還是 output？
-3. Pad 的電氣設定是什麼？
+1. <mark>Pinmux 選了哪個功能？</mark>
+2. <mark>GPIO direction 是 input 還是 output？</mark>
+3. <mark>Pad 的電氣設定是什麼？</mark>
 
 ### 3.3.5 Pinmux 衝突
 
@@ -489,16 +489,19 @@ Product state：Present = true
 
 ### 3.4.5 Input 的 pull
 
-Input 若沒有外部 device 驅動，也沒有 pull，可能成為 floating input。
+<mark>Input 若沒有外部 device 驅動，也沒有 pull，可能成為 floating input。</mark>
 
-預設電位可能來自：
+<mark>預設電位可能來自：</mark>
 
-- 板上 external pull-up / pull-down。
-- SoC internal pull。
-- CPLD 或其他 device output。
-- Level shifter 的狀態。
+- <mark>板上 external pull-up / pull-down。</mark>
+- <mark>SoC internal pull。</mark>
+- <mark>CPLD 或其他 device output。</mark>
+- <mark>Level shifter 的狀態。</mark>
 
-關鍵訊號應先看 Schematic 上的 external pull。SoC internal pull 可能較弱，而且 reset 初期不一定生效。
+<mark>關鍵訊號應先看 Schematic 上的 external pull。SoC internal pull 可能較弱，而且 reset 初期不一定生效。</mark>
+
+
+> <mark>檢閱提醒：Pull-down disable 只代表移除內部下拉，不代表該腳位一定進入 Hi-Z。是否為 Hi-Z / floating input，需同時確認 Pinmux、GPIO direction、output driver 是否啟用，以及外部是否有 pull、buffer、CPLD 或其他 device 正在驅動。</mark>
 
 ### 3.4.6 Output 的安全初始值
 
@@ -552,13 +555,13 @@ OpenBMC service 使用該狀態
 
 ### 3.5.2 Reset default
 
-Reset default 是 SoC 剛離開 reset 時的硬體狀態，可能是：
+<mark>Reset default 是 SoC 剛離開 reset 時的硬體狀態，可能是：</mark>
 
-- Input。
-- High impedance。
-- 帶 internal pull。
-- 特定 alternate function。
-- 由 strap 或安全狀態限制。
+- <mark>Input。</mark>
+- <mark>High impedance。</mark>
+- <mark>帶 internal pull。</mark>
+- <mark>特定 alternate function。</mark>
+- <mark>由 strap 或安全狀態限制。</mark>
 
 這個階段早於 U-Boot。只查看 U-Boot command 的結果，無法證明 reset release 附近沒有 glitch。
 
